@@ -1,12 +1,10 @@
 # Sandbox examples
 
-These examples show how to run agents with an isolated workspace. Start with the
-small API examples when you want the smallest surface area, or use the tutorial
-scaffold when you want the shared layout for guided sandbox tutorials.
+These examples show how to run agents with an isolated workspace. Start with the small API examples when you want the smallest surface area, or use the tutorial scaffold when you want the shared layout for guided sandbox tutorials.
 
-Most examples call a model through `Runner`, so set `OPENAI_API_KEY` in the
-repository-root `.env` file, in the example's `.env` file when it has one, or
-in your shell environment.
+Most examples call a model through `Runner`, so set `OPENAI_API_KEY` in the repository-root `.env` file, in the example's `.env` file when it has one, or in your shell environment.
+
+`sandbox_agent_with_tools.py` starts the repository's MCP v2 reference server and is intended to run with the locked development environment. The Agents SDK client itself supports both MCP v1 and v2.
 
 ## Small API examples
 
@@ -21,20 +19,17 @@ in your shell environment.
 | [`memory.py`](./memory.py) | `uv run python examples/sandbox/memory.py` | Runs one sandbox agent twice across a snapshot resume so it can read and write its own memory. |
 | [`memory_s3.py`](./memory_s3.py) | `source ~/.s3.env && uv run python examples/sandbox/memory_s3.py` | Runs sandbox memory across two fresh Docker sandboxes with S3-backed memory storage. |
 | [`memory_multi_agent_multiturn.py`](./memory_multi_agent_multiturn.py) | `uv run python examples/sandbox/memory_multi_agent_multiturn.py` | Shows separate memory layouts for two agents sharing one sandbox workspace. |
+| [`shared_session_workdirs.py`](./shared_session_workdirs.py) | `uv run python examples/sandbox/shared_session_workdirs.py` | Shares one live sandbox between trusted agents while Shell, `view_image`, and `apply_patch` resolve relative paths from each run's `cwd`. This is not confinement; use separate sessions for untrusted agents or compute isolation. |
 | [`unix_local_pty.py`](./unix_local_pty.py) | `uv run python examples/sandbox/unix_local_pty.py` | Exercises an interactive pseudo-terminal in a Unix-local sandbox. |
 | [`unix_local_runner.py`](./unix_local_runner.py) | `uv run python examples/sandbox/unix_local_runner.py` | Runs against the Unix-local sandbox backend directly. |
 
 ## Cloud backend examples
 
-Cloud-provider examples live under [`extensions/`](./extensions/). They cover
-E2B, Modal, and Daytona sandbox backends and require provider-specific
-credentials in addition to `OPENAI_API_KEY`.
+Cloud-provider examples live under [`extensions/`](./extensions/). They cover E2B, Modal, and Daytona sandbox backends and require provider-specific credentials in addition to `OPENAI_API_KEY`.
 
 ## Tutorial scaffold
 
-[`tutorials/`](./tutorials/) contains the shared helper code, Docker image, and folder
-conventions for guided sandbox tutorials. Tutorial folders are added in separate
-focused changes.
+[`tutorials/`](./tutorials/) contains the shared helper code, Docker image, and folder conventions for guided sandbox tutorials. Tutorial folders are added in separate focused changes.
 
 ## Tutorials
 
@@ -55,5 +50,4 @@ focused changes.
 ## Shared files
 
 - [`docker/`](./docker/) contains Docker-specific helper examples.
-- [`misc/`](./misc/) contains reusable support code and tiny reference tools
-  used by several sandbox examples.
+- [`misc/`](./misc/) contains reusable support code and tiny reference tools used by several sandbox examples.

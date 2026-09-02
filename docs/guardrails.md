@@ -1,6 +1,6 @@
 # Guardrails
 
-Guardrails enable you to do checks and validations of user input and agent output. For example, imagine you have an agent that uses a very smart (and hence slow/expensive) model to help with customer requests. You wouldn't want malicious users to ask the model to help them with their math homework. So, you can run a guardrail with a fast/cheap model. If the guardrail detects malicious usage, it can immediately raise an error and prevent the expensive model from running, saving you time and money (**when using blocking guardrails; for parallel guardrails, the expensive model may have already started running before the guardrail completes. See "Execution modes" below for details**).
+Guardrails enable you to do checks and validations of user input and agent output. For example, imagine you have an agent that uses a very smart (and hence slow/expensive) model to help with customer requests. You wouldn't want malicious users to ask the model to help them with their math homework. So, you can run a guardrail with a fast/cheap model. If the guardrail detects malicious usage, it can immediately raise an error, saving time and money. Blocking execution guarantees that the expensive model does not start; with parallel execution, the expensive model may already have started before the guardrail completes. See "Execution modes" below for details.
 
 There are two kinds of guardrails:
 
@@ -15,7 +15,7 @@ Guardrails are attached to agents and tools, but they do not all run at the same
 -   **Output guardrails** run only for the agent that produces the final output.
 -   **Tool guardrails** run on every custom function-tool invocation, with input guardrails before execution and output guardrails after execution.
 
-If you need checks around each custom function-tool call in a workflow that includes managers, handoffs, or delegated specialists, use tool guardrails instead of relying only on agent-level input/output guardrails.
+If you need checks before and/or after each custom function-tool call in a workflow that includes managers, handoffs, or delegated specialists, use tool guardrails instead of relying only on agent-level input/output guardrails.
 
 ## Input guardrails
 
@@ -33,7 +33,7 @@ Input guardrails run in 3 steps:
 
 Input guardrails support two execution modes:
 
-- **Parallel execution** (default, `run_in_parallel=True`): The guardrail runs concurrently with the agent's execution. This provides the best latency since both start at the same time. However, if the guardrail fails, the agent may have already consumed tokens and executed tools before being cancelled.
+- **Parallel execution** (default, `run_in_parallel=True`): The guardrail runs concurrently with the agent's execution. This provides the best latency since both start at the same time. However, if the guardrail's tripwire is triggered, the agent may have already consumed tokens and executed tools before being cancelled.
 
 - **Blocking execution** (`run_in_parallel=False`): The guardrail runs and completes *before* the agent starts. If the guardrail tripwire is triggered, the agent never executes, preventing token consumption and tool execution. This is ideal for cost optimization and when you want to avoid potential side effects from tool calls.
 
@@ -51,19 +51,28 @@ Output guardrails run in 3 steps:
 
     Output guardrails always run after the agent completes, so they don't support the `run_in_parallel` parameter.
 
+An output tripwire and an exception raised by the guardrail function have different session behavior. A tripwire rejects the candidate final output. When a tripwire fires, the runner asks the configured session to persist already-completed tool call and tool output items, together with any reasoning context required to replay those calls, while excluding the rejected candidate final output. The runner applies this tripwire rule to both streaming and non-streaming runs. When the guardrail function raises an exception instead of returning a tripwire result, the runner treats the verdict as unknown and asks the configured session to persist the completed final-turn items before surfacing the guardrail exception. If that session write also fails, the session write error takes precedence. Streaming runs use the same persistence ordering as non-streaming runs and raise the terminal exception from `stream_events()`. An immediate [`RunResultStreaming.cancel()`][agents.result.RunResultStreaming.cancel] call while the output guardrail is running cancels the in-flight guardrail and does not start a final-turn session write.
+
+Terminal function-tool output needs additional handling because the tool has already run before the agent-level output guardrail checks the value. When [`Agent.tool_use_behavior`][agents.agent.Agent.tool_use_behavior] makes that tool result the final output and an output tripwire rejects it, the SDK retains a replay-valid function call/output pair only when it can rebuild the pair from validated fields. The retained `function_call_output` payload is replaced with the fixed text `"Output withheld by an output guardrail."`; the original tool-output payload is not retained in the session, `RunState`, streamed result state, or sandbox memory input. The SDK does retain validated function-call metadata required for replay, including the function arguments, so that metadata can contain data that also appeared in the rejected output. Current-response [`OutputGuardrailResult`][agents.guardrail.OutputGuardrailResult] objects also replace `agent_output` with the fixed text and clear `output_info`. Current-response [`ToolOutputGuardrailResult`][agents.tool_guardrails.ToolOutputGuardrailResult] objects preserve the allow/reject behavior type but replace payload-bearing `output_info` and rejection messages with the same text. Earlier accepted turns and guardrail results remain unchanged. If the response contains reasoning or another shape that the SDK cannot sanitize safely, the SDK discards the complete current-response suffix instead of retaining the rejected output payload. A guardrail function that raises an exception has not returned a rejection verdict, so the completed terminal-tool turn follows the exception persistence behavior described above.
+
 ## Tool guardrails
 
-Tool guardrails wrap **function tools** and let you validate or block tool calls before and after execution. They are configured on the tool itself and run every time that tool is invoked.
+Tool guardrails wrap **`FunctionTool` instances** and let you validate or block calls to those tools before and after execution. They are configured on the tool itself and run every time that tool is invoked.
 
 - Input tool guardrails run before the tool executes and can skip the call, replace the output with a message, or raise a tripwire.
 - Output tool guardrails run after the tool executes and can replace the output or raise a tripwire.
+- If a function tool requires approval, input tool guardrails normally run after approval and immediately before execution. Set [`RunConfig.tool_execution`][agents.run.RunConfig.tool_execution] to [`ToolExecutionConfig(pre_approval_tool_input_guardrails=True)`][agents.run.ToolExecutionConfig] when you want those input checks to run before the pending approval interruption is emitted. Calls that pass this pre-approval check are still checked again after approval before the tool executes.
 - Tool guardrails apply only to function tools created with [`function_tool`][agents.tool.function_tool]. Handoffs run through the SDK's handoff pipeline rather than the normal function-tool pipeline, so tool guardrails do not apply to the handoff call itself. Hosted tools (`WebSearchTool`, `FileSearchTool`, `HostedMCPTool`, `CodeInterpreterTool`, `ImageGenerationTool`) and built-in execution tools (`ComputerTool`, `ShellTool`, `ApplyPatchTool`, `LocalShellTool`) also do not use this guardrail pipeline, and [`Agent.as_tool()`][agents.agent.Agent.as_tool] does not currently expose tool-guardrail options directly.
 
 See the code snippet below for details.
 
 ## Tripwires
 
-If the input or output fails the guardrail, the Guardrail can signal this with a tripwire. As soon as we see a guardrail that has triggered the tripwires, we immediately raise a `{Input,Output}GuardrailTripwireTriggered` exception and halt the Agent execution.
+If an agent input or output fails a guardrail, the guardrail can signal this with a tripwire. The runner immediately raises an `InputGuardrailTripwireTriggered` or `OutputGuardrailTripwireTriggered` exception and halts agent execution. Tool guardrails use the corresponding `ToolInputGuardrailTripwireTriggered` and `ToolOutputGuardrailTripwireTriggered` exceptions.
+
+For agent-level tripwires, the exception's `guardrail_result` identifies the guardrail that triggered the tripwire. For an input tripwire raised by the runner, `exception.run_data.input_guardrail_results` contains every input guardrail result completed before the run stopped, including the result that triggered the tripwire. Output tripwires provide the equivalent accumulated results through `exception.run_data.output_guardrail_results`.
+
+Tool tripwire exceptions instead expose the triggering `guardrail` and `output` directly. Their `run_data.tool_input_guardrail_results` and `run_data.tool_output_guardrail_results` lists preserve results accumulated from completed turns before the failure; the triggering result is available through the exception's `output`. Other runner-managed failures, such as `MaxTurnsExceeded`, also preserve completed tool guardrail results in these lists. After `stream_events()` raises an exception, the streamed result exposes the same accumulated agent and tool guardrail result lists. `run_data` can be `None` when an exception is raised outside a runner-managed execution path.
 
 ## Implementing a guardrail
 
@@ -78,8 +87,8 @@ from agents import (
     RunContextWrapper,
     Runner,
     TResponseInputItem,
-    input_guardrail,
 )
+from agents.decorators import input_guardrail
 
 class MathHomeworkOutput(BaseModel):
     is_math_homework: bool
@@ -135,8 +144,8 @@ from agents import (
     OutputGuardrailTripwireTriggered,
     RunContextWrapper,
     Runner,
-    output_guardrail,
 )
+from agents.decorators import output_guardrail
 class MessageOutput(BaseModel): # (1)!
     response: str
 
@@ -191,10 +200,8 @@ from agents import (
     Agent,
     Runner,
     ToolGuardrailFunctionOutput,
-    function_tool,
-    tool_input_guardrail,
-    tool_output_guardrail,
 )
+from agents.decorators import tool, tool_input_guardrail, tool_output_guardrail
 
 @tool_input_guardrail
 def block_secrets(data):
@@ -214,7 +221,7 @@ def redact_output(data):
     return ToolGuardrailFunctionOutput.allow()
 
 
-@function_tool(
+@tool(
     tool_input_guardrails=[block_secrets],
     tool_output_guardrails=[redact_output],
 )

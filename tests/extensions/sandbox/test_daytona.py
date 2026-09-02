@@ -365,6 +365,18 @@ def test_daytona_package_re_exports_backend_symbols(monkeypatch: pytest.MonkeyPa
     assert package_module.DaytonaSandboxClient is daytona_module.DaytonaSandboxClient
 
 
+@pytest.fixture(autouse=True)
+def _trust_recording_mounts_for_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agents.sandbox import _mount_security
+
+    original = _mount_security._mount_class_is_trusted
+    monkeypatch.setattr(
+        _mount_security,
+        "_mount_class_is_trusted",
+        lambda mount: isinstance(mount, _RecordingMount) or original(mount),
+    )
+
+
 class _RecordingMount(Mount):
     type: str = "daytona_recording_mount"
     mount_strategy: InContainerMountStrategy = Field(
@@ -749,7 +761,10 @@ class TestDaytonaSandbox:
             session = await client.create(
                 options=daytona_module.DaytonaSandboxClientOptions(pause_on_exit=True),
             )
-            state = session.state
+            state = cast(
+                Any,
+                client.deserialize_session_state(client.serialize_session_state(session.state)),
+            )
             _FakeAsyncDaytona.create_calls.clear()
 
             resumed = await client.resume(state)
@@ -1111,6 +1126,37 @@ class TestDaytonaSandbox:
         assert mount._mounted_paths == [mount_path]
 
     @pytest.mark.asyncio
+    async def test_persist_workspace_marks_stopped_sandbox_non_retryable(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Verify stopped Daytona sandboxes expose provider-neutral retryability."""
+
+        daytona_module = _load_daytona_module(monkeypatch)
+        sandbox = _FakeDaytonaSandbox()
+        state = daytona_module.DaytonaSandboxSessionState(
+            manifest=Manifest(root=daytona_module.DEFAULT_DAYTONA_WORKSPACE_ROOT),
+            snapshot=NoopSnapshot(id="snapshot"),
+            sandbox_id=sandbox.id,
+        )
+        session = daytona_module.DaytonaSandboxSession.from_state(state, sandbox=sandbox)
+
+        async def _raise_stopped_sandbox(_cmd: str, **_kwargs: object) -> object:
+            raise RuntimeError(
+                "bad request: failed to resolve container IP after 3 attempts: "
+                "no IP address found. Is the Sandbox started?"
+            )
+
+        monkeypatch.setattr(sandbox.process, "exec", _raise_stopped_sandbox)
+
+        with pytest.raises(daytona_module.WorkspaceArchiveReadError) as exc_info:
+            await session.persist_workspace()
+
+        assert exc_info.value.retryable is False
+        assert exc_info.value.context["backend"] == "daytona"
+        assert exc_info.value.context["reason"] == "sandbox_not_running"
+
+    @pytest.mark.asyncio
     async def test_persist_workspace_uses_nested_mount_targets_and_runtime_skip_paths(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -1342,8 +1388,8 @@ class TestDaytonaSandbox:
 
         monkeypatch.setattr(
             daytona_module,
-            "_import_daytona_exceptions",
-            lambda: {"timeout": _FakeTimeout},
+            "_daytona_timeout_error_types",
+            lambda: (_FakeTimeout,),
         )
 
         sandbox = _FakeDaytonaSandbox()
@@ -1357,6 +1403,111 @@ class TestDaytonaSandbox:
 
         with pytest.raises(ExecTimeoutError):
             await session.pty_exec_start("python3", shell=False, tty=False, timeout=2.0)
+
+    @pytest.mark.asyncio
+    async def test_pty_start_marks_documented_sdk_not_found_non_retryable(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        daytona_module = _load_daytona_module(monkeypatch)
+
+        class _FakeNotFound(Exception):
+            status_code = 404
+            error_code = "sandbox_not_found"
+
+        monkeypatch.setattr(
+            daytona_module,
+            "_daytona_non_retryable_error_types",
+            lambda: (_FakeNotFound,),
+        )
+        monkeypatch.setattr(daytona_module, "_daytona_retryable_error_types", lambda: ())
+
+        sandbox = _FakeDaytonaSandbox()
+        sandbox.process.create_pty_session_error = _FakeNotFound("sandbox not found")
+        state = daytona_module.DaytonaSandboxSessionState(
+            manifest=Manifest(root=daytona_module.DEFAULT_DAYTONA_WORKSPACE_ROOT),
+            snapshot=NoopSnapshot(id="snapshot"),
+            sandbox_id=sandbox.id,
+        )
+        session = daytona_module.DaytonaSandboxSession.from_state(state, sandbox=sandbox)
+
+        with pytest.raises(ExecTransportError) as exc_info:
+            await session.pty_exec_start("python3", shell=False, tty=True)
+
+        assert exc_info.value.retryable is False
+        assert exc_info.value.context["backend"] == "daytona"
+        assert exc_info.value.context["http_status"] == 404
+        assert exc_info.value.context["provider_error_code"] == "sandbox_not_found"
+        assert exc_info.value.context["reason"] == "sandbox_not_found"
+
+    @pytest.mark.asyncio
+    async def test_pty_start_marks_documented_sdk_rate_limit_retryable(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        daytona_module = _load_daytona_module(monkeypatch)
+
+        class _FakeRateLimit(Exception):
+            status_code = 429
+            error_code = "rate_limit_exceeded"
+
+        monkeypatch.setattr(
+            daytona_module,
+            "_daytona_retryable_error_types",
+            lambda: (_FakeRateLimit,),
+        )
+        monkeypatch.setattr(daytona_module, "_daytona_non_retryable_error_types", lambda: ())
+
+        sandbox = _FakeDaytonaSandbox()
+        sandbox.process.create_pty_session_error = _FakeRateLimit("rate limit exceeded")
+        state = daytona_module.DaytonaSandboxSessionState(
+            manifest=Manifest(root=daytona_module.DEFAULT_DAYTONA_WORKSPACE_ROOT),
+            snapshot=NoopSnapshot(id="snapshot"),
+            sandbox_id=sandbox.id,
+        )
+        session = daytona_module.DaytonaSandboxSession.from_state(state, sandbox=sandbox)
+
+        with pytest.raises(ExecTransportError) as exc_info:
+            await session.pty_exec_start("python3", shell=False, tty=True)
+
+        assert exc_info.value.retryable is True
+        assert exc_info.value.context["backend"] == "daytona"
+        assert exc_info.value.context["http_status"] == 429
+        assert exc_info.value.context["provider_error_code"] == "rate_limit_exceeded"
+        assert exc_info.value.context["reason"] == "rate_limit_exceeded"
+
+    @pytest.mark.parametrize(
+        ("status", "expected_retryable"),
+        [
+            (400, False),
+            (401, False),
+            (403, False),
+            (404, False),
+            (409, False),
+            (429, True),
+            (500, True),
+            (502, True),
+            (503, True),
+            (504, True),
+        ],
+    )
+    def test_daytona_retryability_status_table(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        status: int,
+        expected_retryable: bool,
+    ) -> None:
+        daytona_module = _load_daytona_module(monkeypatch)
+        monkeypatch.setattr(daytona_module, "_daytona_non_retryable_error_types", lambda: ())
+        monkeypatch.setattr(daytona_module, "_daytona_retryable_error_types", lambda: ())
+
+        class FakeStatusError(Exception):
+            status_code = status
+
+        retryable, reason = daytona_module._daytona_provider_retryability(FakeStatusError())
+
+        assert retryable is expected_retryable
+        assert reason == f"http_{status}"
 
     @pytest.mark.asyncio
     async def test_session_reader_keeps_entry_live_when_logs_fail_without_exit_code(
@@ -1389,6 +1540,96 @@ class TestDaytonaSandbox:
 
         assert entry.done is False
         assert entry.exit_code is None
+
+    @pytest.mark.asyncio
+    async def test_terminate_pty_entry_awaits_worker_finalizer(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        daytona_module = _load_daytona_module(monkeypatch)
+        sandbox = _FakeDaytonaSandbox()
+        state = daytona_module.DaytonaSandboxSessionState(
+            manifest=Manifest(root=daytona_module.DEFAULT_DAYTONA_WORKSPACE_ROOT),
+            snapshot=NoopSnapshot(id="snapshot"),
+            sandbox_id=sandbox.id,
+        )
+        session = daytona_module.DaytonaSandboxSession.from_state(state, sandbox=sandbox)
+        entry = daytona_module._DaytonaPtySessionEntry(  # noqa: SLF001
+            daytona_session_id="session-123",
+            pty_handle=object(),
+            tty=False,
+            cmd_id="cmd-123",
+        )
+        finalizer_finished = asyncio.Event()
+
+        async def worker() -> None:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await asyncio.sleep(0)
+                finalizer_finished.set()
+
+        entry.worker_task = asyncio.create_task(worker())
+        await asyncio.sleep(0)
+
+        await session._terminate_pty_entry(entry)  # noqa: SLF001
+
+        assert finalizer_finished.is_set()
+        assert entry.worker_task is None
+        assert sandbox.process.delete_session_calls == ["session-123"]
+
+    @pytest.mark.asyncio
+    async def test_terminate_pty_entry_bounds_worker_finalizer(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        daytona_module = _load_daytona_module(monkeypatch)
+        sandbox = _FakeDaytonaSandbox()
+        state = daytona_module.DaytonaSandboxSessionState(
+            manifest=Manifest(root=daytona_module.DEFAULT_DAYTONA_WORKSPACE_ROOT),
+            snapshot=NoopSnapshot(id="snapshot"),
+            sandbox_id=sandbox.id,
+        )
+        monkeypatch.setattr(state.timeouts, "cleanup_s", 0.01)
+        session = daytona_module.DaytonaSandboxSession.from_state(state, sandbox=sandbox)
+        entry = daytona_module._DaytonaPtySessionEntry(  # noqa: SLF001
+            daytona_session_id="session-123",
+            pty_handle=object(),
+            tty=False,
+            cmd_id="cmd-123",
+        )
+        logs_started = asyncio.Event()
+        finalizer_started = asyncio.Event()
+
+        async def read_logs(*_args: object) -> None:
+            logs_started.set()
+            await asyncio.Event().wait()
+
+        async def get_command(*_args: object) -> object:
+            finalizer_started.set()
+            await asyncio.Event().wait()
+            return types.SimpleNamespace(exit_code=None)
+
+        monkeypatch.setattr(sandbox.process, "get_session_command_logs_async", read_logs)
+        monkeypatch.setattr(sandbox.process, "get_session_command", get_command)
+
+        worker_task = asyncio.create_task(
+            session._run_session_reader(  # noqa: SLF001
+                entry,
+                "session-123",
+                "cmd-123",
+                lambda _chunk: None,
+            )
+        )
+        entry.worker_task = worker_task
+        await logs_started.wait()
+
+        await asyncio.wait_for(session._terminate_pty_entry(entry), timeout=0.5)  # noqa: SLF001
+
+        assert finalizer_started.is_set()
+        assert worker_task.done()
+        assert entry.worker_task is None
+        assert sandbox.process.delete_session_calls == ["session-123"]
 
 
 # ---------------------------------------------------------------------------
@@ -1673,7 +1914,7 @@ async def test_ensure_rclone_installs_when_missing() -> None:
 @pytest.mark.asyncio
 async def test_activate_calls_preflights_and_delegates() -> None:
     strategy = DaytonaCloudBucketMountStrategy()
-    mount = MagicMock()
+    mount = S3Mount(bucket="public-bucket", mount_strategy=strategy)
     session = _FakePreflightSession()
     dest = Path("/workspace")
     base_dir = Path("/workspace")
@@ -1689,6 +1930,29 @@ async def test_activate_calls_preflights_and_delegates() -> None:
         fuse_mock.assert_awaited_once_with(session)
         rclone_mock.assert_awaited_once_with(session)
         delegate_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_activate_rejects_credentials_before_preflights() -> None:
+    strategy = DaytonaCloudBucketMountStrategy()
+    mount = S3Mount(
+        bucket="bucket",
+        access_key_id="access-key",
+        secret_access_key="secret-key",
+        mount_strategy=strategy,
+    )
+    session = _FakePreflightSession()
+
+    with (
+        patch.object(_daytona_mounts, "_ensure_fuse_support", new_callable=AsyncMock) as fuse_mock,
+        patch.object(_daytona_mounts, "_ensure_rclone", new_callable=AsyncMock) as rclone_mock,
+        pytest.raises(MountConfigError),
+    ):
+        await strategy.activate(mount, session, Path("/workspace"), Path("/workspace"))
+
+    fuse_mock.assert_not_awaited()
+    rclone_mock.assert_not_awaited()
+    assert session.exec_calls == []
 
 
 @pytest.mark.asyncio
@@ -1735,7 +1999,7 @@ async def test_teardown_delegates_without_preflights() -> None:
 @pytest.mark.asyncio
 async def test_restore_after_snapshot_reruns_preflights() -> None:
     strategy = DaytonaCloudBucketMountStrategy()
-    mount = MagicMock()
+    mount = S3Mount(bucket="public-bucket", mount_strategy=strategy)
     session = _FakePreflightSession()
     path = Path("/workspace/bucket")
 
@@ -1750,6 +2014,29 @@ async def test_restore_after_snapshot_reruns_preflights() -> None:
         fuse_mock.assert_awaited_once_with(session)
         rclone_mock.assert_awaited_once_with(session)
         delegate_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_restore_after_snapshot_rejects_credentials_before_preflights() -> None:
+    strategy = DaytonaCloudBucketMountStrategy()
+    mount = S3Mount(
+        bucket="bucket",
+        access_key_id="access-key",
+        secret_access_key="secret-key",
+        mount_strategy=strategy,
+    )
+    session = _FakePreflightSession()
+
+    with (
+        patch.object(_daytona_mounts, "_ensure_fuse_support", new_callable=AsyncMock) as fuse_mock,
+        patch.object(_daytona_mounts, "_ensure_rclone", new_callable=AsyncMock) as rclone_mock,
+        pytest.raises(MountConfigError),
+    ):
+        await strategy.restore_after_snapshot(mount, session, Path("/workspace/data"))
+
+    fuse_mock.assert_not_awaited()
+    rclone_mock.assert_not_awaited()
+    assert session.exec_calls == []
 
 
 def test_build_docker_volume_driver_config_returns_none() -> None:

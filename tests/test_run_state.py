@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import gc
-import io
+import importlib
 import json
 import logging
-from collections.abc import AsyncIterator, Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from copy import deepcopy
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, TypeVar, cast
+from types import SimpleNamespace
+from typing import Any, ClassVar, Literal, TypeVar, cast
 
 import pytest
 from openai.types.responses import (
+    ResponseCustomToolCall,
+    ResponseFunctionShellToolCall,
     ResponseFunctionToolCall,
     ResponseOutputMessage,
     ResponseOutputText,
@@ -25,13 +29,23 @@ from openai.types.responses.response_computer_tool_call import (
     ActionScreenshot,
     ResponseComputerToolCall,
 )
-from openai.types.responses.response_output_item import LocalShellCall, McpApprovalRequest
+from openai.types.responses.response_function_tool_call import CallerProgram
+from openai.types.responses.response_output_item import (
+    LocalShellCall,
+    LocalShellCallAction,
+    McpApprovalRequest,
+    McpCall,
+    Program,
+    ProgramOutput,
+)
+from openai.types.responses.response_usage import InputTokensDetails
 from openai.types.responses.tool_param import Mcp
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError, model_serializer
 
-from agents import Agent, Model, ModelSettings, RunConfig, Runner, handoff, trace
+from agents import Agent, ModelSettings, RunConfig, RunHooks, Runner, handoff, trace
+from agents._tool_invocation import tool_invocation_identity_and_scope
 from agents.computer import Computer
-from agents.exceptions import UserError
+from agents.exceptions import ModelBehaviorError, UserError
 from agents.guardrail import (
     GuardrailFunctionOutput,
     InputGuardrail,
@@ -43,6 +57,7 @@ from agents.handoffs import Handoff
 from agents.items import (
     HandoffOutputItem,
     ItemHelpers,
+    MCPApprovalResponseItem,
     MessageOutputItem,
     ModelResponse,
     ReasoningItem,
@@ -53,11 +68,21 @@ from agents.items import (
     ToolSearchCallItem,
     ToolSearchOutputItem,
     TResponseInputItem,
-    TResponseStreamEvent,
+    TResponseOutputItem,
 )
 from agents.run_context import RunContextWrapper
-from agents.run_internal.agent_runner_helpers import resolve_trace_settings
-from agents.run_internal.items import run_items_to_input_items
+from agents.run_error_handlers import RunErrorHandlerResult, RunErrorHandlers
+from agents.run_internal.agent_runner_helpers import (
+    resolve_resumed_context,
+    resolve_trace_settings,
+)
+from agents.run_internal.items import (
+    NestedHistoryOwnedItemRef,
+    digest_input_item,
+    ensure_nested_history_run_item_occurrence_key,
+    run_item_to_input_item,
+    run_items_to_input_items,
+)
 from agents.run_internal.run_loop import (
     NextStepInterruption,
     ProcessedResponse,
@@ -79,21 +104,23 @@ from agents.run_state import (
     _capability_identity_signature,
     _deserialize_items,
     _deserialize_processed_response,
+    _deserialize_tool_call_output_raw_item,
     _serialize_guardrail_results,
     _serialize_tool_action_groups,
 )
 from agents.sandbox import Manifest
 from agents.sandbox.capabilities.capability import Capability
+from agents.sandbox.entries import BaseEntry, Mount, MountStrategyBase
 from agents.sandbox.sandboxes.unix_local import UnixLocalSandboxClient, UnixLocalSandboxSessionState
-from agents.sandbox.session.base_sandbox_session import BaseSandboxSession
-from agents.sandbox.snapshot import LocalSnapshot, NoopSnapshot
-from agents.sandbox.types import ExecResult
+from agents.sandbox.snapshot import LocalSnapshot
+from agents.testing import ModelCall, ModelStep, ScriptedModel, scripted_sandbox_session
 from agents.tool import (
     ApplyPatchTool,
     ComputerTool,
     FunctionTool,
     HostedMCPTool,
     LocalShellTool,
+    ProgrammaticToolCallingTool,
     ShellTool,
     function_tool,
     tool_namespace,
@@ -107,10 +134,9 @@ from agents.tool_guardrails import (
     ToolOutputGuardrail,
     ToolOutputGuardrailResult,
 )
+from agents.tracing.traces import TraceState
 from agents.usage import Usage
-from tests.utils.factories import TestSessionState
 
-from .fake_model import FakeModel
 from .test_responses import (
     get_final_output_message,
     get_function_tool_call,
@@ -128,6 +154,7 @@ from .utils.hitl import (
     HITL_REJECTION_MSG,
     make_function_tool_call,
     make_model_and_agent,
+    make_shell_call,
     make_state_with_interruptions,
     run_and_resume_with_mutation,
 )
@@ -136,49 +163,6 @@ _CURRENT_SCHEMA_MAJOR, _CURRENT_SCHEMA_MINOR = CURRENT_SCHEMA_VERSION.split(".")
 _NEXT_UNSUPPORTED_SCHEMA_VERSION = f"{_CURRENT_SCHEMA_MAJOR}.{int(_CURRENT_SCHEMA_MINOR) + 1}"
 
 TContext = TypeVar("TContext")
-
-
-class _IdentitySandboxSession(BaseSandboxSession):
-    def __init__(self, root: str) -> None:
-        self.state = TestSessionState(
-            manifest=Manifest(root=root),
-            snapshot=NoopSnapshot(id=f"snapshot:{root}"),
-        )
-
-    async def start(self) -> None:
-        return None
-
-    async def stop(self) -> None:
-        return None
-
-    async def shutdown(self) -> None:
-        return None
-
-    async def running(self) -> bool:
-        return True
-
-    async def read(self, path: Path, *, user: object = None) -> Any:
-        _ = (path, user)
-        raise AssertionError("read() should not be called")
-
-    async def write(self, path: Path, data: io.IOBase, *, user: object = None) -> None:
-        _ = (path, data, user)
-        raise AssertionError("write() should not be called")
-
-    async def _exec_internal(
-        self,
-        *command: Any,
-        timeout: float | None = None,
-    ) -> ExecResult:
-        _ = (command, timeout)
-        raise AssertionError("_exec_internal() should not be called")
-
-    async def persist_workspace(self) -> Any:
-        raise AssertionError("persist_workspace() should not be called")
-
-    async def hydrate_workspace(self, data: Any) -> None:
-        _ = data
-        raise AssertionError("hydrate_workspace() should not be called")
 
 
 class _IdentityCapability(Capability):
@@ -235,6 +219,37 @@ def make_state(
     )
 
 
+def record_pending_nested_agent_tool_state(
+    agent: Agent[Any],
+    tool_call: ResponseFunctionToolCall,
+    *,
+    inner_call_id: str,
+) -> None:
+    """Record a serializable nested interruption for an outer function call."""
+    from agents.agent_tool_state import record_agent_tool_run_result
+
+    nested_approval = make_tool_approval_item(
+        agent,
+        call_id=inner_call_id,
+        name="inner_sensitive_tool",
+    )
+    nested_state = make_state_with_interruptions(
+        agent,
+        [nested_approval],
+        original_input=f"nested input for {inner_call_id}",
+    )
+    record_agent_tool_run_result(
+        tool_call,
+        cast(
+            Any,
+            SimpleNamespace(
+                interruptions=nested_state.get_interruptions(),
+                to_state=lambda: nested_state,
+            ),
+        ),
+    )
+
+
 def set_last_processed_response(
     state: RunState[Any, Agent[Any]],
     agent: Agent[Any],
@@ -247,6 +262,37 @@ def set_last_processed_response(
 
 class TestRunState:
     """Test RunState initialization, serialization, and core functionality."""
+
+    @pytest.mark.asyncio
+    async def test_results_to_state_preserve_falsy_trace_state(self) -> None:
+        class FalsyTraceState(TraceState):
+            def __bool__(self) -> bool:
+                return False
+
+        trace_state = FalsyTraceState(trace_id="trace_falsy")
+
+        model = ScriptedModel()
+        model.enqueue([get_final_output_message("done")])
+        result = await Runner.run(Agent(name="test", model=model), "input")
+        result._trace_state = trace_state
+
+        restored = result.to_state()._trace_state
+        assert isinstance(restored, FalsyTraceState)
+        assert restored.trace_id == "trace_falsy"
+
+        streaming_model = ScriptedModel()
+        streaming_model.enqueue([get_final_output_message("done")])
+        streaming_result = Runner.run_streamed(
+            Agent(name="streaming-test", model=streaming_model),
+            "input",
+        )
+        async for _ in streaming_result.stream_events():
+            pass
+        streaming_result._trace_state = trace_state
+
+        streaming_restored = streaming_result.to_state()._trace_state
+        assert isinstance(streaming_restored, FalsyTraceState)
+        assert streaming_restored.trace_id == "trace_falsy"
 
     def test_initializes_with_default_values(self):
         """Test that RunState initializes with correct default values."""
@@ -263,6 +309,18 @@ class TestRunState:
         assert state._current_step is None
         assert state._context is not None
         assert state._context.context == {"foo": "bar"}
+
+    def test_to_json_preserves_falsy_processed_response(self) -> None:
+        class FalsyProcessedResponse(ProcessedResponse):
+            def __bool__(self) -> bool:
+                return False
+
+        context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+        state = make_state(Agent(name="test"), context=context)
+        processed = make_processed_response()
+        state._last_processed_response = FalsyProcessedResponse(**vars(processed))
+
+        assert state.to_json()["last_processed_response"] is not None
 
     def test_set_tool_use_tracker_snapshot_filters_non_strings(self):
         """Test that set_tool_use_tracker_snapshot filters out non-string agent names and tools."""
@@ -446,6 +504,31 @@ class TestRunState:
         restored = await RunState.from_json(root, json_data)
         assert restored._current_agent is second
 
+    @pytest.mark.asyncio
+    async def test_from_json_restores_falsy_current_agent_via_identity_map(self):
+        class FalsyAgent(Agent[Any]):
+            def __bool__(self) -> bool:
+                return False
+
+        context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+        first = Agent(name="duplicate", instructions="zeta")
+        second = FalsyAgent(name="duplicate", instructions="alpha")
+        root = Agent(name="triage", handoffs=[first, second])
+        first.handoffs = [root]
+        second.handoffs = [root]
+
+        state = make_state(root, context=context, original_input="input1", max_turns=2)
+        state._current_agent = second
+
+        json_data = state.to_json()
+        assert json_data["current_agent"] == {
+            "name": "duplicate",
+            "identity": "duplicate#2",
+        }
+
+        restored = await RunState.from_json(root, json_data)
+        assert restored._current_agent is second
+
     def test_build_agent_identity_map_uses_tool_use_behavior_for_duplicate_names(self) -> None:
         """Duplicate-name identities should stay stable when only tool_use_behavior differs."""
 
@@ -498,13 +581,21 @@ class TestRunState:
 
         first_alpha_capability = _IdentityCapability(setting="alpha")
         first_beta_capability = _IdentityCapability(setting="beta")
-        first_alpha_capability.bind(_IdentitySandboxSession("/workspace/first-alpha"))
-        first_beta_capability.bind(_IdentitySandboxSession("/workspace/first-beta"))
+        first_alpha_capability.bind(
+            scripted_sandbox_session(manifest=Manifest(root="/workspace/first-alpha"))
+        )
+        first_beta_capability.bind(
+            scripted_sandbox_session(manifest=Manifest(root="/workspace/first-beta"))
+        )
 
         second_alpha_capability = _IdentityCapability(setting="alpha")
         second_beta_capability = _IdentityCapability(setting="beta")
-        second_alpha_capability.bind(_IdentitySandboxSession("/workspace/second-alpha"))
-        second_beta_capability.bind(_IdentitySandboxSession("/workspace/second-beta"))
+        second_alpha_capability.bind(
+            scripted_sandbox_session(manifest=Manifest(root="/workspace/second-alpha"))
+        )
+        second_beta_capability.bind(
+            scripted_sandbox_session(manifest=Manifest(root="/workspace/second-beta"))
+        )
 
         first_alpha_signature = _capability_identity_signature(first_alpha_capability)
         first_beta_signature = _capability_identity_signature(first_beta_capability)
@@ -580,8 +671,8 @@ class TestRunState:
         def approval_tool() -> str:
             return "approved"
 
-        first_model = FakeModel()
-        second_model = FakeModel()
+        first_model = ScriptedModel()
+        second_model = ScriptedModel()
         first = Agent(name="duplicate", model=first_model)
         second = Agent(
             name="duplicate",
@@ -592,8 +683,8 @@ class TestRunState:
         first.handoffs = [second]
         second.handoffs = [first]
 
-        first_model.add_multiple_turn_outputs([[get_handoff_tool_call(second)]])
-        second_model.add_multiple_turn_outputs(
+        first_model.extend([[get_handoff_tool_call(second)]])
+        second_model.extend(
             [[get_function_tool_call("approval_tool", json.dumps({}), call_id="call_approval")]]
         )
 
@@ -754,7 +845,7 @@ class TestRunState:
         with pytest.raises(
             Exception,
             match=(
-                f"Run state schema version 0.1 is not supported. "
+                "Run state schema version is not supported. "
                 f"Supported versions are: {supported_versions}. "
                 f"New snapshots are written as version {CURRENT_SCHEMA_VERSION}."
             ),
@@ -1525,7 +1616,1318 @@ class TestRunState:
 
         interruptions = state.get_interruptions()
         assert len(interruptions) == 1
-        assert interruptions[0] == approval_item
+        assert interruptions[0] is not approval_item
+        assert interruptions[0].agent is agent
+        assert interruptions[0].tool_name == approval_item.tool_name
+        assert interruptions[0].raw_item.model_dump() == approval_item.raw_item.model_dump()
+        assert interruptions[0].raw_item is not approval_item.raw_item
+
+    @pytest.mark.parametrize("raw_item_kind", ["pydantic", "mapping"])
+    def test_get_interruptions_returns_detached_item_snapshots(self, raw_item_kind: str):
+        """Mutating returned interruption content must not change pending approvals."""
+        agent = Agent(name="SnapshotAgent")
+        raw_item: Any
+        if raw_item_kind == "pydantic":
+            raw_item = ResponseFunctionToolCall(
+                type="function_call",
+                name="toolA",
+                call_id="cid-snapshot",
+                status="completed",
+                arguments='{"value": "original"}',
+            )
+        else:
+            raw_item = {
+                "type": "function_call",
+                "name": "toolA",
+                "call_id": "cid-snapshot",
+                "status": "completed",
+                "arguments": '{"value": "original"}',
+                "metadata": {"tags": ["original"]},
+            }
+        approval_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=raw_item,
+        )
+        state = make_state_with_interruptions(agent, [approval_item])
+
+        interruption = state.get_interruptions()[0]
+        interruption.tool_name = "changed"
+        if isinstance(interruption.raw_item, dict):
+            interruption.raw_item["arguments"] = '{"value": "changed"}'
+            interruption.raw_item["metadata"]["tags"].append("changed")
+        else:
+            interruption.raw_item.arguments = '{"value": "changed"}'
+
+        pending = state.get_interruptions()[0]
+        assert pending is not interruption
+        assert pending.agent is agent
+        assert pending.tool_name == "toolA"
+        if isinstance(pending.raw_item, dict):
+            assert pending.raw_item["arguments"] == '{"value": "original"}'
+            assert pending.raw_item["metadata"] == {"tags": ["original"]}
+        else:
+            assert pending.raw_item.arguments == '{"value": "original"}'
+
+    @pytest.mark.parametrize("raw_item_kind", ["pydantic", "mapping"])
+    @pytest.mark.parametrize("approve", [True, False], ids=["approve", "reject"])
+    def test_get_interruptions_snapshots_can_apply_approval_decisions(
+        self,
+        raw_item_kind: str,
+        approve: bool,
+    ) -> None:
+        """Detached snapshots must retain canonical approval identity."""
+        agent = Agent(name="DecisionAgent")
+        raw_item: Any = {
+            "type": "function_call",
+            "name": "toolA",
+            "call_id": "cid-decision",
+            "status": "completed",
+            "arguments": "{}",
+        }
+        if raw_item_kind == "pydantic":
+            raw_item = ResponseFunctionToolCall(**raw_item)
+        approval_item = ToolApprovalItem(agent=agent, raw_item=raw_item)
+        state = make_state_with_interruptions(agent, [approval_item])
+
+        interruption = state.get_interruptions()[0]
+        assert interruption is not approval_item
+        if approve:
+            state.approve(interruption)
+        else:
+            state.reject(interruption)
+
+        assert state._context is not None
+        assert state._context.is_tool_approved("toolA", "cid-decision") is approve
+
+    def test_get_interruptions_fails_before_returning_an_unsafe_snapshot(self):
+        """Uncopyable payloads must fail at the snapshot boundary."""
+
+        class Uncopyable:
+            def __deepcopy__(self, _memo: dict[int, Any]) -> Any:
+                raise RuntimeError("cannot copy")
+
+        agent = Agent(name="UncopyableAgent")
+        approval_item = ToolApprovalItem(
+            agent=agent,
+            raw_item={
+                "type": "function_call",
+                "name": "toolA",
+                "call_id": "cid-uncopyable",
+                "status": "completed",
+                "arguments": "{}",
+                "metadata": Uncopyable(),
+            },
+        )
+        state = make_state_with_interruptions(agent, [approval_item])
+
+        with pytest.raises(UserError, match="Cannot safely copy pending tool approvals"):
+            state.get_interruptions()
+
+    def test_get_interruptions_clone_failure_drops_sensitive_exception_context(self) -> None:
+        """Clone failures must not retain payload data in the exception graph."""
+        source_sentinel = "SENSITIVE_APPROVAL_CONTEXT_VALUE"
+        partial_sentinel = "SENSITIVE_PARTIAL_COPY_VALUE"
+        agent = Agent(name="CloneFailureContextAgent")
+        safe_item = ToolApprovalItem(
+            agent=agent,
+            raw_item={
+                "type": "function_call",
+                "name": "safeTool",
+                "call_id": "cid-safe-before-sensitive-failure",
+                "arguments": "{}",
+                "metadata": {"secret": partial_sentinel},
+            },
+        )
+        raw_item = {
+            "type": "function_call",
+            "name": "toolA",
+            "call_id": "cid-sensitive-clone-failure",
+            "arguments": "{}",
+            "metadata": {"secret": source_sentinel, "unsafe": object()},
+        }
+        failing_item = ToolApprovalItem(agent=agent, raw_item=raw_item)
+        state = make_state_with_interruptions(
+            agent,
+            [safe_item, failing_item],
+        )
+
+        with pytest.raises(UserError, match="Cannot safely copy pending tool approvals") as exc:
+            state.get_interruptions()
+
+        assert exc.value.__cause__ is None
+        assert exc.value.__context__ is None
+        assert source_sentinel not in repr(exc.value)
+        assert partial_sentinel not in repr(exc.value)
+        traceback = exc.value.__traceback__
+        while traceback is not None:
+            frame = traceback.tb_frame
+            if "/src/agents/" in frame.f_code.co_filename:
+                local_values = tuple(frame.f_locals.values())
+                assert all(value is not state for value in local_values)
+                assert all(value is not safe_item for value in local_values)
+                assert all(value is not failing_item for value in local_values)
+                assert all(value is not raw_item for value in local_values)
+                assert not any(isinstance(value, RunState) for value in local_values)
+                assert not any(isinstance(value, ToolApprovalItem) for value in local_values)
+                assert source_sentinel not in repr(frame.f_locals)
+                assert partial_sentinel not in repr(frame.f_locals)
+            traceback = traceback.tb_next
+
+    @pytest.mark.parametrize("approve", [True, False], ids=["approve", "reject"])
+    def test_get_interruptions_canonicalizes_custom_outer_models(
+        self,
+        approve: bool,
+    ) -> None:
+        """Declared model subtypes must retain canonical approval identity."""
+
+        class CustomCall(ResponseFunctionToolCall):
+            serializer_called: ClassVar[bool] = False
+            status: Literal["completed"] = "completed"
+            action: dict[str, str]
+            subtype_metadata: dict[str, list[str]]
+            subtype_only: Any
+
+            @model_serializer(mode="wrap")
+            def serialize_custom_call(self, handler: Any) -> Any:
+                type(self).serializer_called = True
+                return handler(self)
+
+        raw_item = CustomCall(
+            type="function_call",
+            name="toolA",
+            call_id="cid-custom-model",
+            arguments="{}",
+            action={"kind": "subtype-only"},
+            subtype_metadata={"tags": ["subtype-only"]},
+            subtype_only=object(),
+        )
+        agent = Agent(name="CustomModelAgent")
+        state = make_state_with_interruptions(
+            agent,
+            [ToolApprovalItem(agent=agent, raw_item=raw_item)],
+        )
+
+        assert state._context is not None
+        state._context._tool_invocation_status(raw_item)
+        CustomCall.serializer_called = False
+        snapshot = state.get_interruptions()[0]
+
+        assert not CustomCall.serializer_called
+        assert type(snapshot.raw_item) is ResponseFunctionToolCall
+        assert snapshot.raw_item.call_id == "cid-custom-model"
+        assert snapshot.raw_item.status == "completed"
+        assert "status" not in snapshot.raw_item.model_fields_set
+        assert "status" not in snapshot.raw_item.model_dump(exclude_unset=True)
+        assert "subtype_metadata" not in snapshot.raw_item.model_dump()
+        if approve:
+            state.approve(snapshot)
+        else:
+            state.reject(snapshot)
+        assert state._context.is_tool_approved("toolA", "cid-custom-model") is approve
+
+    @pytest.mark.parametrize("approve", [True, False], ids=["approve", "reject"])
+    def test_get_interruptions_subtype_snapshots_route_to_nested_approval(
+        self,
+        approve: bool,
+    ) -> None:
+        """Canonical subtype snapshots must resolve to nested authoritative items."""
+        from agents.agent_tool_state import drop_agent_tool_run_result, record_agent_tool_run_result
+
+        class CustomCall(ResponseFunctionToolCall):
+            status: Literal["completed"] = "completed"
+            action: dict[str, str]
+
+        agent = Agent(name="NestedSubtypeAgent")
+        nested_tool = function_tool(lambda: "nested", name_override="nested_agent_tool")
+        nested_outer_call = make_tool_call(
+            call_id="outer-nested-subtype",
+            name="nested_agent_tool",
+        )
+        raw_item = CustomCall(
+            type="function_call",
+            name="toolA",
+            call_id="cid-nested-subtype",
+            arguments="{}",
+            action={"kind": "subtype-only"},
+        )
+        nested_approval = ToolApprovalItem(agent=agent, raw_item=raw_item)
+        state = make_state_with_interruptions(agent, [nested_approval])
+        state._last_processed_response = make_processed_response(
+            functions=[
+                ToolRunFunction(tool_call=nested_outer_call, function_tool=nested_tool),
+            ]
+        )
+        nested_state = make_state_with_interruptions(agent, [nested_approval])
+        assert nested_state._context is not None
+        nested_state._context._tool_invocation_status(raw_item)
+        record_agent_tool_run_result(
+            nested_outer_call,
+            cast(
+                Any,
+                SimpleNamespace(
+                    interruptions=[nested_approval],
+                    to_state=lambda: nested_state,
+                ),
+            ),
+            scope_id=state._agent_tool_state_scope_id,
+        )
+
+        try:
+            snapshot = state.get_interruptions()[0]
+            assert snapshot.raw_item.status == "completed"
+            if approve:
+                state.approve(snapshot)
+            else:
+                state.reject(snapshot)
+            assert (
+                nested_state._context.is_tool_approved(
+                    "toolA",
+                    "cid-nested-subtype",
+                )
+                is approve
+            )
+        finally:
+            drop_agent_tool_run_result(
+                nested_outer_call,
+                scope_id=state._agent_tool_state_scope_id,
+            )
+
+    def test_get_interruptions_preserves_required_declared_subtype_defaults(self) -> None:
+        """Subtype defaults for base-required fields must survive canonicalization."""
+
+        class DefaultArgumentsCall(ResponseFunctionToolCall):
+            arguments: str = "{}"
+
+        raw_item = DefaultArgumentsCall(
+            type="function_call",
+            name="toolA",
+            call_id="cid-required-subtype-default",
+        )
+        agent = Agent(name="RequiredSubtypeDefaultAgent")
+        state = make_state_with_interruptions(
+            agent,
+            [ToolApprovalItem(agent=agent, raw_item=raw_item)],
+        )
+
+        snapshot = state.get_interruptions()[0]
+
+        assert type(snapshot.raw_item) is ResponseFunctionToolCall
+        assert snapshot.raw_item.arguments == "{}"
+        assert "arguments" not in snapshot.raw_item.model_fields_set
+        assert "arguments" not in snapshot.raw_item.model_dump(exclude_unset=True)
+        assert raw_item.arguments == "{}"
+
+    @pytest.mark.parametrize("approve", [True, False], ids=["approve", "reject"])
+    def test_get_interruptions_rejects_typed_extra_identity_collisions(
+        self,
+        approve: bool,
+    ) -> None:
+        """Typed extras must not replace declared approval identity fields."""
+        agent = Agent(name="TypedExtraCollisionAgent")
+        raw_item = ResponseFunctionToolCall(
+            type="function_call",
+            name="toolA",
+            call_id="authoritative",
+            arguments="{}",
+        )
+        assert raw_item.model_extra is not None
+        raw_item.model_extra["call_id"] = "forged"
+        state = make_state_with_interruptions(
+            agent,
+            [ToolApprovalItem(agent=agent, raw_item=raw_item)],
+        )
+
+        with pytest.raises(UserError, match="Cannot safely copy pending tool approvals"):
+            snapshot = state.get_interruptions()[0]
+            if approve:
+                state.approve(snapshot)
+            else:
+                state.reject(snapshot)
+
+        assert state._context is not None
+        assert state._context.is_tool_approved("toolA", "authoritative") is None
+        assert state._context.is_tool_approved("toolA", "forged") is None
+
+    def test_get_interruptions_does_not_hash_typed_extra_keys(self) -> None:
+        """Typed-extra keys must be normalized before any hash-based lookup."""
+
+        class MutatingKey(str):
+            def __new__(cls, value: str, owner: ResponseFunctionToolCall) -> MutatingKey:
+                key = str.__new__(cls, value)
+                key.owner = owner
+                return key
+
+            def __hash__(self) -> int:
+                object.__setattr__(self.owner, "arguments", "mutated-by-key-hash")
+                return str.__hash__(self)
+
+        agent = Agent(name="TypedExtraKeyAgent")
+        raw_item = ResponseFunctionToolCall(
+            type="function_call",
+            name="toolA",
+            call_id="cid-typed-extra-key",
+            arguments="original",
+        )
+        assert raw_item.model_extra is not None
+        key = MutatingKey("metadata", raw_item)
+        raw_item.model_extra[key] = {"safe": True}
+        object.__setattr__(raw_item, "arguments", "original")
+        state = make_state_with_interruptions(
+            agent,
+            [ToolApprovalItem(agent=agent, raw_item=raw_item)],
+        )
+
+        snapshot = state.get_interruptions()[0]
+
+        assert raw_item.arguments == "original"
+        assert snapshot.raw_item.arguments == "original"
+        snapshot_extra = snapshot.raw_item.model_extra
+        assert snapshot_extra == {"metadata": {"safe": True}}
+        assert snapshot_extra is not None
+        assert all(type(extra_name) is str for extra_name in snapshot_extra)
+
+    def test_get_interruptions_copies_typed_extra_container_subtypes(self) -> None:
+        """Hook-free built-in container subtypes remain detached and supported."""
+
+        class PlainDict(dict[str, Any]):
+            pass
+
+        class PlainList(list[str]):
+            pass
+
+        metadata = PlainDict(tags=PlainList(["original"]))
+        raw_item = ResponseFunctionToolCall.model_validate(
+            {
+                "type": "function_call",
+                "name": "toolA",
+                "call_id": "cid-typed-extra-containers",
+                "arguments": "{}",
+                "metadata": metadata,
+            }
+        )
+        agent = Agent(name="TypedExtraContainerAgent")
+        state = make_state_with_interruptions(
+            agent,
+            [ToolApprovalItem(agent=agent, raw_item=raw_item)],
+        )
+
+        snapshot = state.get_interruptions()[0]
+
+        assert raw_item.model_extra is not None
+        assert snapshot.raw_item.model_extra is not None
+        source_metadata = raw_item.model_extra["metadata"]
+        copied_metadata = snapshot.raw_item.model_extra["metadata"]
+        assert isinstance(source_metadata, PlainDict)
+        assert isinstance(source_metadata["tags"], PlainList)
+        assert type(copied_metadata) is dict
+        assert type(copied_metadata["tags"]) is list
+        copied_metadata["tags"].append("changed")
+        assert source_metadata["tags"] == ["original"]
+
+    @pytest.mark.parametrize("location", ["outer", "nested"])
+    def test_get_interruptions_rejects_serializer_bearing_typed_extras(
+        self,
+        location: str,
+    ) -> None:
+        """Typed extras must fail before a user serializer can mutate pending state."""
+
+        class MutatingExtra(BaseModel):
+            serializer_called: ClassVar[bool] = False
+            value: str
+
+            @model_serializer(mode="wrap")
+            def serialize_mutating_extra(self, handler: Any) -> Any:
+                type(self).serializer_called = True
+                self.value = "mutated-by-serializer"
+                return handler(self)
+
+        extra = MutatingExtra(value="original")
+        if location == "outer":
+            raw_item: Any = ResponseFunctionToolCall.model_validate(
+                {
+                    "type": "function_call",
+                    "name": "toolA",
+                    "call_id": "cid-serializer-extra",
+                    "arguments": "{}",
+                    "metadata": extra,
+                }
+            )
+        else:
+            raw_item = LocalShellCall.model_validate(
+                {
+                    "id": "local-shell-serializer-extra",
+                    "action": LocalShellCallAction.model_validate(
+                        {
+                            "command": ["echo", "ok"],
+                            "env": {},
+                            "type": "exec",
+                            "metadata": extra,
+                        }
+                    ),
+                    "call_id": "cid-serializer-extra",
+                    "status": "completed",
+                    "type": "local_shell_call",
+                }
+            )
+        agent = Agent(name="SerializerExtraAgent")
+        state = make_state_with_interruptions(
+            agent,
+            [ToolApprovalItem(agent=agent, raw_item=raw_item)],
+        )
+
+        with pytest.raises(UserError, match="Cannot safely copy pending tool approvals"):
+            state.get_interruptions()
+
+        assert extra.value == "original"
+        assert not MutatingExtra.serializer_called
+
+    @pytest.mark.parametrize("location", ["outer", "nested"])
+    def test_get_interruptions_rejects_typed_subtype_attribute_hooks(
+        self,
+        location: str,
+    ) -> None:
+        """Subtype attribute hooks must fail before authoritative model access."""
+
+        class MutatingCall(ResponseFunctionToolCall):
+            armed: bool = False
+
+            def __getattribute__(self, name: str) -> Any:
+                if name in {"__dict__", "__pydantic_extra__"} and object.__getattribute__(
+                    self,
+                    "__dict__",
+                ).get("armed"):
+                    object.__setattr__(self, "arguments", '{"mutated":true}')
+                return super().__getattribute__(name)
+
+        class MutatingAction(LocalShellCallAction):
+            armed: bool = False
+
+            def __getattribute__(self, name: str) -> Any:
+                if name in {"__dict__", "__pydantic_extra__"} and object.__getattribute__(
+                    self,
+                    "__dict__",
+                ).get("armed"):
+                    object.__setattr__(self, "command", ["mutated"])
+                return super().__getattribute__(name)
+
+        if location == "outer":
+            raw_item: Any = MutatingCall(
+                type="function_call",
+                name="toolA",
+                call_id="cid-hook-bearing-subtype",
+                arguments="{}",
+            )
+            raw_item.armed = True
+        else:
+            action = MutatingAction(command=["echo", "ok"], env={}, type="exec")
+            action.armed = True
+            raw_item = LocalShellCall(
+                id="local-shell-hook-bearing-subtype",
+                action=action,
+                call_id="cid-hook-bearing-subtype",
+                status="completed",
+                type="local_shell_call",
+            )
+        agent = Agent(name="HookBearingSubtypeAgent")
+        state = make_state_with_interruptions(
+            agent,
+            [ToolApprovalItem(agent=agent, raw_item=raw_item)],
+        )
+
+        with pytest.raises(UserError, match="Cannot safely copy pending tool approvals"):
+            state.get_interruptions()
+
+        if location == "outer":
+            assert raw_item.arguments == "{}"
+        else:
+            assert raw_item.action.command == ["echo", "ok"]
+
+    def test_get_interruptions_rejects_hooks_in_post_declared_model_mixins(self) -> None:
+        """Subtype hooks must be rejected even when their mixin follows the declared base."""
+
+        class MutatingMixin:
+            def __getattribute__(self, name: str) -> Any:
+                if name in {"__dict__", "__pydantic_extra__"} and object.__getattribute__(
+                    self,
+                    "__dict__",
+                ).get("armed"):
+                    object.__setattr__(self, "arguments", "mutated-by-post-declared-mixin")
+                return super().__getattribute__(name)
+
+        class MutatingCall(ResponseFunctionToolCall, MutatingMixin):
+            armed: bool = False
+
+        raw_item = MutatingCall(
+            type="function_call",
+            name="toolA",
+            call_id="cid-post-declared-mixin",
+            arguments="original",
+        )
+        agent = Agent(name="PostDeclaredMixinAgent")
+        state = make_state_with_interruptions(
+            agent,
+            [ToolApprovalItem(agent=agent, raw_item=raw_item)],
+        )
+        raw_item.armed = True
+
+        with pytest.raises(UserError, match="Cannot safely copy pending tool approvals"):
+            state.get_interruptions()
+
+        assert raw_item.arguments == "original"
+
+    @pytest.mark.parametrize(
+        ("location", "storage_name"),
+        [
+            ("outer", "__pydantic_extra__"),
+            ("nested", "__pydantic_fields_set__"),
+            ("outer", "__dict__"),
+        ],
+    )
+    def test_get_interruptions_rejects_pydantic_storage_descriptors(
+        self,
+        location: str,
+        storage_name: str,
+    ) -> None:
+        """Subtype storage descriptors must fail before public Pydantic instance access."""
+        hook_called = False
+        source_holder: dict[str, Any] = {}
+
+        def mutate_on_access(_instance: BaseModel) -> Any:
+            nonlocal hook_called
+            hook_called = True
+            source_model = source_holder["model"]
+            object.__setattr__(
+                source_model,
+                source_holder["field"],
+                source_holder["mutated_value"],
+            )
+            raise AssertionError("storage descriptor should not run")
+
+        class CustomCall(ResponseFunctionToolCall):
+            pass
+
+        class DictDescriptorCall(ResponseFunctionToolCall):
+            __dict__ = property(mutate_on_access)  # type: ignore[assignment]
+
+        class CustomAction(LocalShellCallAction):
+            pass
+
+        if location == "outer":
+            call_type = ResponseFunctionToolCall if storage_name == "__dict__" else CustomCall
+            raw_item: Any = call_type(
+                type="function_call",
+                name="toolA",
+                call_id="cid-storage-descriptor",
+                arguments="original",
+            )
+            if storage_name == "__dict__":
+                object.__setattr__(raw_item, "__class__", DictDescriptorCall)
+            source_model = raw_item
+            source_field = "arguments"
+            mutated_value: Any = "mutated-by-storage-descriptor"
+        else:
+            source_model = CustomAction(command=["echo", "ok"], env={}, type="exec")
+            raw_item = LocalShellCall(
+                id="local-shell-storage-descriptor",
+                action=source_model,
+                call_id="cid-storage-descriptor",
+                status="completed",
+                type="local_shell_call",
+            )
+            source_field = "command"
+            mutated_value = ["mutated-by-storage-descriptor"]
+
+        source_holder.update(
+            model=source_model,
+            field=source_field,
+            mutated_value=mutated_value,
+        )
+        if storage_name != "__dict__":
+            setattr(type(source_model), storage_name, property(mutate_on_access))
+        agent = Agent(name="StorageDescriptorAgent")
+        state = make_state_with_interruptions(
+            agent,
+            [ToolApprovalItem(agent=agent, raw_item=raw_item)],
+        )
+
+        with pytest.raises(UserError, match="Cannot safely copy pending tool approvals"):
+            state.get_interruptions()
+
+        assert not hook_called
+        if location == "outer":
+            assert source_model.arguments == "original"
+        else:
+            assert source_model.command == ["echo", "ok"]
+
+    @pytest.mark.parametrize("location", ["outer", "nested"])
+    def test_get_interruptions_rejects_pydantic_storage_container_hooks(
+        self,
+        location: str,
+    ) -> None:
+        """Pydantic storage containers must be plain dicts before public iteration."""
+
+        class MutatingStorage(dict[str, Any]):
+            def __init__(self, *args: Any, field: str, mutated_value: Any) -> None:
+                super().__init__(*args)
+                self.field = field
+                self.mutated_value = mutated_value
+
+            def items(self) -> Any:
+                self[self.field] = self.mutated_value
+                return super().items()
+
+        if location == "outer":
+            raw_item: Any = ResponseFunctionToolCall(
+                type="function_call",
+                name="toolA",
+                call_id="cid-storage-container",
+                arguments="original",
+            )
+            source_model = raw_item
+            source_field = "arguments"
+            mutated_value: Any = "mutated-by-storage-container"
+        else:
+            source_model = LocalShellCallAction(command=["echo", "ok"], env={}, type="exec")
+            raw_item = LocalShellCall(
+                id="local-shell-storage-container",
+                action=source_model,
+                call_id="cid-storage-container",
+                status="completed",
+                type="local_shell_call",
+            )
+            source_field = "command"
+            mutated_value = ["mutated-by-storage-container"]
+
+        storage = MutatingStorage(
+            object.__getattribute__(source_model, "__dict__"),
+            field=source_field,
+            mutated_value=mutated_value,
+        )
+        object.__setattr__(source_model, "__dict__", storage)
+        agent = Agent(name="StorageContainerAgent")
+        state = make_state_with_interruptions(
+            agent,
+            [ToolApprovalItem(agent=agent, raw_item=raw_item)],
+        )
+
+        with pytest.raises(UserError, match="Cannot safely copy pending tool approvals"):
+            state.get_interruptions()
+
+        if location == "outer":
+            assert source_model.arguments == "original"
+        else:
+            assert source_model.command == ["echo", "ok"]
+
+    @pytest.mark.parametrize("location", ["outer", "nested"])
+    def test_get_interruptions_does_not_dispatch_pydantic_storage_key_hooks(
+        self,
+        location: str,
+    ) -> None:
+        """Pydantic storage keys must be normalized without method dispatch."""
+        hook_called = False
+
+        class MutatingKey(str):
+            def __new__(
+                cls,
+                value: str,
+                owner: BaseModel,
+                field: str,
+                mutated_value: Any,
+            ) -> MutatingKey:
+                key = str.__new__(cls, value)
+                key.owner = owner
+                key.field = field
+                key.mutated_value = mutated_value
+                return key
+
+            def startswith(self, *args: Any, **kwargs: Any) -> bool:
+                nonlocal hook_called
+                hook_called = True
+                object.__setattr__(self.owner, self.field, self.mutated_value)
+                return str.startswith(self, *args, **kwargs)
+
+        if location == "outer":
+            raw_item: Any = ResponseFunctionToolCall(
+                type="function_call",
+                name="toolA",
+                call_id="cid-storage-key",
+                arguments="original",
+            )
+            source_model = raw_item
+            source_field = "arguments"
+            original_value: Any = "original"
+            mutated_value: Any = "mutated-by-storage-key"
+        else:
+            source_model = LocalShellCallAction(command=["echo", "ok"], env={}, type="exec")
+            raw_item = LocalShellCall(
+                id="local-shell-storage-key",
+                action=source_model,
+                call_id="cid-storage-key",
+                status="completed",
+                type="local_shell_call",
+            )
+            source_field = "command"
+            original_value = ["echo", "ok"]
+            mutated_value = ["mutated-by-storage-key"]
+
+        storage = object.__getattribute__(source_model, "__dict__")
+        assert type(storage) is dict
+        dict.__setitem__(
+            storage,
+            MutatingKey(
+                "subtype_only",
+                source_model,
+                source_field,
+                mutated_value,
+            ),
+            "ignored",
+        )
+        agent = Agent(name="StorageKeyAgent")
+        state = make_state_with_interruptions(
+            agent,
+            [ToolApprovalItem(agent=agent, raw_item=raw_item)],
+        )
+
+        snapshot = state.get_interruptions()[0]
+
+        assert not hook_called
+        assert getattr(source_model, source_field) == original_value
+        snapshot_raw_item = cast(Any, snapshot.raw_item)
+        snapshot_model = snapshot_raw_item if location == "outer" else snapshot_raw_item.action
+        assert getattr(snapshot_model, source_field) == original_value
+
+    @pytest.mark.parametrize("location", ["mapping", "typed_extra"])
+    def test_get_interruptions_does_not_dispatch_payload_class_properties(
+        self,
+        location: str,
+    ) -> None:
+        """Classifying arbitrary payload values must not access their __class__."""
+
+        class MutatingClassProbe:
+            def __init__(self, mutate: Callable[[], None]) -> None:
+                self.mutate = mutate
+
+            @property
+            def __class__(self) -> type[object]:
+                self.mutate()
+                return object
+
+        if location == "mapping":
+            raw_item: Any = {
+                "type": "function_call",
+                "name": "toolA",
+                "call_id": "cid-class-property",
+                "arguments": "original",
+            }
+            probe = MutatingClassProbe(
+                lambda: raw_item.__setitem__("arguments", "mutated-by-class-property")
+            )
+            raw_item["metadata"] = probe
+        else:
+            raw_item = ResponseFunctionToolCall(
+                type="function_call",
+                name="toolA",
+                call_id="cid-class-property",
+                arguments="original",
+            )
+            probe = MutatingClassProbe(
+                lambda: object.__setattr__(
+                    raw_item,
+                    "arguments",
+                    "mutated-by-class-property",
+                )
+            )
+            assert raw_item.model_extra is not None
+            raw_item.model_extra["metadata"] = probe
+        agent = Agent(name="ClassPropertyAgent")
+        state = make_state_with_interruptions(
+            agent,
+            [ToolApprovalItem(agent=agent, raw_item=raw_item)],
+        )
+
+        with pytest.raises(UserError, match="Cannot safely copy pending tool approvals"):
+            state.get_interruptions()
+
+        if location == "mapping":
+            assert raw_item["arguments"] == "original"
+        else:
+            assert raw_item.arguments == "original"
+
+    def test_get_interruptions_checks_later_adapter_subtypes_without_class_access(self) -> None:
+        """Adapter selection must reject hooks without reading instance __class__."""
+
+        class MutatingMcpCall(McpCall):
+            armed: bool = False
+
+            def __getattribute__(self, name: str) -> Any:
+                if name == "__class__" and object.__getattribute__(self, "__dict__").get("armed"):
+                    object.__setattr__(self, "arguments", "mutated-by-adapter-selection")
+                return super().__getattribute__(name)
+
+        raw_item = MutatingMcpCall(
+            id="mcp-hook-bearing-subtype",
+            arguments="original",
+            name="toolA",
+            server_label="server",
+            type="mcp_call",
+        )
+        agent = Agent(name="LaterAdapterSubtypeAgent")
+        state = make_state_with_interruptions(
+            agent,
+            [ToolApprovalItem(agent=agent, raw_item=raw_item)],
+        )
+        raw_item.armed = True
+
+        with pytest.raises(UserError, match="Cannot safely copy pending tool approvals"):
+            state.get_interruptions()
+
+        assert raw_item.arguments == "original"
+
+    def test_get_interruptions_uses_public_schema_for_nested_models(self) -> None:
+        """Base adapters must serialize nested models without subclass serializers."""
+
+        class CustomAction(LocalShellCallAction):
+            serializer_called: ClassVar[bool] = False
+            command: list[str] = ["echo", "ok"]
+            subtype_only: Any
+
+            @model_serializer(mode="wrap")
+            def serialize_custom_action(self, handler: Any) -> Any:
+                type(self).serializer_called = True
+                return handler(self)
+
+        action = CustomAction(
+            env={},
+            type="exec",
+            subtype_only=object(),
+        )
+        raw_item = LocalShellCall(
+            id="local-shell-public-schema",
+            action=action,
+            call_id="cid-local-shell-public-schema",
+            status="completed",
+            type="local_shell_call",
+        )
+        agent = Agent(name="PublicSchemaAgent")
+        state = make_state_with_interruptions(
+            agent,
+            [ToolApprovalItem(agent=agent, raw_item=raw_item)],
+        )
+
+        snapshot = state.get_interruptions()[0]
+
+        assert type(snapshot.raw_item) is LocalShellCall
+        assert snapshot.raw_item.action.command == ["echo", "ok"]
+        assert type(snapshot.raw_item.action) is LocalShellCallAction
+        assert snapshot.raw_item.action is not action
+        assert "command" not in snapshot.raw_item.action.model_fields_set
+        assert "command" not in snapshot.raw_item.action.model_dump(exclude_unset=True)
+        assert not CustomAction.serializer_called
+
+    def test_get_interruptions_uses_trusted_nested_model_annotations(self) -> None:
+        """Nested model discovery must not trust a caller-controlled module name."""
+        source_holder: dict[str, Any] = {}
+
+        class SpoofedAction(LocalShellCallAction):
+            construct_called: ClassVar[bool] = False
+
+            @classmethod
+            def model_construct(
+                cls,
+                _fields_set: set[str] | None = None,
+                **values: object,
+            ) -> Any:
+                cls.construct_called = True
+                source_holder["action"].command = ["mutated"]
+                return super().model_construct(_fields_set=_fields_set, **values)
+
+        SpoofedAction.__module__ = "openai.types.responses.spoofed"
+        action = SpoofedAction(command=["echo", "ok"], env={}, type="exec")
+        source_holder["action"] = action
+        raw_item = LocalShellCall(
+            id="local-shell-spoofed-module",
+            action=action,
+            call_id="cid-spoofed-module",
+            status="completed",
+            type="local_shell_call",
+        )
+        agent = Agent(name="SpoofedNestedModelAgent")
+        state = make_state_with_interruptions(
+            agent,
+            [ToolApprovalItem(agent=agent, raw_item=raw_item)],
+        )
+
+        snapshot = state.get_interruptions()[0]
+
+        assert not SpoofedAction.construct_called
+        assert action.command == ["echo", "ok"]
+        assert type(snapshot.raw_item.action) is LocalShellCallAction
+        assert snapshot.raw_item.action.command == ["echo", "ok"]
+
+    @pytest.mark.parametrize("location", ["mapping", "nested"])
+    def test_get_interruptions_rejects_normalized_key_collisions(self, location: str) -> None:
+        """Distinct source keys must not collapse into one approval identity field."""
+
+        class DistinctString(str):
+            def __hash__(self) -> int:
+                return id(self)
+
+            def __eq__(self, other: object) -> bool:
+                return self is other
+
+        colliding_key = DistinctString("call_id")
+        agent = Agent(name="KeyCollisionAgent")
+        if location == "mapping":
+            raw_item: Any = {
+                "type": "function_call",
+                "name": "toolA",
+                "call_id": "original",
+                "arguments": "{}",
+                colliding_key: "replacement",
+            }
+        else:
+            metadata = {"call_id": "original", colliding_key: "replacement"}
+            raw_item = {
+                "type": "function_call",
+                "name": "toolA",
+                "call_id": "cid-nested-collision",
+                "arguments": "{}",
+                "metadata": metadata,
+            }
+        state = make_state_with_interruptions(
+            agent,
+            [ToolApprovalItem(agent=agent, raw_item=raw_item)],
+        )
+
+        with pytest.raises(UserError, match="Cannot safely copy pending tool approvals"):
+            state.get_interruptions()
+
+        if location == "nested":
+            assert metadata["call_id"] == "original"
+            assert metadata[colliding_key] == "replacement"
+        else:
+            assert raw_item["call_id"] == "original"
+
+    def test_get_interruptions_bypasses_nested_container_hooks(self):
+        """Mapping snapshots must not invoke hooks on container subclasses."""
+
+        class MutatingDict(dict[str, Any]):
+            def items(self) -> Any:
+                self["serializer-side-effect"] = True
+                return super().items()
+
+        class MutatingList(list[str]):
+            def __iter__(self) -> Any:
+                self.append("serializer-side-effect")
+                return super().__iter__()
+
+        metadata = MutatingList(["original"])
+        raw_item = MutatingDict(
+            type="function_call",
+            name="toolA",
+            call_id="cid-hooks",
+            arguments="{}",
+            metadata=metadata,
+        )
+        agent = Agent(name="ContainerHooksAgent")
+        state = make_state_with_interruptions(
+            agent,
+            [ToolApprovalItem(agent=agent, raw_item=raw_item)],
+        )
+
+        interruption = state.get_interruptions()[0]
+
+        assert type(interruption.raw_item) is dict
+        assert interruption.raw_item["metadata"] == ["original"]
+        assert dict.__contains__(raw_item, "serializer-side-effect") is False
+        assert list.__len__(metadata) == 1
+
+    @pytest.mark.parametrize("non_finite", [float("nan"), float("inf"), float("-inf")])
+    def test_get_interruptions_rejects_non_finite_mapping_values(
+        self,
+        non_finite: float,
+    ) -> None:
+        """Non-standard JSON numbers must fail before a snapshot is returned."""
+        agent = Agent(name="NonFiniteAgent")
+        raw_item = {
+            "type": "function_call",
+            "name": "toolA",
+            "call_id": "cid-non-finite",
+            "arguments": "{}",
+            "metadata": non_finite,
+        }
+        state = make_state_with_interruptions(
+            agent,
+            [ToolApprovalItem(agent=agent, raw_item=raw_item)],
+        )
+
+        with pytest.raises(UserError, match="Cannot safely copy pending tool approvals"):
+            state.get_interruptions()
+
+    def test_get_interruptions_failure_does_not_expose_partial_snapshots(self):
+        """A later unsafe payload must fail without changing earlier pending items."""
+        agent = Agent(name="PartialFailureAgent")
+        first_raw_item = {
+            "type": "function_call",
+            "name": "toolA",
+            "call_id": "cid-safe",
+            "arguments": "original",
+        }
+        second_raw_item = {
+            "type": "function_call",
+            "name": "toolB",
+            "call_id": "cid-unsafe",
+            "arguments": "{}",
+            "metadata": object(),
+        }
+        state = make_state_with_interruptions(
+            agent,
+            [
+                ToolApprovalItem(agent=agent, raw_item=first_raw_item),
+                ToolApprovalItem(agent=agent, raw_item=second_raw_item),
+            ],
+        )
+
+        with pytest.raises(UserError, match="Cannot safely copy pending tool approvals"):
+            state.get_interruptions()
+
+        assert first_raw_item["arguments"] == "original"
+
+    def test_get_interruptions_rejects_unsafe_typed_extra_metadata(
+        self,
+    ) -> None:
+        """Unsafe typed extras must fail through the same bounded copy path."""
+        agent = Agent(name="TypedExtraFailureAgent")
+        raw_item = ResponseFunctionToolCall.model_validate(
+            {
+                "type": "function_call",
+                "name": "toolA",
+                "call_id": "cid-typed-extra",
+                "arguments": "{}",
+                "metadata": {"nested": object()},
+            }
+        )
+        state = make_state_with_interruptions(
+            agent,
+            [ToolApprovalItem(agent=agent, raw_item=raw_item)],
+        )
+
+        with pytest.raises(UserError, match="Cannot safely copy pending tool approvals"):
+            state.get_interruptions()
+
+    def test_get_interruptions_rejects_cyclic_mapping_data(self) -> None:
+        """Cyclic mapping content must fail without changing authoritative state."""
+        metadata: list[Any] = []
+        metadata.append(metadata)
+        agent = Agent(name="CyclicMappingAgent")
+        raw_item = {
+            "type": "function_call",
+            "name": "toolA",
+            "call_id": "cid-cycle",
+            "arguments": "{}",
+            "metadata": metadata,
+        }
+        state = make_state_with_interruptions(
+            agent,
+            [ToolApprovalItem(agent=agent, raw_item=raw_item)],
+        )
+
+        with pytest.raises(UserError, match="Cannot safely copy pending tool approvals"):
+            state.get_interruptions()
+
+        assert len(metadata) == 1
+        assert metadata[0] is metadata
+
+    @pytest.mark.parametrize(
+        "raw_item",
+        [
+            ResponseFunctionToolCall.model_validate(
+                {
+                    "type": "function_call",
+                    "name": "toolA",
+                    "call_id": "cid-function",
+                    "status": "completed",
+                    "arguments": "{}",
+                    "metadata": {"tags": ["function"]},
+                }
+            ),
+            ResponseCustomToolCall.model_validate(
+                {
+                    "type": "custom_tool_call",
+                    "name": "toolA",
+                    "call_id": "cid-custom",
+                    "input": "original",
+                    "metadata": {"tags": ["custom"]},
+                }
+            ),
+            ResponseFunctionShellToolCall.model_validate(
+                {
+                    "id": "shell-call",
+                    "action": {
+                        "commands": ["echo", "ok"],
+                        "metadata": {"tags": ["action"]},
+                    },
+                    "call_id": "cid-shell",
+                    "status": "completed",
+                    "type": "shell_call",
+                    "metadata": {"tags": ["shell"]},
+                }
+            ),
+            McpCall.model_validate(
+                {
+                    "id": "mcp-call",
+                    "arguments": "{}",
+                    "name": "toolA",
+                    "server_label": "server",
+                    "type": "mcp_call",
+                    "metadata": {"tags": ["mcp-call"]},
+                }
+            ),
+            McpApprovalRequest.model_validate(
+                {
+                    "id": "mcp-approval",
+                    "arguments": "{}",
+                    "name": "toolA",
+                    "server_label": "server",
+                    "type": "mcp_approval_request",
+                    "metadata": {"tags": ["mcp-approval"]},
+                }
+            ),
+            LocalShellCall.model_validate(
+                {
+                    "id": "local-shell",
+                    "action": LocalShellCallAction.model_validate(
+                        {
+                            "command": ["echo", "ok"],
+                            "env": {},
+                            "type": "exec",
+                            "metadata": {"tags": ["action"]},
+                        }
+                    ),
+                    "call_id": "cid-local-shell",
+                    "status": "completed",
+                    "type": "local_shell_call",
+                    "metadata": {"tags": ["local-shell"]},
+                }
+            ),
+        ],
+        ids=["function", "custom", "shell", "mcp-call", "mcp-approval", "local-shell"],
+    )
+    def test_get_interruptions_copies_each_typed_raw_item(self, raw_item: Any) -> None:
+        """Each declared typed approval payload must be reconstructed safely."""
+        agent = Agent(name="TypedRawItemAgent")
+        state = make_state_with_interruptions(
+            agent,
+            [ToolApprovalItem(agent=agent, raw_item=raw_item)],
+        )
+
+        interruption = state.get_interruptions()[0]
+
+        assert isinstance(interruption.raw_item, type(raw_item))
+        assert interruption.raw_item.model_dump() == raw_item.model_dump()
+        assert interruption.raw_item is not raw_item
+        assert interruption.raw_item.model_fields_set == raw_item.model_fields_set
+        interruption_extra = interruption.raw_item.model_extra
+        raw_extra = raw_item.model_extra
+        assert interruption_extra == raw_extra
+        assert interruption_extra is not None
+        assert raw_extra is not None
+        assert interruption_extra is not raw_extra
+
+        interruption_extra["metadata"]["tags"].append("changed")
+        assert raw_extra["metadata"]["tags"][-1] != "changed"
+        if isinstance(raw_item, LocalShellCall | ResponseFunctionShellToolCall):
+            interruption_action_extra = interruption.raw_item.action.model_extra
+            raw_action_extra = raw_item.action.model_extra
+            assert interruption_action_extra == raw_action_extra
+            assert interruption_action_extra is not None
+            assert raw_action_extra is not None
+            assert interruption_action_extra is not raw_action_extra
+            interruption_action_extra["metadata"]["tags"].append("changed")
+            assert raw_action_extra["metadata"]["tags"] == ["action"]
+
+    @pytest.mark.parametrize(
+        ("raw_item", "tool_name", "call_id"),
+        [
+            (
+                ResponseCustomToolCall(
+                    type="custom_tool_call",
+                    name="custom_tool",
+                    call_id="cid-custom-decision",
+                    input="original",
+                ),
+                "custom_tool",
+                "cid-custom-decision",
+            ),
+            (
+                ResponseFunctionShellToolCall.model_validate(
+                    {
+                        "id": "shell-decision",
+                        "action": {"commands": ["echo", "ok"]},
+                        "call_id": "cid-shell-decision",
+                        "status": "completed",
+                        "type": "shell_call",
+                    }
+                ),
+                "shell",
+                "cid-shell-decision",
+            ),
+        ],
+        ids=["custom", "shell"],
+    )
+    @pytest.mark.parametrize("approve", [True, False], ids=["approve", "reject"])
+    def test_approval_pipeline_models_can_apply_detached_decisions(
+        self,
+        raw_item: Any,
+        tool_name: str,
+        call_id: str,
+        approve: bool,
+    ) -> None:
+        """Production approval models must detach and retain canonical routing identity."""
+        agent = Agent(name="PipelineDecisionAgent")
+        approval_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=raw_item,
+            tool_name=tool_name,
+        )
+        state = make_state_with_interruptions(agent, [approval_item])
+
+        interruption = state.get_interruptions()[0]
+        if approve:
+            state.approve(interruption)
+        else:
+            state.reject(interruption)
+
+        assert state._context is not None
+        assert state._context.is_tool_approved(tool_name, call_id) is approve
+
+    def test_get_interruptions_detaches_a_nested_mutable_alias(self):
+        """Snapshot copying must not trust a nested object's deepcopy implementation."""
+
+        class SelfCopyingList(list[str]):
+            def __deepcopy__(self, _memo: dict[int, Any]) -> SelfCopyingList:
+                return self
+
+        agent = Agent(name="AliasedAgent")
+        metadata = SelfCopyingList(["original"])
+        approval_item = ToolApprovalItem(
+            agent=agent,
+            raw_item={
+                "type": "function_call",
+                "name": "toolA",
+                "call_id": "cid-aliased",
+                "status": "completed",
+                "arguments": "{}",
+                "metadata": metadata,
+            },
+        )
+        state = make_state_with_interruptions(agent, [approval_item])
+
+        interruption = state.get_interruptions()[0]
+        assert isinstance(interruption.raw_item, dict)
+        interruption.raw_item["metadata"].append("changed")
+
+        assert metadata == ["original"]
 
     async def test_serializes_and_restores_approvals(self):
         """Test that approval state is preserved through serialization."""
@@ -1564,6 +2966,1054 @@ class TestRunState:
         assert new_state._context.is_tool_approved(tool_name="tool1", call_id="cid1") is True
         assert new_state._context.is_tool_approved(tool_name="tool2", call_id="cid2") is False
         assert new_state._context.get_rejection_message("tool2", "cid2") is None
+
+    @pytest.mark.parametrize("sticky_approved", [True, False], ids=["approve", "reject"])
+    async def test_exact_call_override_round_trips_with_sticky_default(
+        self,
+        sticky_approved: bool,
+    ) -> None:
+        """A current snapshot preserves an exact exception and the sticky default."""
+        context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+        agent = Agent(name="MixedApprovalAgent")
+        state = make_state(agent, context=context, original_input="test")
+
+        def approval(call_id: str) -> ToolApprovalItem:
+            return ToolApprovalItem(
+                agent=agent,
+                raw_item=ResponseFunctionToolCall(
+                    type="function_call",
+                    name="tool1",
+                    call_id=call_id,
+                    status="completed",
+                    arguments="{}",
+                ),
+            )
+
+        if sticky_approved:
+            state.approve(approval("sticky"), always_approve=True)
+            state.reject(approval("exception"), rejection_message="denied exactly")
+        else:
+            state.reject(
+                approval("sticky"),
+                always_reject=True,
+                rejection_message="denied by default",
+            )
+            state.approve(approval("exception"))
+
+        serialized = state.to_json()
+        assert serialized["$schemaVersion"] == CURRENT_SCHEMA_VERSION
+
+        restored = await RunState.from_json(agent, serialized)
+        assert restored._context is not None
+        expected_exact = not sticky_approved
+        assert restored._context.is_tool_approved("tool1", "exception") is expected_exact
+        assert restored._context.is_tool_approved("tool1", "other") is sticky_approved
+        assert restored._context.get_rejection_message("tool1", "exception") == (
+            "denied exactly" if sticky_approved else None
+        )
+
+    @pytest.mark.parametrize("sticky_approved", [True, False], ids=["approve", "reject"])
+    async def test_schema_1_15_mixed_approval_record_keeps_exact_decision(
+        self,
+        sticky_approved: bool,
+    ) -> None:
+        """An explicit decision in a legacy snapshot remains authoritative."""
+        context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+        agent = Agent(name="LegacyMixedApprovalAgent")
+        state = make_state(agent, context=context, original_input="test")
+
+        def approval(call_id: str) -> ToolApprovalItem:
+            return ToolApprovalItem(
+                agent=agent,
+                raw_item=ResponseFunctionToolCall(
+                    type="function_call",
+                    name="tool1",
+                    call_id=call_id,
+                    status="completed",
+                    arguments="{}",
+                ),
+            )
+
+        if sticky_approved:
+            state.approve(approval("sticky"), always_approve=True)
+            state.reject(approval("exception"), rejection_message="denied exactly")
+        else:
+            state.reject(approval("sticky"), always_reject=True)
+            state.approve(approval("exception"))
+
+        serialized = state.to_json()
+        serialized["$schemaVersion"] = "1.15"
+
+        restored = await RunState.from_json(agent, serialized)
+        assert restored._context is not None
+        expected_exact = not sticky_approved
+        assert restored._context.is_tool_approved("tool1", "exception") is expected_exact
+        assert restored._context.is_tool_approved("tool1", "other") is sticky_approved
+
+    async def test_schema_1_13_restores_pending_approval_binding_from_interruption(self):
+        """A 1.13 snapshot may resume only the exact invocation that was approved."""
+        agent = Agent(name="ApprovalLegacyAgent")
+        approved_call = make_function_tool_call(
+            "tool1",
+            call_id="cid1",
+            arguments='{"value":"safe"}',
+        )
+        approval_item = ToolApprovalItem(agent=agent, raw_item=approved_call)
+        state = make_state_with_interruptions(agent, [approval_item])
+        state.approve(approval_item)
+        json_data = state.to_json()
+        json_data["$schemaVersion"] = "1.13"
+        json_data["context"].pop("tool_invocations", None)
+
+        restored = await RunState.from_json(agent, json_data)
+
+        assert restored._context is not None
+        restored_item = restored.get_interruptions()[0]
+        assert (
+            restored._context.get_approval_status(
+                "tool1",
+                "cid1",
+                existing_pending=restored_item,
+            )
+            is True
+        )
+        changed_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=make_function_tool_call(
+                "tool1",
+                call_id="cid1",
+                arguments='{"value":"changed"}',
+            ),
+        )
+        with pytest.raises(ModelBehaviorError, match="unique call ID"):
+            restored._context.get_approval_status(
+                "tool1",
+                "cid1",
+                existing_pending=restored_item,
+                current_invocation=changed_item,
+            )
+
+    @pytest.mark.parametrize("schema_version", ["1.13", "1.14"])
+    async def test_legacy_schema_sticky_approval_binds_pending_function_invocation(
+        self,
+        schema_version: str,
+    ):
+        """A legacy sticky decision cannot authorize changed resumed arguments."""
+        agent = Agent(name="ApprovalLegacyAgent")
+        approved_call = make_function_tool_call(
+            "tool1",
+            call_id="cid1",
+            arguments='{"value":"safe"}',
+        )
+        approval_item = ToolApprovalItem(agent=agent, raw_item=approved_call)
+        state = make_state_with_interruptions(agent, [approval_item])
+        state.approve(approval_item, always_approve=True)
+        json_data = state.to_json()
+        json_data["$schemaVersion"] = schema_version
+        json_data["context"].pop("tool_invocations", None)
+
+        restored = await RunState.from_json(agent, json_data)
+
+        assert restored._context is not None
+        restored_item = restored.get_interruptions()[0]
+        changed_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=make_function_tool_call(
+                "tool1",
+                call_id="cid1",
+                arguments='{"value":"changed"}',
+            ),
+        )
+        with pytest.raises(ModelBehaviorError, match="unique call ID"):
+            restored._context.get_approval_status(
+                "tool1",
+                "cid1",
+                existing_pending=restored_item,
+                current_invocation=changed_item,
+            )
+
+    async def test_schema_1_14_sticky_approval_binds_pending_hosted_mcp_invocation(self):
+        """A restored hosted MCP sticky decision binds the pending request payload."""
+        agent = Agent(name="ApprovalLegacyAgent")
+        approval_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=McpApprovalRequest(
+                id="request-a",
+                type="mcp_approval_request",
+                arguments='{"value":"safe"}',
+                name="lookup_account",
+                server_label="server-a",
+            ),
+        )
+        state = make_state_with_interruptions(agent, [approval_item])
+        state.approve(approval_item, always_approve=True)
+        json_data = state.to_json()
+        json_data["$schemaVersion"] = "1.14"
+        json_data["context"].pop("tool_invocations", None)
+
+        restored = await RunState.from_json(agent, json_data)
+
+        assert restored._context is not None
+        restored_item = restored.get_interruptions()[0]
+        changed_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=McpApprovalRequest(
+                id="request-a",
+                type="mcp_approval_request",
+                arguments='{"value":"changed"}',
+                name="lookup_account",
+                server_label="server-a",
+            ),
+        )
+        with pytest.raises(ModelBehaviorError, match="unique call ID"):
+            restored._context.get_approval_status(
+                "lookup_account",
+                "request-a",
+                existing_pending=restored_item,
+                current_invocation=changed_item,
+            )
+
+    async def test_current_schema_does_not_reconstruct_missing_approval_binding(self):
+        """A malformed current snapshot must require a new approval decision."""
+        agent = Agent(name="ApprovalCurrentAgent")
+        approved_call = make_function_tool_call(
+            "tool1",
+            call_id="cid1",
+            arguments='{"value":"safe"}',
+        )
+        approval_item = ToolApprovalItem(agent=agent, raw_item=approved_call)
+        state = make_state_with_interruptions(agent, [approval_item])
+        state.approve(approval_item)
+        json_data = state.to_json()
+        json_data["context"].pop("tool_invocations", None)
+
+        restored = await RunState.from_json(agent, json_data)
+
+        assert restored._context is not None
+        restored_item = restored.get_interruptions()[0]
+        assert (
+            restored._context.get_approval_status(
+                "tool1",
+                "cid1",
+                existing_pending=restored_item,
+            )
+            is None
+        )
+
+    async def test_current_schema_sticky_approval_requires_restored_pending_binding(self):
+        """A malformed sticky snapshot cannot treat a resumed call ID as fresh."""
+        agent = Agent(name="ApprovalCurrentAgent")
+        approved_call = make_function_tool_call(
+            "tool1",
+            call_id="cid1",
+            arguments='{"value":"safe"}',
+        )
+        approval_item = ToolApprovalItem(agent=agent, raw_item=approved_call)
+        state = make_state_with_interruptions(agent, [approval_item])
+        state.approve(approval_item, always_approve=True)
+        json_data = state.to_json()
+        json_data["context"].pop("tool_invocations", None)
+
+        restored = await RunState.from_json(agent, json_data)
+
+        assert restored._context is not None
+        restored_item = restored.get_interruptions()[0]
+        assert (
+            restored._context.get_approval_status(
+                "tool1",
+                "cid1",
+                existing_pending=restored_item,
+            )
+            is None
+        )
+        changed_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=make_function_tool_call(
+                "tool1",
+                call_id="cid1",
+                arguments='{"value":"changed"}',
+            ),
+        )
+        assert (
+            restored._context.get_approval_status(
+                "tool1",
+                "cid1",
+                existing_pending=restored_item,
+                current_invocation=changed_item,
+            )
+            is None
+        )
+        fresh_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=make_function_tool_call(
+                "tool1",
+                call_id="cid-fresh",
+                arguments='{"value":"fresh"}',
+            ),
+        )
+        assert (
+            restored._context.get_approval_status(
+                "tool1",
+                "cid-fresh",
+                current_invocation=fresh_item,
+            )
+            is True
+        )
+
+        tool_context = ToolContext.from_agent_context(
+            restored._context,
+            tool_call_id="cid1",
+            tool_call=approved_call,
+        )
+        assert (
+            tool_context.get_approval_status(
+                "tool1",
+                "cid1",
+                existing_pending=restored_item,
+            )
+            is None
+        )
+
+        hook_statuses: list[bool | None] = []
+
+        class ApprovalProbeHooks(RunHooks[Any]):
+            async def on_agent_start(self, context: Any, _agent: Agent[Any]) -> None:
+                hook_statuses.append(
+                    context.get_approval_status(
+                        "tool1",
+                        "cid1",
+                        existing_pending=restored_item,
+                    )
+                )
+
+        probe_agent = Agent(
+            name="ApprovalProbeAgent",
+            model=ScriptedModel(steps=[[get_text_message("done")]]),
+        )
+        await Runner.run(
+            probe_agent,
+            "probe approval state",
+            context=restored._context,
+            hooks=ApprovalProbeHooks(),
+        )
+
+        assert hook_statuses == [None]
+        assert "cid1" not in restored._context._tool_invocations
+
+    @pytest.mark.parametrize("sticky", [False, True], ids=["per_call", "sticky"])
+    async def test_current_schema_mismatched_pending_ledger_binding_requires_reapproval(
+        self,
+        sticky: bool,
+    ) -> None:
+        """A restored ledger entry must match the pending invocation before authorizing it."""
+        agent = Agent(name="ApprovalCurrentAgent")
+        approved_call = make_function_tool_call(
+            "tool1",
+            call_id="cid1",
+            arguments='{"value":"safe"}',
+        )
+        approval_item = ToolApprovalItem(agent=agent, raw_item=approved_call)
+        state = make_state_with_interruptions(agent, [approval_item])
+        state.approve(approval_item, always_approve=sticky)
+        json_data = state.to_json()
+
+        changed_call = make_function_tool_call(
+            "tool1",
+            call_id="cid1",
+            arguments='{"value":"changed"}',
+        )
+        changed_identity = tool_invocation_identity_and_scope(changed_call)
+        assert changed_identity is not None
+        invocation_type, _, approval_scope, fingerprint = changed_identity
+        json_data["context"]["tool_invocations"]["cid1"].update(
+            {
+                "type": invocation_type,
+                "approval_scope": approval_scope,
+                "fingerprint": fingerprint,
+            }
+        )
+
+        restored = await RunState.from_json(agent, json_data)
+
+        assert restored._context is not None
+        restored_item = restored.get_interruptions()[0]
+        changed_item = ToolApprovalItem(agent=agent, raw_item=changed_call)
+        assert (
+            restored._context.get_approval_status(
+                "tool1",
+                "cid1",
+                existing_pending=restored_item,
+                current_invocation=changed_item,
+            )
+            is None
+        )
+        if sticky:
+            fresh_item = ToolApprovalItem(
+                agent=agent,
+                raw_item=make_function_tool_call(
+                    "tool1",
+                    call_id="cid-fresh",
+                    arguments='{"value":"fresh"}',
+                ),
+            )
+            assert (
+                restored._context.get_approval_status(
+                    "tool1",
+                    "cid-fresh",
+                    current_invocation=fresh_item,
+                )
+                is True
+            )
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("type", "unknown_tool_call"),
+            ("approval_scope", "not-a-digest"),
+            ("fingerprint", 123),
+            ("fingerprint", "A" * 64),
+        ],
+    )
+    async def test_current_schema_rejects_malformed_tool_invocation_ledger(
+        self,
+        field: str,
+        value: Any,
+    ):
+        """Current snapshots fail closed when canonical invocation data is malformed."""
+        agent = Agent(name="ApprovalCurrentAgent")
+        approved_call = make_function_tool_call(
+            "tool1",
+            call_id="cid1",
+            arguments='{"value":"safe"}',
+        )
+        approval_item = ToolApprovalItem(agent=agent, raw_item=approved_call)
+        state = make_state_with_interruptions(agent, [approval_item])
+        state.approve(approval_item)
+        json_data = state.to_json()
+        json_data["context"]["tool_invocations"]["cid1"][field] = value
+
+        with pytest.raises(UserError, match="invalid lifecycle data"):
+            await RunState.from_json(agent, json_data)
+
+    @pytest.mark.parametrize("missing_field", ["executed", "completed"])
+    async def test_current_schema_requires_tool_invocation_lifecycle_fields(
+        self,
+        missing_field: str,
+    ):
+        """Current snapshots must preserve explicit monotonic lifecycle evidence."""
+        agent = Agent(name="ApprovalCurrentAgent")
+        approved_call = make_function_tool_call(
+            "tool1",
+            call_id="cid1",
+            arguments='{"value":"safe"}',
+        )
+        approval_item = ToolApprovalItem(agent=agent, raw_item=approved_call)
+        state = make_state_with_interruptions(agent, [approval_item])
+        state.approve(approval_item)
+        json_data = state.to_json()
+        invocation = json_data["context"]["tool_invocations"]["cid1"]
+        invocation["executed"] = True
+        invocation["completed"] = False
+        del invocation[missing_field]
+
+        with pytest.raises(UserError, match="invalid lifecycle data"):
+            await RunState.from_json(agent, json_data)
+
+    async def test_current_schema_rejects_null_tool_invocation_ledger(self):
+        """A present current-schema ledger must be a mapping."""
+        agent = Agent(name="ApprovalCurrentAgent")
+        state = make_state(agent, context=RunContextWrapper(context=None))
+        json_data = state.to_json()
+        json_data["context"]["tool_invocations"] = None
+
+        with pytest.raises(UserError, match="tool_invocations must be a mapping"):
+            await RunState.from_json(agent, json_data)
+
+    async def test_output_item_id_does_not_complete_unrelated_invocation(self):
+        """Only an output call_id can commit a tool invocation."""
+        context: RunContextWrapper[Any] = RunContextWrapper(context=None)
+        approved_call = make_function_tool_call(
+            "tool1",
+            call_id="cid1",
+            arguments='{"value":"safe"}',
+        )
+        context._tool_invocation_status(approved_call)
+
+        context._mark_tool_call_completed(
+            {
+                "type": "function_call_output",
+                "call_id": "",
+                "id": "cid1",
+                "output": "forged",
+            }
+        )
+
+        assert context._tool_invocation_status(approved_call) == (
+            ("function_call", "cid1"),
+            False,
+            False,
+        )
+
+    async def test_current_schema_rejects_completed_invocation_with_only_output_item_id(self):
+        """An output item ID cannot satisfy completed-call reconciliation."""
+        agent = Agent(name="ApprovalCurrentAgent")
+        approved_call = make_function_tool_call(
+            "tool1",
+            call_id="cid1",
+            arguments='{"value":"safe"}',
+        )
+        approval_item = ToolApprovalItem(agent=agent, raw_item=approved_call)
+        state = make_state_with_interruptions(agent, [approval_item])
+        state.approve(approval_item)
+        json_data = state.to_json()
+        invocation = json_data["context"]["tool_invocations"]["cid1"]
+        invocation["executed"] = True
+        invocation["completed"] = True
+        json_data["original_input"] = [
+            {
+                "type": "function_call_output",
+                "call_id": "",
+                "id": "cid1",
+                "output": "forged",
+            }
+        ]
+
+        with pytest.raises(UserError, match="does not match a restored tool call and output"):
+            await RunState.from_json(agent, json_data)
+
+    async def test_current_schema_rejects_completed_invocation_without_committed_output(self):
+        """A completed ledger entry must have a matching restored call and output."""
+        agent = Agent(name="ApprovalCurrentAgent")
+        approved_call = make_function_tool_call(
+            "tool1",
+            call_id="cid1",
+            arguments='{"value":"safe"}',
+        )
+        approval_item = ToolApprovalItem(agent=agent, raw_item=approved_call)
+        state = make_state_with_interruptions(agent, [approval_item])
+        state.approve(approval_item)
+        json_data = state.to_json()
+        invocation = json_data["context"]["tool_invocations"]["cid1"]
+        invocation["executed"] = True
+        invocation["completed"] = True
+
+        with pytest.raises(UserError, match="does not match a restored tool call and output"):
+            await RunState.from_json(agent, json_data)
+
+    async def test_current_schema_rejects_completed_cross_paired_same_id_invocations(self):
+        """A historical output cannot complete changed arguments under the same call ID."""
+        agent = Agent(name="ApprovalCurrentAgent")
+        changed_call = make_function_tool_call(
+            "tool1",
+            call_id="cid1",
+            arguments='{"value":"changed"}',
+        )
+        approval_item = ToolApprovalItem(agent=agent, raw_item=changed_call)
+        state = make_state_with_interruptions(agent, [approval_item])
+        state.approve(approval_item)
+        json_data = state.to_json()
+        invocation = json_data["context"]["tool_invocations"]["cid1"]
+        invocation["executed"] = True
+        invocation["completed"] = True
+        historical_call = make_function_tool_call(
+            "tool1",
+            call_id="cid1",
+            arguments='{"value":"safe"}',
+        )
+        json_data["original_input"] = [
+            historical_call.model_dump(exclude_none=True),
+            {
+                "type": "function_call_output",
+                "call_id": "cid1",
+                "output": "safe",
+            },
+        ]
+
+        with pytest.raises(UserError, match="does not match a restored tool call and output"):
+            await RunState.from_json(agent, json_data)
+
+    async def test_current_schema_rejects_completed_id_with_malformed_call_occurrence(self):
+        """A malformed same-ID occurrence invalidates completed-ledger authority."""
+        agent = Agent(name="ApprovalCurrentAgent")
+        approved_call = make_function_tool_call(
+            "tool1",
+            call_id="cid1",
+            arguments='{"value":"safe"}',
+        )
+        approval_item = ToolApprovalItem(agent=agent, raw_item=approved_call)
+        state = make_state_with_interruptions(agent, [approval_item])
+        state.approve(approval_item)
+        json_data = state.to_json()
+        invocation = json_data["context"]["tool_invocations"]["cid1"]
+        invocation["executed"] = True
+        invocation["completed"] = True
+        json_data["original_input"] = [
+            approved_call.model_dump(exclude_none=True),
+            {
+                "type": "function_call",
+                "name": "missing",
+                "call_id": "cid1",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "cid1",
+                "output": "safe",
+            },
+        ]
+
+        with pytest.raises(UserError, match="does not match a restored tool call and output"):
+            await RunState.from_json(agent, json_data)
+
+    async def test_current_schema_missing_call_id_cannot_create_sticky_approval(self):
+        """Approving a malformed current interruption must not authorize later calls."""
+        agent = Agent(name="ApprovalCurrentAgent")
+        approval_item = ToolApprovalItem(
+            agent=agent,
+            raw_item={
+                "type": "function_call",
+                "name": "tool1",
+                "arguments": '{"value":"safe"}',
+            },
+        )
+        state = make_state_with_interruptions(agent, [approval_item])
+        restored = await RunState.from_json(agent, state.to_json())
+
+        assert restored._context is not None
+        with pytest.raises(ModelBehaviorError, match="non-empty call ID"):
+            restored.approve(restored.get_interruptions()[0])
+
+        assert restored._context._approvals == {}
+        fresh_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=make_function_tool_call(
+                "tool1",
+                call_id="cid-fresh",
+                arguments='{"value":"safe"}',
+            ),
+        )
+        assert (
+            restored._context.get_approval_status(
+                "tool1",
+                "cid-fresh",
+                current_invocation=fresh_item,
+            )
+            is None
+        )
+
+    @pytest.mark.parametrize(
+        "raw_item",
+        [
+            {
+                "type": "function_call",
+                "name": "tool1",
+                "call_id": "cid1",
+            },
+            {
+                "type": "mcp_approval_request",
+                "name": "lookup_account",
+                "server_label": "server-a",
+                "id": "request-a",
+            },
+            {
+                "type": "unknown_tool_call",
+                "name": "tool1",
+                "call_id": "cid1",
+            },
+            {
+                "type": "unknown_tool_call",
+                "name": "tool1",
+                "id": "provider-id",
+            },
+            {
+                "type": "mcp_approval_request",
+                "name": "",
+                "server_label": "server-a",
+                "arguments": "{}",
+                "id": "request-empty-name",
+            },
+            {
+                "type": "mcp_approval_request",
+                "name": "lookup_account",
+                "server_label": None,
+                "arguments": "{}",
+                "id": "request-null-server",
+            },
+            {
+                "type": "hosted_tool_call",
+                "call_id": "request-wrapped-empty-name",
+                "provider_data": {
+                    "type": "mcp_approval_request",
+                    "name": "",
+                    "server_label": "server-a",
+                    "arguments": "{}",
+                },
+            },
+        ],
+    )
+    async def test_approval_decision_requires_canonical_invocation(self, raw_item: dict[str, Any]):
+        """An unbindable recognized item cannot create approval authority."""
+        agent = Agent(name="ApprovalCurrentAgent")
+        approval_item = ToolApprovalItem(agent=agent, raw_item=raw_item)
+        state = make_state_with_interruptions(agent, [approval_item])
+
+        with pytest.raises(ModelBehaviorError, match="canonical invocation identity"):
+            state.approve(approval_item)
+
+        assert state._context is not None
+        assert state._context._approvals == {}
+
+    async def test_current_schema_orphaned_per_call_approval_requires_reapproval(self):
+        """A restored per-call decision without a ledger entry cannot bind a new payload."""
+        agent = Agent(name="ApprovalCurrentAgent")
+        approved_call = make_function_tool_call(
+            "tool1",
+            call_id="cid1",
+            arguments='{"value":"safe"}',
+        )
+        state: RunState[Any, Agent[Any]] = make_state(agent, context=RunContextWrapper(context={}))
+        state.approve(ToolApprovalItem(agent=agent, raw_item=approved_call))
+        serialized = state.to_json()
+        serialized["context"]["tool_invocations"] = {}
+
+        restored = await RunState.from_json(agent, serialized)
+
+        assert restored._context is not None
+        changed_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=make_function_tool_call(
+                "tool1",
+                call_id="cid1",
+                arguments='{"value":"changed"}',
+            ),
+        )
+        assert (
+            restored._context.get_approval_status(
+                "tool1",
+                "cid1",
+                current_invocation=changed_item,
+            )
+            is None
+        )
+        assert "cid1" not in restored._context._tool_invocations
+
+    @pytest.mark.parametrize("schema_version", ["1.13", "1.14"])
+    @pytest.mark.parametrize("arguments", ['{"value":"safe"}', '{"value":"changed"}'])
+    async def test_legacy_schema_orphaned_per_call_approval_requires_reapproval(
+        self,
+        schema_version: str,
+        arguments: str,
+    ):
+        """A legacy per-call decision without a reconstructable call is not authority."""
+        agent = Agent(name="ApprovalLegacyAgent")
+        approved_call = make_function_tool_call(
+            "tool1",
+            call_id="cid1",
+            arguments='{"value":"safe"}',
+        )
+        state: RunState[Any, Agent[Any]] = make_state(agent, context=RunContextWrapper(context={}))
+        state.approve(ToolApprovalItem(agent=agent, raw_item=approved_call))
+        serialized = state.to_json()
+        serialized["$schemaVersion"] = schema_version
+        serialized["context"].pop("tool_invocations", None)
+
+        restored = await RunState.from_json(agent, serialized)
+
+        assert restored._context is not None
+        current_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=make_function_tool_call(
+                "tool1",
+                call_id="cid1",
+                arguments=arguments,
+            ),
+        )
+        assert (
+            restored._context.get_approval_status(
+                "tool1",
+                "cid1",
+                current_invocation=current_item,
+            )
+            is None
+        )
+        assert "cid1" not in restored._context._tool_invocations
+
+        restored.approve(current_item)
+
+        assert (
+            restored._context.get_approval_status(
+                "tool1",
+                "cid1",
+                current_invocation=current_item,
+            )
+            is True
+        )
+
+    async def test_current_schema_missing_ledger_marks_historical_sticky_call_unbound(self):
+        """A historical ID cannot borrow sticky authority when its ledger entry is missing."""
+        agent = Agent(name="ApprovalCurrentAgent")
+        approved_call = make_function_tool_call(
+            "tool1",
+            call_id="cid1",
+            arguments='{"value":"safe"}',
+        )
+        state: RunState[Any, Agent[Any]] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+            original_input=[approved_call.model_dump(exclude_none=True)],
+        )
+        state.approve(
+            ToolApprovalItem(agent=agent, raw_item=approved_call),
+            always_approve=True,
+        )
+        serialized = state.to_json()
+        serialized["context"].pop("tool_invocations")
+
+        restored = await RunState.from_json(agent, serialized)
+
+        assert restored._context is not None
+        changed_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=make_function_tool_call(
+                "tool1",
+                call_id="cid1",
+                arguments='{"value":"changed"}',
+            ),
+        )
+        assert (
+            restored._context.get_approval_status(
+                "tool1",
+                "cid1",
+                current_invocation=changed_item,
+            )
+            is None
+        )
+        fresh_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=make_function_tool_call(
+                "tool1",
+                call_id="cid-fresh",
+                arguments='{"value":"fresh"}',
+            ),
+        )
+        assert (
+            restored._context.get_approval_status(
+                "tool1",
+                "cid-fresh",
+                current_invocation=fresh_item,
+            )
+            is True
+        )
+
+    @pytest.mark.parametrize("missing_field", ["arguments", "server_label"])
+    async def test_current_schema_unbindable_pending_approval_cannot_bind_replacement(
+        self,
+        missing_field: str,
+    ):
+        """A malformed current pending item cannot lend authority to a replacement payload."""
+        agent = Agent(name="ApprovalCurrentAgent")
+        approval_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=McpApprovalRequest(
+                id="request-a",
+                type="mcp_approval_request",
+                arguments='{"value":"safe"}',
+                name="lookup_account",
+                server_label="server-a",
+            ),
+        )
+        state = make_state_with_interruptions(agent, [approval_item])
+        assert state._context is not None
+        state._context._rebuild_approvals(  # noqa: SLF001
+            {
+                "lookup_account": {
+                    "approved": ["request-a"],
+                    "rejected": [],
+                }
+            }
+        )
+        serialized = state.to_json()
+        serialized["context"].pop("tool_invocations", None)
+        serialized["current_step"]["data"]["interruptions"][0]["raw_item"].pop(missing_field)
+
+        restored = await RunState.from_json(agent, serialized)
+
+        assert restored._context is not None
+        restored_item = restored.get_interruptions()[0]
+        current_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=McpApprovalRequest(
+                id="request-a",
+                type="mcp_approval_request",
+                arguments='{"value":"changed"}',
+                name="lookup_account",
+                server_label="server-a",
+            ),
+        )
+        assert (
+            restored._context.get_approval_status(
+                "lookup_account",
+                "request-a",
+                existing_pending=restored_item,
+                current_invocation=current_item,
+            )
+            is None
+        )
+
+    async def test_current_schema_unbindable_pending_with_ledger_requires_reapproval(self):
+        """An unbindable pending item overrides even a matching serialized ledger entry."""
+        agent = Agent(name="ApprovalCurrentAgent")
+        approved_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=McpApprovalRequest(
+                id="request-a",
+                type="mcp_approval_request",
+                arguments='{"value":"safe"}',
+                name="lookup_account",
+                server_label="server-a",
+            ),
+        )
+        state = make_state_with_interruptions(agent, [approved_item])
+        state.approve(approved_item)
+        serialized = state.to_json()
+        serialized["current_step"]["data"]["interruptions"][0]["raw_item"].pop("arguments")
+
+        restored = await RunState.from_json(agent, serialized)
+
+        assert restored._context is not None
+        restored_pending = restored.get_interruptions()[0]
+        safe_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=McpApprovalRequest(
+                id="request-a",
+                type="mcp_approval_request",
+                arguments='{"value":"safe"}',
+                name="lookup_account",
+                server_label="server-a",
+            ),
+        )
+        assert (
+            restored._context.get_approval_status(
+                "lookup_account",
+                "request-a",
+                existing_pending=restored_pending,
+                current_invocation=safe_item,
+            )
+            is None
+        )
+
+        changed_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=McpApprovalRequest(
+                id="request-a",
+                type="mcp_approval_request",
+                arguments='{"value":"changed"}',
+                name="lookup_account",
+                server_label="server-a",
+            ),
+        )
+        with pytest.raises(ModelBehaviorError, match="unique call ID"):
+            restored._context.approve_tool(changed_item)
+
+        assert (
+            restored._context.get_approval_status(
+                "lookup_account",
+                "request-a",
+                existing_pending=restored_pending,
+                current_invocation=safe_item,
+            )
+            is None
+        )
+
+        restored._context.approve_tool(safe_item)
+
+        assert (
+            restored._context.get_approval_status(
+                "lookup_account",
+                "request-a",
+                existing_pending=restored_pending,
+                current_invocation=safe_item,
+            )
+            is True
+        )
+
+    async def test_current_schema_missing_ledger_rejects_malformed_current_authority(self):
+        """A malformed current call cannot consume a decision whose binding is missing."""
+        agent = Agent(name="ApprovalCurrentAgent")
+        approved_call = make_function_tool_call(
+            "tool1",
+            call_id="cid1",
+            arguments='{"value":"safe"}',
+        )
+        approval_item = ToolApprovalItem(agent=agent, raw_item=approved_call)
+        state = make_state_with_interruptions(agent, [approval_item])
+        state.approve(approval_item)
+        serialized = state.to_json()
+        serialized["context"]["tool_invocations"] = {}
+
+        restored = await RunState.from_json(agent, serialized)
+
+        assert restored._context is not None
+        restored_pending = restored.get_interruptions()[0]
+        malformed_current = ToolApprovalItem(
+            agent=agent,
+            raw_item=ResponseFunctionToolCall.model_construct(
+                type="function_call",
+                name="tool1",
+                call_id="cid1",
+            ),
+        )
+        assert (
+            restored._context.get_approval_status(
+                "tool1",
+                "cid1",
+                existing_pending=restored_pending,
+                current_invocation=malformed_current,
+            )
+            is None
+        )
+        assert restored._context._tool_invocations == {}
+
+    @pytest.mark.parametrize("always_approve", [False, True])
+    async def test_serialized_apply_patch_approval_binds_plural_operations(
+        self,
+        always_approve: bool,
+    ):
+        """Changed plural apply-patch operations cannot reuse a restored decision."""
+        agent = Agent(name="ApprovalCurrentAgent")
+        approval_item = ToolApprovalItem(
+            agent=agent,
+            raw_item={
+                "type": "apply_patch_call",
+                "name": "apply_patch",
+                "call_id": "patch-call",
+                "operations": [{"type": "delete_file", "path": "safe.txt"}],
+            },
+            tool_name="apply_patch",
+        )
+        state = make_state_with_interruptions(agent, [approval_item])
+        state.approve(approval_item, always_approve=always_approve)
+
+        restored = await RunState.from_json(agent, state.to_json())
+
+        assert restored._context is not None
+        restored_item = restored.get_interruptions()[0]
+        changed_item = ToolApprovalItem(
+            agent=agent,
+            raw_item={
+                "type": "apply_patch_call",
+                "name": "apply_patch",
+                "call_id": "patch-call",
+                "operations": [{"type": "delete_file", "path": "important.txt"}],
+            },
+            tool_name="apply_patch",
+        )
+        with pytest.raises(ModelBehaviorError, match="unique call ID"):
+            restored._context.get_approval_status(
+                "apply_patch",
+                "patch-call",
+                existing_pending=restored_item,
+                current_invocation=changed_item,
+            )
 
     async def test_serializes_and_restores_rejection_messages(self):
         """Test that rejection messages are preserved through serialization."""
@@ -1651,6 +4101,40 @@ class TestRunState:
         assert restored._context.context == {"source": "override"}
         assert restored._context.get_rejection_message("tool2", "cid2") == "Denied by reviewer"
         assert restored._context.get_rejection_message("tool2", "cid3") == "Denied by reviewer"
+
+    async def test_context_override_discards_unbound_ids_from_previous_restore(self):
+        """Each restore rebuilds derived approval state on a reused context wrapper."""
+        agent = Agent(name="ApprovalOverrideAgent")
+        approval_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=make_function_tool_call(
+                "tool1",
+                call_id="shared",
+                arguments='{"value":"safe"}',
+            ),
+        )
+        state = make_state_with_interruptions(agent, [approval_item])
+        state.approve(approval_item)
+        malformed = state.to_json()
+        malformed["context"]["tool_invocations"] = {}
+        valid = state.to_json()
+        override_context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+
+        await RunState.from_json(agent, malformed, context_override=override_context)
+        assert override_context._restored_unbound_approval_call_ids == {"shared"}
+
+        restored = await RunState.from_json(agent, valid, context_override=override_context)
+
+        assert restored._context is override_context
+        assert override_context._restored_unbound_approval_call_ids == set()
+        assert (
+            override_context.get_approval_status(
+                "tool1",
+                "shared",
+                current_invocation=approval_item,
+            )
+            is True
+        )
 
 
 class TestBuildAgentMap:
@@ -1765,13 +4249,21 @@ class TestSerializationRoundTrip:
         context.usage.input_tokens = 100
         context.usage.output_tokens = 50
         context.usage.total_tokens = 150
+        context.usage.input_tokens_details = InputTokensDetails.model_validate(
+            {"cache_write_tokens": 7, "cached_tokens": 3}
+        )
 
         agent = Agent(name="UsageAgent")
         state = make_state(agent, context=context, original_input="test", max_turns=10)
 
         str_data = state.to_string()
+        serialized = json.loads(str_data)
         new_state = await RunState.from_string(agent, str_data)
 
+        assert serialized["$schemaVersion"] == CURRENT_SCHEMA_VERSION
+        assert serialized["context"]["usage"]["input_tokens_details"] == [
+            {"cached_tokens": 3, "cache_write_tokens": 7}
+        ]
         assert new_state._context is not None
         assert new_state._context.usage.requests == 5
         assert new_state._context.usage is not None
@@ -1780,6 +4272,41 @@ class TestSerializationRoundTrip:
         assert new_state._context.usage.output_tokens == 50
         assert new_state._context.usage is not None
         assert new_state._context.usage.total_tokens == 150
+        assert new_state._context.usage.input_tokens_details.cached_tokens == 3
+        assert (
+            getattr(
+                new_state._context.usage.input_tokens_details,
+                "cache_write_tokens",
+                None,
+            )
+            == 7
+        )
+
+    async def test_restores_schema_1_11_usage_without_cache_write_tokens(self):
+        """Released snapshots default the newly required OpenAI usage field to zero."""
+        agent = Agent(name="UsageAgent")
+        state: RunState[dict[str, Any]] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+            original_input="test",
+            max_turns=10,
+        )
+        state_json = state.to_json()
+        state_json["$schemaVersion"] = "1.11"
+        state_json["context"]["usage"]["input_tokens_details"] = [{"cached_tokens": 3}]
+
+        restored = await RunState.from_json(agent, state_json)
+
+        assert restored._context is not None
+        assert restored._context.usage.input_tokens_details.cached_tokens == 3
+        assert (
+            getattr(
+                restored._context.usage.input_tokens_details,
+                "cache_write_tokens",
+                None,
+            )
+            == 0
+        )
 
     def test_serializes_generated_items(self):
         """Test that generated items are serialized and restored."""
@@ -1920,6 +4447,203 @@ class TestSerializationRoundTrip:
         assert isinstance(restored_item, ToolCallOutputItem)
         assert restored_item.raw_item == custom_tool_output
         assert restored_item.output == "custom result"
+
+    async def test_deserializes_computer_call_output_acknowledged_safety_checks(self):
+        """Acknowledged safety checks should survive repeated RunState roundtrips."""
+        context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+        agent = Agent(name="ItemAgent")
+        state = make_state(agent, context=context, original_input="test", max_turns=5)
+
+        computer_tool_output = {
+            "type": "computer_call_output",
+            "call_id": "call_computer_1",
+            "output": {"type": "computer_screenshot", "image_url": "img"},
+            "acknowledged_safety_checks": [
+                {"id": "sc_1", "code": "malicious_instructions", "message": "confirm"}
+            ],
+        }
+        state._generated_items.append(
+            ToolCallOutputItem(
+                agent=agent,
+                raw_item=cast(Any, computer_tool_output),
+                output="done",
+            )
+        )
+
+        new_state = await RunState.from_json(agent, state.to_json())
+
+        restored_item = new_state._generated_items[0]
+        assert isinstance(restored_item, ToolCallOutputItem)
+        raw_item = cast("dict[str, Any]", restored_item.raw_item)
+        expected_checks = [{"id": "sc_1", "code": "malicious_instructions", "message": "confirm"}]
+        assert raw_item["acknowledged_safety_checks"] == expected_checks
+        # Reading the field twice must not exhaust it.
+        assert list(raw_item["acknowledged_safety_checks"]) == expected_checks
+
+        # A restored state must serialize again for repeated pause/resume cycles.
+        roundtripped = await RunState.from_string(agent, new_state.to_string())
+        raw_item_again = cast("dict[str, Any]", roundtripped._generated_items[0].raw_item)
+        assert raw_item_again["acknowledged_safety_checks"] == expected_checks
+        json.dumps(roundtripped.to_json())
+
+    async def test_serializes_output_containers_of_models(self):
+        """Containers of Pydantic models and dataclasses should serialize as structured data."""
+        context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+        agent = Agent(name="ItemAgent")
+
+        class Weather(BaseModel):
+            city: str
+            temperature: int
+
+        @dataclass
+        class Reading:
+            value: int
+            label: str
+
+        cases: list[tuple[Any, Any]] = [
+            ([Weather(city="sf", temperature=18)], [{"city": "sf", "temperature": 18}]),
+            (
+                {"today": Weather(city="sf", temperature=18)},
+                {"today": {"city": "sf", "temperature": 18}},
+            ),
+            ((Reading(value=1, label="ok"),), [{"value": 1, "label": "ok"}]),
+        ]
+        for output, expected in cases:
+            state = make_state(agent, context=context, original_input="test", max_turns=5)
+            state._generated_items.append(
+                ToolCallOutputItem(
+                    agent=agent,
+                    raw_item={"type": "function_call_output", "call_id": "c1", "output": "x"},
+                    output=output,
+                )
+            )
+
+            json_data = state.to_json()
+            assert json_data["generated_items"][0]["output"] == expected
+
+            new_state = await RunState.from_json(agent, json_data)
+            restored_item = new_state._generated_items[0]
+            assert isinstance(restored_item, ToolCallOutputItem)
+            assert restored_item.output == expected
+
+    async def test_deserializes_tool_call_output_custom_data(self):
+        """SDK-only tool output custom data should survive RunState roundtrips."""
+        context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+        agent = Agent(name="ItemAgent")
+        state = make_state(agent, context=context, original_input="test", max_turns=5)
+
+        raw_tool_output = {
+            "type": "function_call_output",
+            "call_id": "call_custom_data",
+            "output": "result",
+        }
+        state._generated_items.append(
+            ToolCallOutputItem(
+                agent=agent,
+                raw_item=raw_tool_output,
+                output="result",
+                custom_data={"ui": {"kind": "chart"}, "ids": ["a", "b"]},
+            )
+        )
+
+        json_data = state.to_json()
+        serialized_item = json_data["generated_items"][0]
+        assert serialized_item["custom_data"] == {"ui": {"kind": "chart"}, "ids": ["a", "b"]}
+        assert "custom_data" not in serialized_item["raw_item"]
+
+        new_state = await RunState.from_json(agent, json_data)
+
+        restored_item = new_state._generated_items[0]
+        assert isinstance(restored_item, ToolCallOutputItem)
+        assert restored_item.custom_data == {"ui": {"kind": "chart"}, "ids": ["a", "b"]}
+
+    async def test_pydantic_tool_output_preserves_default_fields(self):
+        """A structured tool output's default-valued fields must survive RunState roundtrips.
+
+        ``ToolCallOutputItem.output`` holds the tool's actual return value. Serializing it with
+        ``exclude_unset`` drops fields left at their defaults, so a resumed run would expose an
+        incomplete ``.output`` that disagrees with the full model-facing ``raw_item`` payload.
+        """
+        context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+        agent = Agent(name="ItemAgent")
+        state = make_state(agent, context=context, original_input="test", max_turns=5)
+
+        class WeatherReport(BaseModel):
+            temperature: int
+            unit: str = "celsius"
+            humidity: int | None = None
+
+        # Only ``temperature`` is set explicitly; ``unit`` and ``humidity`` keep their defaults.
+        output = WeatherReport(temperature=20)
+        raw_tool_output = {
+            "type": "function_call_output",
+            "call_id": "call_weather",
+            "output": '{"temperature":20,"unit":"celsius","humidity":null}',
+        }
+        state._generated_items.append(
+            ToolCallOutputItem(agent=agent, raw_item=raw_tool_output, output=output)
+        )
+
+        json_data = state.to_json()
+        assert json_data["generated_items"][0]["output"] == {
+            "temperature": 20,
+            "unit": "celsius",
+            "humidity": None,
+        }
+
+        new_state = await RunState.from_json(agent, json_data)
+        restored_item = new_state._generated_items[0]
+        assert isinstance(restored_item, ToolCallOutputItem)
+        assert restored_item.output == {
+            "temperature": 20,
+            "unit": "celsius",
+            "humidity": None,
+        }
+
+    async def test_non_utf8_bytes_tool_output_keeps_dict_shape(self):
+        """A structured output with non-UTF-8 bytes must stay a dict, not collapse to a string.
+
+        Serializing in Python mode keeps default-valued fields and lets ``_ensure_json_compatible``
+        stringify only the offending value. Dumping with ``mode="json"`` would instead raise on the
+        non-UTF-8 bytes, trip the broad fallback, and replace the whole structured output with an
+        opaque ``str(item.output)``.
+        """
+        context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+        agent = Agent(name="ItemAgent")
+        state = make_state(agent, context=context, original_input="test", max_turns=5)
+
+        class BlobResult(BaseModel):
+            payload: bytes
+            label: str = "default-label"
+            note: str | None = None
+
+        # An untyped function tool can return an arbitrary Pydantic model; here one field holds
+        # non-UTF-8 bytes while ``label``/``note`` are left at their defaults.
+        output = BlobResult(payload=b"\xff\xfe")
+        raw_tool_output = {
+            "type": "function_call_output",
+            "call_id": "call_blob",
+            "output": "blob stored",
+        }
+        state._generated_items.append(
+            ToolCallOutputItem(agent=agent, raw_item=raw_tool_output, output=output)
+        )
+
+        expected = {
+            "payload": str(b"\xff\xfe"),
+            "label": "default-label",
+            "note": None,
+        }
+
+        json_data = state.to_json()
+        serialized_output = json_data["generated_items"][0]["output"]
+        assert isinstance(serialized_output, dict)
+        assert serialized_output == expected
+
+        new_state = await RunState.from_json(agent, json_data)
+        restored_item = new_state._generated_items[0]
+        assert isinstance(restored_item, ToolCallOutputItem)
+        assert restored_item.output == expected
 
     async def test_serializes_original_input_with_function_call_output(self):
         """Test that original_input with function_call_output items is preserved."""
@@ -2541,16 +5265,20 @@ class TestDeserializeHelpers:
             ],
             response_id="resp123",
             request_id="req123",
+            raw_usage={"input_tokens": 10, "provider_metric": 0},
         )
         state._model_responses.append(response)
 
         # Round trip
+        serialized = state.to_json()
+        assert "raw_usage" not in serialized["model_responses"][0]
         json_str = state.to_string()
         restored = await RunState.from_string(agent, json_str)
 
         assert len(restored._model_responses) == 1
         assert restored._model_responses[0].response_id == "resp123"
         assert restored._model_responses[0].request_id == "req123"
+        assert restored._model_responses[0].raw_usage is None
         assert restored._model_responses[0].usage.requests == 1
         assert restored._model_responses[0].usage.input_tokens == 10
 
@@ -2610,8 +5338,924 @@ class TestDeserializeHelpers:
         assert interruptions[0].agent.name == "InnerAgent"
         assert interruptions[0].raw_item.name == "sensitive_tool"  # type: ignore[union-attr]
 
+    @pytest.mark.parametrize("round_trip", [False, True], ids=["live", "serialized"])
+    async def test_ambiguous_current_and_nested_approval_identity_fails_closed(
+        self,
+        round_trip: bool,
+    ) -> None:
+        """An approval shared by current and nested scopes must not be guessed."""
+        from agents.agent_tool_state import (
+            drop_agent_tool_run_result,
+            record_agent_tool_run_result,
+        )
+
+        agent = Agent(name="Agent")
+        sensitive_tool = function_tool(lambda: "sensitive", name_override="sensitive")
+        nested_tool = function_tool(lambda: "nested", name_override="nested_agent_tool")
+        agent.tools = [sensitive_tool, nested_tool]
+
+        current_call = make_tool_call(call_id="shared", name="sensitive")
+        nested_outer_call = make_tool_call(call_id="outer-nested", name="nested_agent_tool")
+        current_approval = ToolApprovalItem(agent=agent, raw_item=current_call)
+        nested_approval = ToolApprovalItem(
+            agent=agent,
+            raw_item=current_call.model_copy(deep=True),
+        )
+        state = make_state_with_interruptions(
+            agent,
+            [current_approval, nested_approval],
+        )
+        state._last_processed_response = make_processed_response(
+            functions=[
+                ToolRunFunction(tool_call=current_call, function_tool=sensitive_tool),
+                ToolRunFunction(tool_call=nested_outer_call, function_tool=nested_tool),
+            ]
+        )
+        assert state._context is not None
+        state._context._tool_invocation_status(current_call)
+
+        nested_state = make_state_with_interruptions(agent, [nested_approval])
+        record_agent_tool_run_result(
+            nested_outer_call,
+            cast(
+                Any,
+                SimpleNamespace(
+                    interruptions=[nested_approval],
+                    to_state=lambda: nested_state,
+                ),
+            ),
+            scope_id=state._agent_tool_state_scope_id,
+        )
+
+        target_state = state
+        target_nested_call = nested_outer_call
+        try:
+            if round_trip:
+                target_state = await RunState.from_json(agent, state.to_json())
+                assert target_state._last_processed_response is not None
+                target_nested_call = target_state._last_processed_response.functions[1].tool_call
+
+            with pytest.raises(UserError, match="current run and a nested agent-tool run"):
+                target_state.approve(target_state.get_interruptions()[0])
+        finally:
+            drop_agent_tool_run_result(
+                nested_outer_call,
+                scope_id=state._agent_tool_state_scope_id,
+            )
+            if target_state is not state:
+                drop_agent_tool_run_result(
+                    target_nested_call,
+                    scope_id=target_state._agent_tool_state_scope_id,
+                )
+
+    @pytest.mark.parametrize("approval_input", ["snapshot", "exact"])
+    @pytest.mark.parametrize("approve", [True, False], ids=["approve", "reject"])
+    def test_ambiguous_current_approval_identity_fails_closed(
+        self,
+        approval_input: str,
+        approve: bool,
+    ) -> None:
+        """A snapshot or exact approval shared by current owners must not be guessed."""
+        agent = Agent(name="AmbiguousCurrentAgent")
+        raw_item = ResponseFunctionToolCall(
+            type="function_call",
+            name="toolA",
+            call_id="shared-current",
+            arguments="{}",
+        )
+        first = ToolApprovalItem(
+            agent=agent,
+            raw_item=raw_item,
+            tool_name="toolA",
+            tool_lookup_key=("deferred_top_level", "toolA"),
+            _allow_bare_name_alias=True,
+        )
+        second = replace(
+            first,
+            raw_item=raw_item.model_copy(deep=True),
+            _allow_bare_name_alias=False,
+        )
+        state = make_state_with_interruptions(agent, [first, second])
+
+        selected = state.get_interruptions()[1] if approval_input == "snapshot" else second
+        with pytest.raises(UserError, match="multiple current pending approvals"):
+            if approve:
+                state.approve(selected)
+            else:
+                state.reject(selected)
+
+        assert state._context is not None
+        assert state._context.is_tool_approved("toolA", "shared-current") is None
+
+    @pytest.mark.parametrize("approve", [True, False], ids=["approve", "reject"])
+    def test_unsafe_current_sibling_cannot_bypass_approval_ambiguity(
+        self,
+        approve: bool,
+    ) -> None:
+        """Unsafe same-Agent siblings must not be treated as distinct owners."""
+        agent = Agent(name="UnsafeCurrentSiblingAgent")
+        first = ToolApprovalItem(
+            agent=agent,
+            raw_item={
+                "type": "function_call",
+                "name": "toolA",
+                "call_id": "shared-unsafe-current",
+                "arguments": "{}",
+                "metadata": object(),
+            },
+        )
+        second = ToolApprovalItem(
+            agent=agent,
+            raw_item={
+                "type": "function_call",
+                "name": "toolA",
+                "call_id": "shared-unsafe-current",
+                "arguments": "{}",
+                "metadata": object(),
+            },
+        )
+        state = make_state_with_interruptions(agent, [first, second])
+
+        with pytest.raises(UserError, match="multiple current pending approvals"):
+            if approve:
+                state.approve(second)
+            else:
+                state.reject(second)
+
+        assert state._context is not None
+        assert state._context.is_tool_approved("toolA", "shared-unsafe-current") is None
+
+    @pytest.mark.parametrize("location", ["current", "nested"])
+    @pytest.mark.parametrize("approve", [True, False], ids=["approve", "reject"])
+    def test_uncopyable_noncanonical_approval_does_not_select_pending_owner(
+        self,
+        location: str,
+        approve: bool,
+    ) -> None:
+        """An uncopyable noncanonical input must not select a same-Agent pending owner."""
+        from agents.agent_tool_state import drop_agent_tool_run_result, record_agent_tool_run_result
+
+        agent = Agent(name="UncopyableDecisionAgent")
+        pending = ToolApprovalItem(
+            agent=agent,
+            raw_item=ResponseFunctionToolCall(
+                type="function_call",
+                name="toolA",
+                call_id="cid-uncopyable-decision",
+                arguments="{}",
+            ),
+        )
+        supplied = ToolApprovalItem(agent=agent, raw_item={"metadata": object()})
+
+        target_state = make_state_with_interruptions(agent, [pending])
+        state = target_state
+        outer_call = make_tool_call(
+            call_id="outer-uncopyable-decision",
+            name="nested_agent_tool",
+        )
+        if location == "nested":
+            state = make_state_with_interruptions(agent, [])
+            nested_tool = function_tool(lambda: "nested", name_override="nested_agent_tool")
+            state._last_processed_response = make_processed_response(
+                functions=[ToolRunFunction(tool_call=outer_call, function_tool=nested_tool)]
+            )
+            record_agent_tool_run_result(
+                outer_call,
+                cast(
+                    Any,
+                    SimpleNamespace(
+                        interruptions=[pending],
+                        to_state=lambda: target_state,
+                    ),
+                ),
+                scope_id=state._agent_tool_state_scope_id,
+            )
+
+        try:
+            if approve:
+                state.approve(supplied)
+            else:
+                state.reject(supplied)
+
+            assert target_state._context is not None
+            assert (
+                target_state._context.is_tool_approved(
+                    "toolA",
+                    "cid-uncopyable-decision",
+                )
+                is None
+            )
+        finally:
+            if location == "nested":
+                drop_agent_tool_run_result(
+                    outer_call,
+                    scope_id=state._agent_tool_state_scope_id,
+                )
+
+    @pytest.mark.parametrize("location", ["current", "nested"])
+    @pytest.mark.parametrize("approve", [True, False], ids=["approve", "reject"])
+    def test_safe_noncanonical_approval_does_not_select_uncopyable_pending_owner(
+        self,
+        location: str,
+        approve: bool,
+    ) -> None:
+        """A safe input must not be redirected to an unsafe same-Agent pending owner."""
+        from agents.agent_tool_state import drop_agent_tool_run_result, record_agent_tool_run_result
+
+        agent = Agent(name="UnsafePendingOwnerAgent")
+        pending = ToolApprovalItem(
+            agent=agent,
+            raw_item={
+                "type": "function_call",
+                "name": "pending_tool",
+                "call_id": "pending-unsafe-owner",
+                "arguments": "{}",
+                "metadata": object(),
+            },
+        )
+        supplied = ToolApprovalItem(
+            agent=agent,
+            raw_item=ResponseFunctionToolCall(
+                type="function_call",
+                name="supplied_tool",
+                call_id="supplied-safe-owner",
+                arguments="{}",
+            ),
+        )
+
+        target_state = make_state_with_interruptions(agent, [pending])
+        state = target_state
+        outer_call = make_tool_call(call_id="outer-unsafe-owner", name="nested_agent_tool")
+        if location == "nested":
+            state = make_state_with_interruptions(agent, [])
+            nested_tool = function_tool(lambda: "nested", name_override="nested_agent_tool")
+            state._last_processed_response = make_processed_response(
+                functions=[ToolRunFunction(tool_call=outer_call, function_tool=nested_tool)]
+            )
+            record_agent_tool_run_result(
+                outer_call,
+                cast(
+                    Any,
+                    SimpleNamespace(
+                        interruptions=[pending],
+                        to_state=lambda: target_state,
+                    ),
+                ),
+                scope_id=state._agent_tool_state_scope_id,
+            )
+
+        try:
+            with pytest.raises(UserError, match="Cannot apply approval"):
+                if approve:
+                    state.approve(supplied)
+                else:
+                    state.reject(supplied)
+
+            assert target_state._context is not None
+            assert (
+                target_state._context.is_tool_approved(
+                    "pending_tool",
+                    "pending-unsafe-owner",
+                )
+                is None
+            )
+            assert (
+                target_state._context.is_tool_approved(
+                    "supplied_tool",
+                    "supplied-safe-owner",
+                )
+                is None
+            )
+        finally:
+            if location == "nested":
+                drop_agent_tool_run_result(
+                    outer_call,
+                    scope_id=state._agent_tool_state_scope_id,
+                )
+
+    @pytest.mark.parametrize("approval_location", ["current", "nested"])
+    @pytest.mark.parametrize("approve", [True, False], ids=["approve", "reject"])
+    def test_exact_uncopyable_approval_does_not_read_other_unsafe_owner(
+        self,
+        approval_location: str,
+        approve: bool,
+    ) -> None:
+        """An unsafe authoritative item must not expose another owner's raw payload."""
+        from agents.agent_tool_state import drop_agent_tool_run_result, record_agent_tool_run_result
+
+        hook_calls: list[tuple[str, object]] = []
+
+        class HookedDict(dict[str, Any]):
+            def get(self, key: str, default: Any = None) -> Any:
+                hook_calls.append(("get", key))
+                return super().get(key, default)
+
+            def __contains__(self, key: object) -> bool:
+                hook_calls.append(("contains", key))
+                return super().__contains__(key)
+
+            def __getitem__(self, key: str) -> Any:
+                hook_calls.append(("getitem", key))
+                return super().__getitem__(key)
+
+        agent = Agent(name="UnsafeAuthoritativeOwnerAgent")
+        current = ToolApprovalItem(
+            agent=agent,
+            raw_item=HookedDict(
+                type="function_call",
+                name="current_tool",
+                call_id="current-unsafe-authoritative",
+                arguments="{}",
+                metadata=object(),
+            ),
+        )
+        nested = ToolApprovalItem(
+            agent=agent,
+            raw_item={
+                "type": "function_call",
+                "name": "nested_tool",
+                "call_id": "nested-unsafe-authoritative",
+                "arguments": "{}",
+                "metadata": object(),
+            },
+        )
+        outer_state = make_state_with_interruptions(agent, [current])
+        nested_state = make_state_with_interruptions(agent, [nested])
+        outer_call = make_tool_call(
+            call_id="outer-unsafe-authoritative",
+            name="nested_agent_tool",
+        )
+        nested_tool = function_tool(lambda: "nested", name_override="nested_agent_tool")
+        outer_state._last_processed_response = make_processed_response(
+            functions=[ToolRunFunction(tool_call=outer_call, function_tool=nested_tool)]
+        )
+        record_agent_tool_run_result(
+            outer_call,
+            cast(
+                Any,
+                SimpleNamespace(
+                    interruptions=[nested],
+                    to_state=lambda: nested_state,
+                ),
+            ),
+            scope_id=outer_state._agent_tool_state_scope_id,
+        )
+        hook_calls.clear()
+        approval_item = current if approval_location == "current" else nested
+
+        try:
+            with pytest.raises(UserError, match="Cannot apply approval"):
+                if approve:
+                    outer_state.approve(approval_item)
+                else:
+                    outer_state.reject(approval_item)
+
+            assert hook_calls == []
+            assert outer_state._context is not None
+            assert nested_state._context is not None
+            assert (
+                outer_state._context.is_tool_approved(
+                    "current_tool",
+                    "current-unsafe-authoritative",
+                )
+                is None
+            )
+            assert (
+                nested_state._context.is_tool_approved(
+                    "nested_tool",
+                    "nested-unsafe-authoritative",
+                )
+                is None
+            )
+        finally:
+            drop_agent_tool_run_result(
+                outer_call,
+                scope_id=outer_state._agent_tool_state_scope_id,
+            )
+
+    @pytest.mark.parametrize("unsafe_metadata", [False, True], ids=["safe", "unsafe"])
+    @pytest.mark.parametrize("approve", [True, False], ids=["approve", "reject"])
+    def test_ambiguous_exact_nested_approval_identity_fails_closed(
+        self,
+        unsafe_metadata: bool,
+        approve: bool,
+    ) -> None:
+        """An exact nested approval must not bypass nested owner multiplicity."""
+        from agents.agent_tool_state import drop_agent_tool_run_result, record_agent_tool_run_result
+
+        agent = Agent(name="AmbiguousNestedAgent")
+        if unsafe_metadata:
+            raw_item: Any = {
+                "type": "function_call",
+                "name": "toolA",
+                "call_id": "shared-nested",
+                "arguments": "{}",
+                "metadata": object(),
+            }
+            second_raw_item: Any = {**raw_item, "metadata": object()}
+        else:
+            raw_item = ResponseFunctionToolCall(
+                type="function_call",
+                name="toolA",
+                call_id="shared-nested",
+                arguments="{}",
+            )
+            second_raw_item = raw_item.model_copy(deep=True)
+        first = ToolApprovalItem(agent=agent, raw_item=raw_item, tool_name="toolA")
+        second = replace(first, raw_item=second_raw_item)
+        nested_state = make_state_with_interruptions(agent, [first, second])
+        outer_state = make_state_with_interruptions(agent, [first])
+        outer_call = make_tool_call(call_id="outer-ambiguous-nested", name="nested_agent_tool")
+        nested_tool = function_tool(lambda: "nested", name_override="nested_agent_tool")
+        outer_state._last_processed_response = make_processed_response(
+            functions=[ToolRunFunction(tool_call=outer_call, function_tool=nested_tool)]
+        )
+        record_agent_tool_run_result(
+            outer_call,
+            cast(
+                Any,
+                SimpleNamespace(
+                    interruptions=[first],
+                    to_state=lambda: nested_state,
+                ),
+            ),
+            scope_id=outer_state._agent_tool_state_scope_id,
+        )
+
+        try:
+            with pytest.raises(UserError, match="multiple current pending approvals"):
+                if approve:
+                    outer_state.approve(first)
+                else:
+                    outer_state.reject(first)
+            assert nested_state._context is not None
+            assert nested_state._context.is_tool_approved("toolA", "shared-nested") is None
+        finally:
+            drop_agent_tool_run_result(
+                outer_call,
+                scope_id=outer_state._agent_tool_state_scope_id,
+            )
+
+    @pytest.mark.parametrize("approve", [True, False], ids=["approve", "reject"])
+    def test_unsafe_exact_approval_across_nested_states_fails_closed(
+        self,
+        approve: bool,
+    ) -> None:
+        """Exact unsafe input must preserve ambiguity across all nested owner states."""
+        from agents.agent_tool_state import drop_agent_tool_run_result, record_agent_tool_run_result
+
+        agent = Agent(name="UnsafeNestedOwnerAgent")
+        first = ToolApprovalItem(
+            agent=agent,
+            raw_item={
+                "type": "function_call",
+                "name": "toolA",
+                "call_id": "shared-unsafe-nested",
+                "arguments": "{}",
+                "metadata": object(),
+            },
+        )
+        second = replace(first, raw_item={**first.raw_item, "metadata": object()})
+        first_state = make_state_with_interruptions(agent, [first])
+        second_state = make_state_with_interruptions(agent, [second])
+        outer_state = make_state_with_interruptions(agent, [])
+        first_outer_call = make_tool_call(call_id="outer-unsafe-first", name="nested_first")
+        second_outer_call = make_tool_call(call_id="outer-unsafe-second", name="nested_second")
+        first_tool = function_tool(lambda: "first", name_override="nested_first")
+        second_tool = function_tool(lambda: "second", name_override="nested_second")
+        outer_state._last_processed_response = make_processed_response(
+            functions=[
+                ToolRunFunction(tool_call=first_outer_call, function_tool=first_tool),
+                ToolRunFunction(tool_call=second_outer_call, function_tool=second_tool),
+            ]
+        )
+        for outer_call, item, nested_state in (
+            (first_outer_call, first, first_state),
+            (second_outer_call, second, second_state),
+        ):
+            record_agent_tool_run_result(
+                outer_call,
+                cast(
+                    Any,
+                    SimpleNamespace(
+                        interruptions=[item],
+                        to_state=lambda nested_state=nested_state: nested_state,
+                    ),
+                ),
+                scope_id=outer_state._agent_tool_state_scope_id,
+            )
+
+        try:
+            with pytest.raises(UserError, match="cannot be safely distinguished"):
+                if approve:
+                    outer_state.approve(first)
+                else:
+                    outer_state.reject(first)
+
+            for nested_state in (first_state, second_state):
+                assert nested_state._context is not None
+                assert (
+                    nested_state._context.is_tool_approved(
+                        "toolA",
+                        "shared-unsafe-nested",
+                    )
+                    is None
+                )
+        finally:
+            for outer_call in (first_outer_call, second_outer_call):
+                drop_agent_tool_run_result(
+                    outer_call,
+                    scope_id=outer_state._agent_tool_state_scope_id,
+                )
+
+    @pytest.mark.parametrize("round_trip", [False, True], ids=["live", "serialized"])
+    @pytest.mark.parametrize("approve", [True, False], ids=["approve", "reject"])
+    async def test_completed_current_invocation_does_not_own_nested_approval(
+        self,
+        round_trip: bool,
+        approve: bool,
+    ) -> None:
+        """A completed current invocation must not shadow a pending nested invocation."""
+        from agents.agent_tool_state import (
+            drop_agent_tool_run_result,
+            peek_agent_tool_run_result,
+            record_agent_tool_run_result,
+        )
+
+        agent = Agent(name="Agent")
+        sensitive_tool = function_tool(lambda: "sensitive", name_override="sensitive")
+        nested_tool = function_tool(lambda: "nested", name_override="nested_agent_tool")
+        agent.tools = [sensitive_tool, nested_tool]
+
+        completed_call = make_tool_call(call_id="shared", name="sensitive")
+        nested_outer_call = make_tool_call(call_id="outer-nested", name="nested_agent_tool")
+        nested_approval = ToolApprovalItem(
+            agent=agent,
+            raw_item=completed_call.model_copy(deep=True),
+        )
+        state = make_state_with_interruptions(agent, [nested_approval])
+        state._last_processed_response = make_processed_response(
+            functions=[
+                ToolRunFunction(tool_call=completed_call, function_tool=sensitive_tool),
+                ToolRunFunction(tool_call=nested_outer_call, function_tool=nested_tool),
+            ]
+        )
+        assert state._context is not None
+        state._context._tool_invocation_status(completed_call)
+        completed_output = {
+            "type": "function_call_output",
+            "call_id": completed_call.call_id,
+            "output": "done",
+        }
+        state._context._mark_tool_call_completed(completed_output)
+        state._generated_items = [
+            ToolCallItem(agent=agent, raw_item=completed_call),
+            ToolCallOutputItem(agent=agent, raw_item=completed_output, output="done"),
+        ]
+
+        nested_state = make_state_with_interruptions(agent, [nested_approval])
+        record_agent_tool_run_result(
+            nested_outer_call,
+            cast(
+                Any,
+                SimpleNamespace(
+                    interruptions=[nested_approval],
+                    to_state=lambda: nested_state,
+                ),
+            ),
+            scope_id=state._agent_tool_state_scope_id,
+        )
+
+        target_state = state
+        target_nested_call = nested_outer_call
+        try:
+            if round_trip:
+                target_state = await RunState.from_json(agent, state.to_json())
+                assert target_state._last_processed_response is not None
+                target_nested_call = target_state._last_processed_response.functions[1].tool_call
+
+            target_approval = target_state.get_interruptions()[0]
+            if approve:
+                target_state.approve(target_approval)
+            else:
+                target_state.reject(target_approval)
+
+            pending_result = peek_agent_tool_run_result(
+                target_nested_call,
+                scope_id=target_state._agent_tool_state_scope_id,
+            )
+            assert pending_result is not None
+            target_nested_state = pending_result.to_state()
+            assert target_nested_state._context is not None
+            assert (
+                target_nested_state._context.get_approval_status(
+                    "sensitive",
+                    "shared",
+                    existing_pending=target_approval,
+                )
+                is approve
+            )
+        finally:
+            drop_agent_tool_run_result(
+                nested_outer_call,
+                scope_id=state._agent_tool_state_scope_id,
+            )
+            if target_state is not state:
+                drop_agent_tool_run_result(
+                    target_nested_call,
+                    scope_id=target_state._agent_tool_state_scope_id,
+                )
+
+    @pytest.mark.parametrize("round_trip", [False, True], ids=["live", "serialized"])
+    @pytest.mark.parametrize("approve", [True, False], ids=["approve", "reject"])
+    async def test_native_current_and_nested_approval_identity_fails_closed(
+        self,
+        round_trip: bool,
+        approve: bool,
+    ) -> None:
+        """A name-less native call shared by current and nested scopes must not be guessed."""
+        from agents.agent_tool_state import (
+            drop_agent_tool_run_result,
+            record_agent_tool_run_result,
+        )
+
+        agent = Agent(name="Agent")
+
+        async def shell_executor(_request: Any) -> Any:
+            return {"output": "done"}
+
+        shell_tool = ShellTool(executor=shell_executor, needs_approval=True)
+        nested_tool = function_tool(lambda: "nested", name_override="nested_agent_tool")
+        agent.tools = [shell_tool, nested_tool]
+
+        current_call = make_shell_call("shared")
+        nested_outer_call = make_tool_call(call_id="outer-nested", name="nested_agent_tool")
+        current_approval = ToolApprovalItem(
+            agent=agent,
+            raw_item=cast(Any, current_call),
+            tool_name=shell_tool.name,
+        )
+        nested_approval = ToolApprovalItem(
+            agent=agent,
+            raw_item=cast(Any, deepcopy(current_call)),
+            tool_name=shell_tool.name,
+        )
+        state = make_state_with_interruptions(
+            agent,
+            [current_approval, nested_approval],
+        )
+        state._last_processed_response = make_processed_response(
+            functions=[ToolRunFunction(tool_call=nested_outer_call, function_tool=nested_tool)],
+            shell_calls=[ToolRunShellCall(tool_call=current_call, shell_tool=shell_tool)],
+        )
+        assert state._context is not None
+        state._context._tool_invocation_status(current_call, tool_name=shell_tool.name)
+
+        nested_state = make_state_with_interruptions(agent, [nested_approval])
+        record_agent_tool_run_result(
+            nested_outer_call,
+            cast(
+                Any,
+                SimpleNamespace(
+                    interruptions=[nested_approval],
+                    to_state=lambda: nested_state,
+                ),
+            ),
+            scope_id=state._agent_tool_state_scope_id,
+        )
+
+        target_state = state
+        target_nested_call = nested_outer_call
+        try:
+            if round_trip:
+                target_state = await RunState.from_json(agent, state.to_json())
+                assert target_state._last_processed_response is not None
+                target_nested_call = target_state._last_processed_response.functions[0].tool_call
+
+            with pytest.raises(UserError, match="current run and a nested agent-tool run"):
+                if approve:
+                    target_state.approve(target_state.get_interruptions()[0])
+                else:
+                    target_state.reject(target_state.get_interruptions()[0])
+        finally:
+            drop_agent_tool_run_result(
+                nested_outer_call,
+                scope_id=state._agent_tool_state_scope_id,
+            )
+            if target_state is not state:
+                drop_agent_tool_run_result(
+                    target_nested_call,
+                    scope_id=target_state._agent_tool_state_scope_id,
+                )
+
+    @pytest.mark.parametrize("drop_mode", ["disabled", "removed", "malformed_call"])
+    async def test_nested_agent_tool_state_survives_when_earlier_function_is_dropped(
+        self, drop_mode: str
+    ) -> None:
+        """A dropped function must not shift a later function's nested state."""
+        from agents.agent_tool_state import (
+            drop_agent_tool_run_result,
+            peek_agent_tool_run_result,
+        )
+
+        context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+        agent = Agent(name="OuterAgent")
+        earlier_tool_enabled = True
+        conditional_tool = function_tool(
+            lambda: "conditional",
+            name_override="conditional_tool",
+            is_enabled=lambda _context, _agent: earlier_tool_enabled,
+        )
+        nested_tool = function_tool(lambda: "nested", name_override="nested_agent_tool")
+        agent.tools = [conditional_tool, nested_tool]
+
+        conditional_call = make_tool_call(call_id="conditional-call", name="conditional_tool")
+        nested_call = make_tool_call(call_id="nested-call", name="nested_agent_tool")
+        state = make_state(agent, context=context)
+        state._last_processed_response = make_processed_response(
+            functions=[
+                ToolRunFunction(tool_call=conditional_call, function_tool=conditional_tool),
+                ToolRunFunction(tool_call=nested_call, function_tool=nested_tool),
+            ]
+        )
+
+        record_pending_nested_agent_tool_state(
+            agent,
+            nested_call,
+            inner_call_id="inner-call",
+        )
+
+        restored_call: ResponseFunctionToolCall | None = None
+        restored_scope_id: str | None = None
+        try:
+            state_json = state.to_json()
+            if drop_mode == "disabled":
+                earlier_tool_enabled = False
+            elif drop_mode == "removed":
+                agent.tools = [nested_tool]
+            else:
+                functions_data = state_json["last_processed_response"]["functions"]
+                functions_data[0]["tool_call"].pop("call_id")
+
+            restored = await RunState.from_json(agent, state_json)
+
+            assert restored._last_processed_response is not None
+            restored_scope_id = restored._agent_tool_state_scope_id
+            assert restored_scope_id is not None
+            assert len(restored._last_processed_response.functions) == 1
+            restored_call = restored._last_processed_response.functions[0].tool_call
+            assert restored_call.call_id == "nested-call"
+            pending_result = peek_agent_tool_run_result(restored_call, scope_id=restored_scope_id)
+            assert pending_result is not None
+            assert len(pending_result.interruptions) == 1
+            restored_approval = pending_result.interruptions[0]
+            assert isinstance(restored_approval.raw_item, ResponseFunctionToolCall)
+            assert restored_approval.raw_item.call_id == "inner-call"
+        finally:
+            drop_agent_tool_run_result(nested_call)
+            if restored_call is not None:
+                drop_agent_tool_run_result(restored_call, scope_id=restored_scope_id)
+
+    async def test_dropped_nested_agent_tool_state_is_not_moved_to_later_function(
+        self,
+    ) -> None:
+        """Nested state owned by a dropped function must not migrate to a retained function."""
+        from agents.agent_tool_state import (
+            drop_agent_tool_run_result,
+            peek_agent_tool_run_result,
+        )
+
+        context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+        agent = Agent(name="OuterAgent")
+        dropped_tool = function_tool(lambda: "dropped", name_override="dropped_agent_tool")
+        retained_tool = function_tool(lambda: "retained", name_override="retained_tool")
+        agent.tools = [dropped_tool, retained_tool]
+
+        dropped_call = make_tool_call(call_id="dropped-call", name="dropped_agent_tool")
+        retained_call = make_tool_call(call_id="retained-call", name="retained_tool")
+        state = make_state(agent, context=context)
+        state._last_processed_response = make_processed_response(
+            functions=[
+                ToolRunFunction(tool_call=dropped_call, function_tool=dropped_tool),
+                ToolRunFunction(tool_call=retained_call, function_tool=retained_tool),
+            ]
+        )
+
+        record_pending_nested_agent_tool_state(
+            agent,
+            dropped_call,
+            inner_call_id="dropped-inner-call",
+        )
+
+        restored_call: ResponseFunctionToolCall | None = None
+        restored_scope_id: str | None = None
+        try:
+            state_json = state.to_json()
+            agent.tools = [retained_tool]
+
+            restored = await RunState.from_json(agent, state_json)
+
+            assert restored._last_processed_response is not None
+            restored_scope_id = restored._agent_tool_state_scope_id
+            assert restored_scope_id is not None
+            assert len(restored._last_processed_response.functions) == 1
+            restored_call = restored._last_processed_response.functions[0].tool_call
+            assert restored_call.call_id == "retained-call"
+            assert peek_agent_tool_run_result(restored_call, scope_id=restored_scope_id) is None
+        finally:
+            drop_agent_tool_run_result(dropped_call)
+            if restored_call is not None:
+                drop_agent_tool_run_result(restored_call, scope_id=restored_scope_id)
+
+    async def test_multiple_nested_agent_tool_states_survive_multiple_dropped_functions(
+        self,
+    ) -> None:
+        """Multiple retained functions keep their own nested state across different drops."""
+        from agents.agent_tool_state import (
+            drop_agent_tool_run_result,
+            peek_agent_tool_run_result,
+        )
+
+        context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+        agent = Agent(name="OuterAgent")
+        earlier_tool_enabled = True
+        disabled_tool = function_tool(
+            lambda: "disabled",
+            name_override="disabled_tool",
+            is_enabled=lambda _context, _agent: earlier_tool_enabled,
+        )
+        first_nested_tool = function_tool(lambda: "first", name_override="first_agent_tool")
+        malformed_tool = function_tool(lambda: "malformed", name_override="malformed_tool")
+        second_nested_tool = function_tool(lambda: "second", name_override="second_agent_tool")
+        agent.tools = [disabled_tool, first_nested_tool, malformed_tool, second_nested_tool]
+
+        disabled_call = make_tool_call(call_id="disabled-call", name="disabled_tool")
+        first_nested_call = make_tool_call(call_id="first-call", name="first_agent_tool")
+        malformed_call = make_tool_call(call_id="malformed-call", name="malformed_tool")
+        second_nested_call = make_tool_call(call_id="second-call", name="second_agent_tool")
+        state = make_state(agent, context=context)
+        state._last_processed_response = make_processed_response(
+            functions=[
+                ToolRunFunction(tool_call=disabled_call, function_tool=disabled_tool),
+                ToolRunFunction(tool_call=first_nested_call, function_tool=first_nested_tool),
+                ToolRunFunction(tool_call=malformed_call, function_tool=malformed_tool),
+                ToolRunFunction(tool_call=second_nested_call, function_tool=second_nested_tool),
+            ]
+        )
+
+        nested_calls = [first_nested_call, second_nested_call]
+        inner_call_ids = ["first-inner-call", "second-inner-call"]
+        for nested_call, inner_call_id in zip(nested_calls, inner_call_ids, strict=True):
+            record_pending_nested_agent_tool_state(
+                agent,
+                nested_call,
+                inner_call_id=inner_call_id,
+            )
+
+        restored_calls: list[ResponseFunctionToolCall] = []
+        restored_scope_id: str | None = None
+        try:
+            state_json = state.to_json()
+            earlier_tool_enabled = False
+            functions_data = state_json["last_processed_response"]["functions"]
+            functions_data[2]["tool_call"].pop("call_id")
+
+            restored = await RunState.from_json(agent, state_json)
+
+            assert restored._last_processed_response is not None
+            restored_scope_id = restored._agent_tool_state_scope_id
+            assert restored_scope_id is not None
+            restored_calls = [
+                function.tool_call for function in restored._last_processed_response.functions
+            ]
+            assert [call.call_id for call in restored_calls] == ["first-call", "second-call"]
+            for restored_call, expected_inner_call_id in zip(
+                restored_calls, inner_call_ids, strict=True
+            ):
+                pending_result = peek_agent_tool_run_result(
+                    restored_call, scope_id=restored_scope_id
+                )
+                assert pending_result is not None
+                assert len(pending_result.interruptions) == 1
+                restored_approval = pending_result.interruptions[0]
+                assert isinstance(restored_approval.raw_item, ResponseFunctionToolCall)
+                assert restored_approval.raw_item.call_id == expected_inner_call_id
+        finally:
+            for nested_call in nested_calls:
+                drop_agent_tool_run_result(nested_call)
+            for restored_call in restored_calls:
+                drop_agent_tool_run_result(restored_call, scope_id=restored_scope_id)
+
     @pytest.mark.asyncio
-    async def test_nested_agent_tool_hitl_resume_survives_json_round_trip_after_gc(self) -> None:
+    @pytest.mark.parametrize(
+        "approve_nested_tool",
+        [True, False],
+        ids=["approve", "reject"],
+    )
+    async def test_nested_agent_tool_hitl_resume_survives_json_round_trip_after_gc(
+        self,
+        approve_nested_tool: bool,
+    ) -> None:
         """Nested agent-tool resumptions should survive RunState JSON round-trips."""
 
         def _has_function_call_output(input_data: str | list[TResponseInputItem]) -> bool:
@@ -2626,91 +6270,52 @@ class TestDeserializeHelpers:
                     return True
             return False
 
-        class ResumeAwareToolModel(Model):
-            def __init__(
-                self, *, tool_name: str, tool_arguments: str, final_text: str, call_prefix: str
-            ) -> None:
-                self.tool_name = tool_name
-                self.tool_arguments = tool_arguments
-                self.final_text = final_text
-                self.call_prefix = call_prefix
-                self.call_count = 0
+        def _make_resume_aware_tool_model(
+            *,
+            tool_name: str,
+            tool_arguments: str,
+            final_text: str,
+            call_prefix: str,
+            preceding_tool_name: str | None = None,
+        ) -> ScriptedModel:
+            tool_call_count = 0
 
-            async def get_response(
-                self,
-                system_instructions: str | None,
-                input: str | list[TResponseInputItem],
-                model_settings: ModelSettings,
-                tools: list[Any],
-                output_schema: Any,
-                handoffs: list[Any],
-                tracing: Any,
-                *,
-                previous_response_id: str | None,
-                conversation_id: str | None,
-                prompt: Any | None,
-            ) -> ModelResponse:
-                del (
-                    system_instructions,
-                    model_settings,
-                    tools,
-                    output_schema,
-                    handoffs,
-                    tracing,
-                    previous_response_id,
-                    conversation_id,
-                    prompt,
-                )
-                if _has_function_call_output(input):
+            def _respond(call: ModelCall) -> ModelResponse:
+                nonlocal tool_call_count
+                if _has_function_call_output(call.input):
                     return ModelResponse(
-                        output=[get_text_message(self.final_text)],
+                        output=[get_text_message(final_text)],
                         usage=Usage(),
-                        response_id=f"{self.call_prefix}-done",
+                        response_id=f"{call_prefix}-done",
                     )
 
-                self.call_count += 1
-                return ModelResponse(
-                    output=[
+                tool_call_count += 1
+                output: list[TResponseOutputItem] = []
+                if preceding_tool_name is not None:
+                    output.append(
                         ResponseFunctionToolCall(
                             type="function_call",
-                            name=self.tool_name,
-                            call_id=f"{self.call_prefix}-{id(self)}-{self.call_count}",
-                            arguments=self.tool_arguments,
+                            name=preceding_tool_name,
+                            call_id=f"{call_prefix}-preceding-{tool_call_count}",
+                            arguments="{}",
                         )
-                    ],
+                    )
+                output.append(
+                    ResponseFunctionToolCall(
+                        type="function_call",
+                        name=tool_name,
+                        call_id=f"{call_prefix}-{id(model)}-{tool_call_count}",
+                        arguments=tool_arguments,
+                    )
+                )
+                return ModelResponse(
+                    output=output,
                     usage=Usage(),
-                    response_id=f"{self.call_prefix}-call-{self.call_count}",
+                    response_id=f"{call_prefix}-call-{tool_call_count}",
                 )
 
-            async def stream_response(
-                self,
-                system_instructions: str | None,
-                input: str | list[TResponseInputItem],
-                model_settings: ModelSettings,
-                tools: list[Any],
-                output_schema: Any,
-                handoffs: list[Any],
-                tracing: Any,
-                *,
-                previous_response_id: str | None,
-                conversation_id: str | None,
-                prompt: Any | None,
-            ) -> AsyncIterator[TResponseStreamEvent]:
-                del (
-                    system_instructions,
-                    input,
-                    model_settings,
-                    tools,
-                    output_schema,
-                    handoffs,
-                    tracing,
-                    previous_response_id,
-                    conversation_id,
-                    prompt,
-                )
-                if False:
-                    yield cast(TResponseStreamEvent, {})
-                raise RuntimeError("Streaming is not supported in this test.")
+            model = ScriptedModel(ModelStep.respond(_respond) for _ in range(3))
+            return model
 
         tool_calls: list[str] = []
 
@@ -2719,7 +6324,7 @@ class TestDeserializeHelpers:
             tool_calls.append(text)
             return f"approved:{text}"
 
-        inner_model = ResumeAwareToolModel(
+        inner_model = _make_resume_aware_tool_model(
             tool_name="inner_sensitive_tool",
             tool_arguments=json.dumps({"text": "hello"}),
             final_text="inner-complete",
@@ -2731,19 +6336,34 @@ class TestDeserializeHelpers:
             tool_name="inner_agent_tool",
             tool_description="Inner agent tool",
         )
-        outer_model = ResumeAwareToolModel(
+        outer_model = _make_resume_aware_tool_model(
             tool_name="inner_agent_tool",
             tool_arguments=json.dumps({"input": "hello"}),
             final_text="outer-complete",
             call_prefix="outer",
+            preceding_tool_name="conditional_outer_tool",
         )
-        outer_agent = Agent(name="OuterAgent", model=outer_model, tools=[outer_tool])
+        outer_tool_enabled = True
+        conditional_outer_tool = function_tool(
+            lambda: "conditional-complete",
+            name_override="conditional_outer_tool",
+            is_enabled=lambda _context, _agent: outer_tool_enabled,
+        )
+        outer_agent = Agent(
+            name="OuterAgent", model=outer_model, tools=[conditional_outer_tool, outer_tool]
+        )
 
         first_result = await Runner.run(outer_agent, "start")
         assert first_result.final_output is None
         assert first_result.interruptions
 
         state_json = first_result.to_state().to_json()
+        serialized_functions = state_json["last_processed_response"]["functions"]
+        assert [entry["tool_call"]["name"] for entry in serialized_functions] == [
+            "conditional_outer_tool",
+            "inner_agent_tool",
+        ]
+        outer_tool_enabled = False
         del first_result
         gc.collect()
 
@@ -2754,8 +6374,12 @@ class TestDeserializeHelpers:
         restored_interruptions_two = restored_state_two.get_interruptions()
         assert len(restored_interruptions_one) == 1
         assert len(restored_interruptions_two) == 1
-        restored_state_one.approve(restored_interruptions_one[0])
-        restored_state_two.approve(restored_interruptions_two[0])
+        if approve_nested_tool:
+            restored_state_one.approve(restored_interruptions_one[0])
+            restored_state_two.approve(restored_interruptions_two[0])
+        else:
+            restored_state_one.reject(restored_interruptions_one[0])
+            restored_state_two.reject(restored_interruptions_two[0])
 
         resumed_result_one = await Runner.run(outer_agent, restored_state_one)
         resumed_result_two = await Runner.run(outer_agent, restored_state_two)
@@ -2764,14 +6388,25 @@ class TestDeserializeHelpers:
         assert resumed_result_one.interruptions == []
         assert resumed_result_two.final_output == "outer-complete"
         assert resumed_result_two.interruptions == []
-        assert tool_calls == ["hello", "hello"]
+        assert tool_calls == (["hello", "hello"] if approve_nested_tool else [])
+        inner_model.assert_complete()
+        outer_model.assert_complete()
 
     async def test_json_decode_error_handling(self):
         """Test that invalid JSON raises appropriate error."""
         agent = Agent(name="TestAgent")
+        sentinel = "malformed-json-secret"
 
-        with pytest.raises(Exception, match="Failed to parse run state JSON"):
-            await RunState.from_string(agent, "{ invalid json }")
+        with pytest.raises(UserError, match="Failed to parse run state JSON") as exc:
+            await RunState.from_string(agent, f'{{ "sandbox": "{sentinel}" ')
+
+        assert sentinel not in str(exc.value)
+        traceback = exc.value.__traceback__
+        while traceback is not None:
+            module_name = traceback.tb_frame.f_globals.get("__name__", "")
+            if isinstance(module_name, str) and module_name.startswith("agents."):
+                assert sentinel not in repr(traceback.tb_frame.f_locals)
+            traceback = traceback.tb_next
 
     async def test_missing_agent_in_map_error(self):
         """Test error when agent not found in agent map."""
@@ -2785,41 +6420,269 @@ class TestDeserializeHelpers:
 
         # Try to deserialize with a different agent that doesn't have AgentA in handoffs
         agent_b = Agent(name="AgentB")
-        with pytest.raises(Exception, match="Agent AgentA not found in agent map"):
+        with pytest.raises(Exception, match="Run state agent not found in agent map"):
             await RunState.from_string(agent_b, json_str)
 
 
 class TestRunStateResumption:
     """Test resuming runs from RunState using Runner.run()."""
 
+    @pytest.mark.parametrize("streamed", [False, True], ids=["run", "run_streamed"])
+    @pytest.mark.parametrize("sticky_approved", [True, False], ids=["approve", "reject"])
+    @pytest.mark.asyncio
+    async def test_resume_executes_only_exact_override_result(
+        self,
+        streamed: bool,
+        sticky_approved: bool,
+    ) -> None:
+        """Public resume paths execute only calls authorized by mixed decisions."""
+        model = ScriptedModel()
+        executions: list[str] = []
+
+        @function_tool(needs_approval=True)
+        async def approval_tool(value: str) -> str:
+            executions.append(value)
+            return f"approved:{value}"
+
+        agent = Agent(name="MixedApprovalAgent", model=model, tools=[approval_tool])
+        model.extend(
+            [
+                [
+                    get_function_tool_call(
+                        "approval_tool",
+                        json.dumps({"value": "sticky"}),
+                        call_id="sticky-call",
+                    ),
+                    get_function_tool_call(
+                        "approval_tool",
+                        json.dumps({"value": "exception"}),
+                        call_id="exception-call",
+                    ),
+                ],
+                [get_final_output_message("done")],
+            ]
+        )
+
+        initial = await Runner.run(agent, "start")
+        state = initial.to_state()
+        interruptions = {
+            cast(str, interruption.raw_item.call_id): interruption
+            for interruption in state.get_interruptions()
+        }
+        if sticky_approved:
+            state.approve(interruptions["sticky-call"], always_approve=True)
+            state.reject(
+                interruptions["exception-call"],
+                rejection_message="denied exactly",
+            )
+        else:
+            state.reject(
+                interruptions["sticky-call"],
+                always_reject=True,
+                rejection_message="denied by default",
+            )
+            state.approve(interruptions["exception-call"])
+
+        restored = await RunState.from_string(agent, state.to_string())
+        if streamed:
+            resumed = Runner.run_streamed(agent, restored)
+            async for _ in resumed.stream_events():
+                pass
+        else:
+            resumed = await Runner.run(agent, restored)
+
+        assert resumed.final_output == "done"
+        assert resumed.interruptions == []
+        assert executions == (["sticky"] if sticky_approved else ["exception"])
+
     @pytest.mark.asyncio
     async def test_resume_from_run_state(self):
         """Test resuming a run from a RunState."""
-        model = FakeModel()
+        model = ScriptedModel()
         agent = Agent(name="TestAgent", model=model)
 
         # First run - create a state
-        model.set_next_output([get_text_message("First response")])
+        model.enqueue([get_text_message("First response")])
         result1 = await Runner.run(agent, "First input")
 
         # Create RunState from result
         state = result1.to_state()
 
         # Resume from state
-        model.set_next_output([get_text_message("Second response")])
+        model.enqueue([get_text_message("Second response")])
         result2 = await Runner.run(agent, state)
 
         assert result2.final_output == "Second response"
 
     @pytest.mark.asyncio
+    async def test_resume_from_run_state_does_not_mutate_source_result(self):
+        """Resuming from a state must not append to the raw_responses already returned."""
+        model = ScriptedModel()
+        agent = Agent(name="TestAgent", model=model)
+
+        model.enqueue([get_text_message("First response")])
+        result1 = await Runner.run(agent, "First input")
+        assert len(result1.raw_responses) == 1
+
+        state = result1.to_state()
+
+        model.enqueue([get_text_message("Second response")])
+        result2 = await Runner.run(agent, state)
+
+        # The second run accumulates on top of the first, but the RunResult that was
+        # already handed back to the caller must keep only its own response.
+        assert len(result2.raw_responses) == 2
+        assert len(result1.raw_responses) == 1
+        assert result1.raw_responses is not result2.raw_responses
+
+    @pytest.mark.asyncio
+    async def test_resume_from_run_state_does_not_mutate_source_result_usage(self):
+        """Resuming from a state must not add its tokens to the usage already returned."""
+        model = ScriptedModel()
+        agent = Agent(name="TestAgent", model=model)
+
+        model.enqueue([get_text_message("First response")])
+        result1 = await Runner.run(agent, "First input")
+        requests_after_first_run = result1.context_wrapper.usage.requests
+
+        state = result1.to_state()
+
+        model.enqueue([get_text_message("Second response")])
+        result2 = await Runner.run(agent, state)
+
+        # The resumed run carries the first run's totals forward, but the RunResult
+        # already handed back to the caller must keep only its own.
+        assert result2.context_wrapper.usage.requests > requests_after_first_run
+        assert result1.context_wrapper.usage.requests == requests_after_first_run
+        assert result1.context_wrapper.usage is not result2.context_wrapper.usage
+
+    @pytest.mark.asyncio
+    async def test_two_checkpoints_from_one_result_do_not_share_usage(self):
+        """Two checkpoints must bill their own resumed run, not each other's."""
+        model = ScriptedModel()
+        agent = Agent(name="TestAgent", model=model)
+
+        model.enqueue([get_text_message("First response")])
+        result = await Runner.run(agent, "First input")
+
+        first_checkpoint = result.to_state()
+        second_checkpoint = result.to_state()
+
+        model.enqueue([get_text_message("Second response")])
+        first_resume = await Runner.run(agent, first_checkpoint)
+
+        model.enqueue([get_text_message("Third response")])
+        second_resume = await Runner.run(agent, second_checkpoint)
+
+        # Each checkpoint resumed exactly once from the same one-request run, so both
+        # must report the same total instead of the second inheriting the first's.
+        assert first_resume.context_wrapper.usage.requests == 2
+        assert second_resume.context_wrapper.usage.requests == 2
+        assert (
+            first_resume.context_wrapper.usage.request_usage_entries
+            is not second_resume.context_wrapper.usage.request_usage_entries
+        )
+
+    @pytest.mark.asyncio
+    async def test_resume_does_not_append_to_the_state_it_resumed_from(self):
+        """A resumed run must not accumulate its responses into the caller's checkpoint."""
+        model = ScriptedModel()
+        agent = Agent(name="TestAgent", model=model)
+
+        model.enqueue([get_text_message("First response")])
+        result1 = await Runner.run(agent, "First input")
+        state = result1.to_state()
+        serialized_before = state.to_json()["model_responses"]
+
+        model.enqueue([get_text_message("Second response")])
+        result2 = await Runner.run(agent, state)
+        assert len(result2.raw_responses) == 2
+
+        # The state is a snapshot of the first turn, so the second run's response must
+        # not land in it, neither in memory nor in the serialized snapshot.
+        assert len(state._model_responses) == 1
+        assert state.to_json()["model_responses"] == serialized_before
+
+        # Re-running the same checkpoint therefore replays only its own history.
+        model.enqueue([get_text_message("Third response")])
+        result3 = await Runner.run(agent, state)
+        assert len(result3.raw_responses) == 2
+
+    @pytest.mark.asyncio
+    async def test_streamed_resume_does_not_append_to_the_state_it_resumed_from(self):
+        """A streamed resume must not accumulate its items into the caller's checkpoint."""
+        model = ScriptedModel()
+        agent = Agent(name="TestAgent", model=model)
+
+        model.enqueue([get_text_message("First response")])
+        result1 = await Runner.run(agent, "First input")
+        state = result1.to_state()
+        serialized_before = state.to_json()["session_items"]
+
+        model.enqueue([get_text_message("Second response")])
+        result2 = Runner.run_streamed(agent, state)
+        async for _ in result2.stream_events():
+            pass
+        assert len(result2.new_items) == 2
+
+        assert len(state._session_items) == 1
+        assert state.to_json()["session_items"] == serialized_before
+
+        # Without this, the abandoned attempt's message leaks into the replayed history.
+        model.enqueue([get_text_message("Third response")])
+        result3 = Runner.run_streamed(agent, state)
+        async for _ in result3.stream_events():
+            pass
+        assert len(result3.new_items) == 2
+        assert len(result3.to_input_list()) == 3
+
+    @pytest.mark.asyncio
+    async def test_resumed_max_turns_handler_does_not_append_to_state_items(self):
+        """A resumed run that trips max turns must not append to the state's items."""
+        model = ScriptedModel()
+        agent = Agent(name="TestAgent", model=model)
+
+        model.enqueue([get_text_message("First response")])
+        result1 = await Runner.run(agent, "First input", max_turns=1)
+        state = result1.to_state()
+        serialized_before = state.to_json()["generated_items"]
+
+        handlers: RunErrorHandlers[Any] = {
+            "max_turns": lambda _input: RunErrorHandlerResult(final_output="fallback")
+        }
+        result2 = await Runner.run(agent, state, error_handlers=handlers)
+        assert result2.final_output == "fallback"
+
+        assert len(state._generated_items) == 1
+        assert state.to_json()["generated_items"] == serialized_before
+
+    @pytest.mark.asyncio
+    async def test_fresh_runs_still_report_their_own_history(self):
+        """Boundary: a run that starts without a state is unaffected by the copies."""
+        model = ScriptedModel()
+        agent = Agent(name="TestAgent", model=model)
+
+        model.enqueue([get_text_message("First response")])
+        result1 = await Runner.run(agent, "First input")
+        assert len(result1.raw_responses) == 1
+        assert len(result1.new_items) == 1
+
+        model.enqueue([get_text_message("Streamed response")])
+        result2 = Runner.run_streamed(agent, "Second input")
+        async for _ in result2.stream_events():
+            pass
+        assert len(result2.raw_responses) == 1
+        assert len(result2.new_items) == 1
+
+    @pytest.mark.asyncio
     async def test_resume_from_run_state_with_context(self):
         """Test resuming a run from a RunState with context override."""
-        model = FakeModel()
+        model = ScriptedModel()
         agent = Agent(name="TestAgent", model=model)
 
         # First run with context
         context1 = {"key": "value1"}
-        model.set_next_output([get_text_message("First response")])
+        model.enqueue([get_text_message("First response")])
         result1 = await Runner.run(agent, "First input", context=context1)
 
         # Create RunState from result
@@ -2827,7 +6690,7 @@ class TestRunStateResumption:
 
         # Resume from state with different context (should use new context)
         context2 = {"key": "value2"}
-        model.set_next_output([get_text_message("Second response")])
+        model.enqueue([get_text_message("Second response")])
         result2 = await Runner.run(agent, state, context=context2)
 
         # New context should be used.
@@ -2839,18 +6702,18 @@ class TestRunStateResumption:
     @pytest.mark.asyncio
     async def test_resume_from_run_state_with_conversation_id(self):
         """Test resuming a run from a RunState with conversation_id."""
-        model = FakeModel()
+        model = ScriptedModel()
         agent = Agent(name="TestAgent", model=model)
 
         # First run
-        model.set_next_output([get_text_message("First response")])
+        model.enqueue([get_text_message("First response")])
         result1 = await Runner.run(agent, "First input", conversation_id="conv123")
 
         # Create RunState from result
         state = result1.to_state()
 
         # Resume from state with conversation_id
-        model.set_next_output([get_text_message("Second response")])
+        model.enqueue([get_text_message("Second response")])
         result2 = await Runner.run(agent, state, conversation_id="conv123")
 
         assert result2.final_output == "Second response"
@@ -2858,18 +6721,18 @@ class TestRunStateResumption:
     @pytest.mark.asyncio
     async def test_resume_from_run_state_with_previous_response_id(self):
         """Test resuming a run from a RunState with previous_response_id."""
-        model = FakeModel()
+        model = ScriptedModel()
         agent = Agent(name="TestAgent", model=model)
 
         # First run
-        model.set_next_output([get_text_message("First response")])
+        model.enqueue([get_text_message("First response")])
         result1 = await Runner.run(agent, "First input", previous_response_id="resp123")
 
         # Create RunState from result
         state = result1.to_state()
 
         # Resume from state with previous_response_id
-        model.set_next_output([get_text_message("Second response")])
+        model.enqueue([get_text_message("Second response")])
         result2 = await Runner.run(agent, state, previous_response_id="resp123")
 
         assert result2.final_output == "Second response"
@@ -2877,7 +6740,7 @@ class TestRunStateResumption:
     @pytest.mark.asyncio
     async def test_resume_from_run_state_with_interruption(self):
         """Test resuming a run from a RunState with an interruption."""
-        model = FakeModel()
+        model = ScriptedModel()
 
         async def tool_func() -> str:
             return "tool_result"
@@ -2891,7 +6754,8 @@ class TestRunStateResumption:
         )
 
         # First run - create an interruption
-        model.set_next_output([get_function_tool_call("test_tool", "{}")])
+        model.enqueue([get_function_tool_call("test_tool", "{}")])
+        model.enqueue([])
         result1 = await Runner.run(agent, "First input")
 
         # Create RunState from result
@@ -2902,26 +6766,83 @@ class TestRunStateResumption:
             state.approve(state.get_interruptions()[0])
 
         # Resume from state - should execute approved tools
-        model.set_next_output([get_text_message("Second response")])
+        model.enqueue([get_text_message("Second response")])
         result2 = await Runner.run(agent, state)
 
         assert result2.final_output == "Second response"
 
+    @pytest.mark.parametrize("streamed", [False, True])
+    @pytest.mark.asyncio
+    async def test_result_to_state_detaches_tool_decision_ledgers(self, streamed: bool):
+        """States created from one result must not share approval decisions."""
+        model = ScriptedModel()
+        executions: list[str] = []
+
+        @function_tool(needs_approval=True)
+        async def approval_tool() -> str:
+            executions.append("executed")
+            return "approved"
+
+        agent = Agent(name="TestAgent", model=model, tools=[approval_tool])
+        model.enqueue([get_function_tool_call("approval_tool", "{}")])
+
+        if streamed:
+            result = Runner.run_streamed(agent, "First input")
+            async for _ in result.stream_events():
+                pass
+        else:
+            result = await Runner.run(agent, "First input")
+
+        decided = result.to_state()
+        untouched = result.to_state()
+        untouched_approvals_before = untouched.to_json()["context"]["approvals"]
+
+        decided.approve(decided.get_interruptions()[0])
+
+        assert decided._context is not untouched._context
+        assert decided._context is not None
+        assert untouched._context is not None
+        assert decided._context.context is untouched._context.context
+        assert decided._context._approvals is not untouched._context._approvals
+        assert decided._context._tool_invocations is not untouched._context._tool_invocations
+        assert untouched.to_json()["context"]["approvals"] == untouched_approvals_before
+
+        if streamed:
+            untouched_result = Runner.run_streamed(agent, untouched)
+            async for _ in untouched_result.stream_events():
+                pass
+        else:
+            untouched_result = await Runner.run(agent, untouched)
+
+        assert untouched_result.interruptions
+        assert executions == []
+
+    def test_nested_resume_checkpoint_to_state_keeps_its_owned_decision_ledger(self):
+        """A scoped nested checkpoint returns the state that resume will consume."""
+        from agents.agent_tool_state import _AgentToolResumeCheckpoint
+
+        agent = Agent(name="NestedAgent")
+        approval_item = make_tool_approval_item(agent, call_id="nested-call")
+        state = make_state_with_interruptions(agent, [approval_item])
+        checkpoint = _AgentToolResumeCheckpoint(state, frozenset())
+
+        assert checkpoint.to_state() is state
+
     @pytest.mark.asyncio
     async def test_resume_from_run_state_streamed(self):
         """Test resuming a run from a RunState using run_streamed."""
-        model = FakeModel()
+        model = ScriptedModel()
         agent = Agent(name="TestAgent", model=model)
 
         # First run
-        model.set_next_output([get_text_message("First response")])
+        model.enqueue([get_text_message("First response")])
         result1 = await Runner.run(agent, "First input")
 
         # Create RunState from result
         state = result1.to_state()
 
         # Resume from state using run_streamed
-        model.set_next_output([get_text_message("Second response")])
+        model.enqueue([get_text_message("Second response")])
         result2 = Runner.run_streamed(agent, state)
 
         events = []
@@ -2936,8 +6857,8 @@ class TestRunStateResumption:
     async def test_resume_from_run_state_streamed_uses_context_from_state(self):
         """Test that streaming with RunState uses context from state."""
 
-        model = FakeModel()
-        model.set_next_output([get_text_message("done")])
+        model = ScriptedModel()
+        model.enqueue([get_text_message("done")])
         agent = Agent(name="TestAgent", model=model)
 
         # Create a RunState with context
@@ -2956,8 +6877,8 @@ class TestRunStateResumption:
     async def test_resume_from_run_state_streamed_with_context_override(self):
         """Test that streaming uses provided context override when resuming."""
 
-        model = FakeModel()
-        model.set_next_output([get_text_message("done")])
+        model = ScriptedModel()
+        model.enqueue([get_text_message("done")])
         agent = Agent(name="TestAgent", model=model)
 
         # Create a RunState with context
@@ -2975,7 +6896,7 @@ class TestRunStateResumption:
     @pytest.mark.asyncio
     async def test_run_result_streaming_to_state_with_interruptions(self):
         """Test RunResultStreaming.to_state() sets _current_step with interruptions."""
-        model = FakeModel()
+        model = ScriptedModel()
         agent = Agent(name="TestAgent", model=model)
 
         async def test_tool() -> str:
@@ -2985,7 +6906,7 @@ class TestRunStateResumption:
         agent.tools = [tool]
 
         # Create a run that will have interruptions
-        model.add_multiple_turn_outputs(
+        model.extend(
             [
                 [get_function_tool_call("test_tool", json.dumps({}))],
                 [get_text_message("done")],
@@ -3664,6 +7585,58 @@ class TestRunStateSerializationEdgeCases:
 
         result_shell = _deserialize_items([item_data_shell], {"TestAgent": agent})
         assert len(result_shell) == 1
+        assert result_shell[0].raw_item == item_data_shell["raw_item"]
+
+    @pytest.mark.parametrize(
+        "raw_item",
+        [
+            {"type": "local_shell_call_output", "call_id": "call123"},
+            {
+                "type": "local_shell_call_output",
+                "id": "shell123",
+                "output": "result",
+            },
+            {
+                "type": "local_shell_call_output",
+                "call_id": 123,
+                "output": "result",
+            },
+            {
+                "type": "local_shell_call_output",
+                "call_id": b"call123",
+                "output": "result",
+            },
+            {
+                "type": "local_shell_call_output",
+                "call_id": "",
+                "output": "result",
+            },
+            {
+                "type": "local_shell_call_output",
+                "call_id": "call123",
+                "output": 123,
+            },
+            {
+                "type": "local_shell_call_output",
+                "call_id": "call123",
+                "output": b"result",
+            },
+        ],
+        ids=[
+            "missing-output",
+            "id-only",
+            "invalid-call-id",
+            "bytes-call-id",
+            "empty-call-id",
+            "invalid-output",
+            "bytes-output",
+        ],
+    )
+    async def test_deserialize_rejects_invalid_local_shell_call_output(
+        self, raw_item: dict[str, Any]
+    ) -> None:
+        with pytest.raises(ValidationError):
+            _deserialize_tool_call_output_raw_item(raw_item)
 
     async def test_deserialize_reasoning_item(self):
         """Test deserialization of reasoning_item."""
@@ -3797,12 +7770,18 @@ class TestRunStateSerializationEdgeCases:
                 "type": "mcp_approval_response",
                 "approval_request_id": "req123",
                 "approve": True,
+                "caller": {"type": "program", "caller_id": "program123"},
             },
         }
 
         result_response = _deserialize_items([item_data_response], {"TestAgent": agent})
         assert len(result_response) == 1
         assert result_response[0].type == "mcp_approval_response_item"
+        assert isinstance(result_response[0], MCPApprovalResponseItem)
+        assert result_response[0].raw_item.get("caller") == {
+            "type": "program",
+            "caller_id": "program123",
+        }
 
     async def test_deserialize_tool_approval_item(self):
         """Test deserialization of tool_approval_item."""
@@ -3911,6 +7890,44 @@ class TestRunStateSerializationEdgeCases:
         )
         assert result is not None
         assert len(result.handoffs) == 1
+
+    async def test_deserialize_processed_response_handoff_from_direct_agent(self):
+        """Pending handoffs configured with a direct Agent must survive RunState restoration."""
+        context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+        agent_b = Agent(name="AgentB")
+        agent_a = Agent(name="AgentA", handoffs=[agent_b])
+        handoff_name = Handoff.default_tool_name(agent_b)
+        processed_response_data = {
+            "new_items": [],
+            "handoffs": [
+                {
+                    "tool_call": {
+                        "type": "function_call",
+                        "name": handoff_name,
+                        "call_id": "call123",
+                        "status": "completed",
+                        "arguments": "{}",
+                    },
+                    "handoff": {"tool_name": handoff_name},
+                }
+            ],
+            "functions": [],
+            "computer_actions": [],
+            "local_shell_actions": [],
+            "mcp_approval_requests": [],
+            "tools_used": [],
+            "interruptions": [],
+        }
+
+        result = await _deserialize_processed_response(
+            processed_response_data,
+            agent_a,
+            context,
+            {"AgentA": agent_a, "AgentB": agent_b},
+        )
+
+        assert len(result.handoffs) == 1
+        assert result.handoffs[0].handoff.agent_name == "AgentB"
 
     async def test_deserialize_processed_response_function_in_tools_map(self):
         """Test deserialization of ProcessedResponse with function in tools_map."""
@@ -4349,10 +8366,14 @@ class TestRunStateSerializationEdgeCases:
         context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
         agent = Agent(name="TestAgent")
 
+        class FalsyShellTool(ShellTool):
+            def __bool__(self) -> bool:
+                return False
+
         async def shell_executor(request: Any) -> Any:
             return {"output": "test output"}
 
-        shell_tool = ShellTool(executor=shell_executor)
+        shell_tool = FalsyShellTool(executor=shell_executor)
         agent.tools = [shell_tool]
 
         # Create invalid tool_call_data that will cause ValidationError
@@ -4387,6 +8408,7 @@ class TestRunStateSerializationEdgeCases:
         assert len(result.shell_calls) == 1
         # shell_call should have raw tool_call_data (dict) instead of validated LocalShellCall
         assert isinstance(result.shell_calls[0].tool_call, dict)
+        assert result.shell_calls[0].shell_tool is shell_tool
 
     async def test_deserialize_processed_response_apply_patch_action_with_exception(self):
         """Test deserialization of ProcessedResponse with apply patch action Exception."""
@@ -4592,10 +8614,61 @@ class TestRunStateSerializationEdgeCases:
             "generated_items": [],
         }
 
-        with pytest.raises(
-            UserError, match=f"Run state schema version {schema_version} is not supported"
-        ):
+        with pytest.raises(UserError, match="Run state schema version is not supported"):
             await RunState.from_json(agent, state_json)
+
+    @pytest.mark.asyncio
+    async def test_from_json_checks_schema_before_sandbox_envelope(self):
+        agent = Agent(name="TestAgent")
+        state_json: dict[str, Any] = {
+            "$schemaVersion": "9.9",
+            "sandbox": ["future-sandbox-value"],
+        }
+        original = deepcopy(state_json)
+
+        with pytest.raises(UserError, match="Run state schema version is not supported"):
+            await RunState.from_json(agent, state_json)
+
+        assert state_json == original
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("operation", ["from_json", "from_string"])
+    @pytest.mark.parametrize(
+        ("payload", "message"),
+        [
+            ([{"secret_access_key": "malformed-schema-secret"}], "must be an object"),
+            (
+                {"$schemaVersion": {"value": "malformed-schema-secret"}},
+                "schema version has an invalid type",
+            ),
+            (
+                {"$schemaVersion": "malformed-schema-secret"},
+                "schema version is not supported",
+            ),
+        ],
+    )
+    async def test_malformed_schema_shape_redacts_public_errors(
+        self,
+        operation: str,
+        payload: object,
+        message: str,
+    ) -> None:
+        agent = Agent(name="TestAgent")
+        sentinel = "malformed-schema-secret"
+
+        with pytest.raises(UserError, match=message) as exc:
+            if operation == "from_json":
+                await RunState.from_json(agent, cast(Any, deepcopy(payload)))
+            else:
+                await RunState.from_string(agent, json.dumps(payload))
+
+        assert sentinel not in str(exc.value)
+        traceback = exc.value.__traceback__
+        while traceback is not None:
+            frame_path = Path(traceback.tb_frame.f_code.co_filename).as_posix()
+            if "/src/agents/" in frame_path:
+                assert sentinel not in repr(traceback.tb_frame.f_locals)
+            traceback = traceback.tb_next
 
     @pytest.mark.asyncio
     async def test_from_json_accepts_previous_schema_version(self):
@@ -4622,6 +8695,427 @@ class TestRunStateSerializationEdgeCases:
         assert restored._context is not None
         assert restored._context.context == {"foo": "bar"}
 
+    @pytest.mark.asyncio
+    async def test_programmatic_tool_calling_round_trip_uses_current_schema(self):
+        agent = Agent(name="TestAgent")
+        state: RunState[Any, Agent[Any]] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+            original_input="test",
+        )
+        program = Program(
+            id="program_item",
+            call_id="call_program",
+            code="lookup()",
+            fingerprint="fingerprint",
+            type="program",
+        )
+        function_call = ResponseFunctionToolCall(
+            id="function_item",
+            call_id="call_function",
+            name="lookup",
+            arguments="{}",
+            caller=CallerProgram(type="program", caller_id="call_program"),
+            type="function_call",
+        )
+        program_output = ProgramOutput(
+            id="program_output_item",
+            call_id="call_program",
+            result="done",
+            status="completed",
+            type="program_output",
+        )
+        state._model_responses = [
+            ModelResponse(
+                output=[program, function_call, program_output],
+                usage=Usage(),
+                response_id="response_1",
+            )
+        ]
+        state._generated_items = [
+            ToolCallItem(agent=agent, raw_item=program),
+            ToolCallItem(agent=agent, raw_item=function_call),
+            ToolCallOutputItem(agent=agent, raw_item=program_output, output="done"),
+        ]
+
+        json_data = state.to_json()
+        assert json_data["$schemaVersion"] == CURRENT_SCHEMA_VERSION
+
+        restored = await RunState.from_json(agent, json_data)
+        assert isinstance(restored._model_responses[0].output[0], Program)
+        assert isinstance(restored._model_responses[0].output[2], ProgramOutput)
+        restored_call = cast(ResponseFunctionToolCall, restored._model_responses[0].output[1])
+        assert restored_call["caller"] if isinstance(restored_call, dict) else restored_call.caller
+        assert isinstance(restored._generated_items[0].raw_item, Program)
+        assert isinstance(restored._generated_items[2].raw_item, ProgramOutput)
+
+    @pytest.mark.asyncio
+    async def test_programmatic_tool_calling_round_trip_preserves_mapping_items(self):
+        agent = Agent(name="TestAgent")
+        state: RunState[Any, Agent[Any]] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+            original_input="test",
+        )
+        program = {
+            "id": "program_item",
+            "call_id": "call_program",
+            "code": "lookup()",
+            "type": "program",
+        }
+        program_output = {
+            "id": "program_output_item",
+            "call_id": "call_program",
+            "result": "done",
+            "type": "program_output",
+        }
+        model_response = ModelResponse(output=[], usage=Usage(), response_id="response_1")
+        model_response.output = cast(list[TResponseOutputItem], [program, program_output])
+        state._model_responses = [model_response]
+        state._generated_items = [
+            ToolCallItem(agent=agent, raw_item=program),
+            ToolCallOutputItem(agent=agent, raw_item=program_output, output="done"),
+        ]
+
+        restored = await RunState.from_json(agent, state.to_json())
+
+        assert cast(list[Any], restored._model_responses[0].output) == [program, program_output]
+        assert restored._generated_items[0].raw_item == program
+        assert restored._generated_items[1].raw_item == program_output
+
+    @pytest.mark.asyncio
+    async def test_programmatic_tool_calling_rechecks_allowed_callers_on_resume(self):
+        @function_tool(allowed_callers=["programmatic"])
+        def saved_lookup() -> str:
+            return "saved"
+
+        saved_agent = Agent(
+            name="TestAgent",
+            tools=[ProgrammaticToolCallingTool(), saved_lookup],
+        )
+        state: RunState[Any, Agent[Any]] = make_state(
+            saved_agent,
+            context=RunContextWrapper(context={}),
+            original_input="test",
+        )
+        program = Program(
+            id="program_item",
+            call_id="call_program",
+            code="saved_lookup()",
+            fingerprint="fingerprint",
+            type="program",
+        )
+        function_call = ResponseFunctionToolCall(
+            id="function_item",
+            call_id="call_function",
+            name="saved_lookup",
+            arguments="{}",
+            caller=CallerProgram(type="program", caller_id="call_program"),
+            type="function_call",
+        )
+        state._model_responses = [
+            ModelResponse(output=[program], usage=Usage(), response_id="response_1")
+        ]
+        state._last_processed_response = make_processed_response(
+            functions=[
+                ToolRunFunction(
+                    tool_call=function_call,
+                    function_tool=saved_lookup,
+                )
+            ]
+        )
+
+        @function_tool(name_override="saved_lookup")
+        def rebound_lookup() -> str:
+            return "rebound"
+
+        rebound_agent = Agent(
+            name="TestAgent",
+            tools=[ProgrammaticToolCallingTool(), rebound_lookup],
+        )
+        with pytest.raises(ModelBehaviorError, match="Error details are redacted"):
+            await RunState.from_json(
+                rebound_agent,
+                state.to_json(),
+                context_override={},
+            )
+
+    @pytest.mark.asyncio
+    async def test_programmatic_tool_calling_requires_configured_tool_on_resume(self):
+        @function_tool(allowed_callers=["programmatic"])
+        def saved_lookup() -> str:
+            return "saved"
+
+        saved_agent = Agent(
+            name="TestAgent",
+            tools=[ProgrammaticToolCallingTool(), saved_lookup],
+        )
+        state: RunState[Any, Agent[Any]] = make_state(
+            saved_agent,
+            context=RunContextWrapper(context={}),
+            original_input="test",
+        )
+        program = Program(
+            id="program_item",
+            call_id="call_program",
+            code="saved_lookup()",
+            fingerprint="fingerprint",
+            type="program",
+        )
+        function_call = ResponseFunctionToolCall(
+            id="function_item",
+            call_id="call_function",
+            name="saved_lookup",
+            arguments="{}",
+            caller=CallerProgram(type="program", caller_id="call_program"),
+            type="function_call",
+        )
+        state._model_responses = [
+            ModelResponse(output=[program], usage=Usage(), response_id="response_1")
+        ]
+        state._last_processed_response = make_processed_response(
+            functions=[ToolRunFunction(tool_call=function_call, function_tool=saved_lookup)]
+        )
+
+        @function_tool(name_override="saved_lookup", allowed_callers=["programmatic"])
+        def rebound_lookup() -> str:
+            return "rebound"
+
+        rebound_agent = Agent(name="TestAgent", tools=[rebound_lookup])
+        with pytest.raises(ModelBehaviorError, match="Error details are redacted"):
+            await RunState.from_json(rebound_agent, state.to_json(), context_override={})
+
+    @pytest.mark.asyncio
+    async def test_programmatic_tool_calling_rejects_missing_parent_on_resume(self):
+        @function_tool(allowed_callers=["programmatic"])
+        def saved_lookup() -> str:
+            return "saved"
+
+        agent = Agent(
+            name="TestAgent",
+            tools=[ProgrammaticToolCallingTool(), saved_lookup],
+        )
+        state: RunState[Any, Agent[Any]] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+            original_input="test",
+        )
+        function_call = ResponseFunctionToolCall(
+            id="function_item",
+            call_id="call_function",
+            name="saved_lookup",
+            arguments="{}",
+            caller=CallerProgram(type="program", caller_id="missing_program"),
+            type="function_call",
+        )
+        state._last_processed_response = make_processed_response(
+            functions=[ToolRunFunction(tool_call=function_call, function_tool=saved_lookup)]
+        )
+
+        with pytest.raises(ModelBehaviorError, match="Error details are redacted"):
+            await RunState.from_json(agent, state.to_json(), context_override={})
+
+    @pytest.mark.asyncio
+    async def test_programmatic_tool_calling_rejects_completed_parent_on_resume(self):
+        @function_tool(allowed_callers=["programmatic"])
+        def saved_lookup() -> str:
+            return "saved"
+
+        agent = Agent(
+            name="TestAgent",
+            tools=[ProgrammaticToolCallingTool(), saved_lookup],
+        )
+        state: RunState[Any, Agent[Any]] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+            original_input="test",
+        )
+        program = Program(
+            id="program_item",
+            call_id="call_program",
+            code="saved_lookup()",
+            fingerprint="fingerprint",
+            type="program",
+        )
+        program_output = ProgramOutput(
+            id="program_output_item",
+            call_id="call_program",
+            result="done",
+            status="completed",
+            type="program_output",
+        )
+        function_call = ResponseFunctionToolCall(
+            id="function_item",
+            call_id="call_function",
+            name="saved_lookup",
+            arguments="{}",
+            caller=CallerProgram(type="program", caller_id="call_program"),
+            type="function_call",
+        )
+        state._model_responses = [
+            ModelResponse(
+                output=[program, program_output],
+                usage=Usage(),
+                response_id="response_1",
+            )
+        ]
+        state._last_processed_response = make_processed_response(
+            functions=[ToolRunFunction(tool_call=function_call, function_tool=saved_lookup)]
+        )
+
+        with pytest.raises(ModelBehaviorError, match="Error details are redacted"):
+            await RunState.from_json(agent, state.to_json(), context_override={})
+
+    @pytest.mark.asyncio
+    async def test_programmatic_mcp_approval_rechecks_allowed_callers_on_resume(self):
+        saved_mcp_tool = HostedMCPTool(
+            tool_config=cast(
+                Mcp,
+                {
+                    "type": "mcp",
+                    "server_label": "docs_server",
+                    "server_url": "https://example.com/mcp",
+                    "allowed_callers": ["programmatic"],
+                },
+            )
+        )
+        saved_agent = Agent(
+            name="TestAgent",
+            tools=[ProgrammaticToolCallingTool(), saved_mcp_tool],
+        )
+        state: RunState[Any, Agent[Any]] = make_state(
+            saved_agent,
+            context=RunContextWrapper(context={}),
+            original_input="test",
+        )
+        program = Program(
+            id="program_item",
+            call_id="call_program",
+            code="tools.docs_server.lookup()",
+            fingerprint="fingerprint",
+            type="program",
+        )
+        approval_request = McpApprovalRequest.model_construct(
+            id="approval_item",
+            arguments="{}",
+            name="lookup",
+            server_label="docs_server",
+            type="mcp_approval_request",
+            caller=CallerProgram(type="program", caller_id="call_program"),
+        )
+        state._model_responses = [
+            ModelResponse(output=[program], usage=Usage(), response_id="response_1")
+        ]
+        state._last_processed_response = make_processed_response(
+            mcp_approval_requests=[
+                ToolRunMCPApprovalRequest(
+                    request_item=approval_request,
+                    mcp_tool=saved_mcp_tool,
+                )
+            ]
+        )
+
+        rebound_mcp_tool = HostedMCPTool(
+            tool_config=cast(
+                Mcp,
+                {
+                    "type": "mcp",
+                    "server_label": "docs_server",
+                    "server_url": "https://example.com/mcp",
+                    "allowed_callers": ["direct"],
+                },
+            )
+        )
+        rebound_agent = Agent(
+            name="TestAgent",
+            tools=[ProgrammaticToolCallingTool(), rebound_mcp_tool],
+        )
+        with pytest.raises(ModelBehaviorError, match="Error details are redacted"):
+            await RunState.from_json(
+                rebound_agent,
+                state.to_json(),
+                context_override={},
+            )
+
+    @pytest.mark.asyncio
+    async def test_previous_schema_rejects_programmatic_tool_calling_items(self):
+        agent = Agent(name="TestAgent")
+        state: RunState[Any, Agent[Any]] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+            original_input="test",
+        )
+        state._model_responses = [
+            ModelResponse(
+                output=[
+                    Program(
+                        id="program_item",
+                        call_id="call_program",
+                        code="lookup()",
+                        fingerprint="fingerprint",
+                        type="program",
+                    )
+                ],
+                usage=Usage(),
+                response_id="response_1",
+            )
+        ]
+        json_data = state.to_json()
+        json_data["$schemaVersion"] = "1.12"
+
+        with pytest.raises(UserError, match="Programmatic Tool Calling requires schema version"):
+            await RunState.from_json(agent, json_data)
+
+    @pytest.mark.asyncio
+    async def test_schema_1_13_accepts_programmatic_tool_calling_items(self):
+        agent = Agent(name="TestAgent", tools=[ProgrammaticToolCallingTool()])
+        state: RunState[Any, Agent[Any]] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+            original_input="test",
+        )
+        state._model_responses = [
+            ModelResponse(
+                output=[
+                    Program(
+                        id="program_item",
+                        call_id="call_program",
+                        code="lookup()",
+                        fingerprint="fingerprint",
+                        type="program",
+                    )
+                ],
+                usage=Usage(),
+                response_id="response_1",
+            )
+        ]
+        json_data = state.to_json()
+        json_data["$schemaVersion"] = "1.13"
+
+        restored = await RunState.from_json(agent, json_data)
+
+        assert restored._schema_version == "1.13"
+        assert restored._model_responses[0].output[0].type == "program"
+
+    @pytest.mark.asyncio
+    async def test_previous_schema_ignores_program_like_arbitrary_context(self):
+        agent = Agent(name="TestAgent")
+        state = make_state(
+            agent,
+            context=RunContextWrapper(
+                context={"payload": {"type": "program", "call_id": "not-a-run-item"}}
+            ),
+            original_input="test",
+        )
+        json_data = state.to_json()
+        json_data["$schemaVersion"] = "1.12"
+
+        restored = await RunState.from_json(agent, json_data)
+        assert restored._context is not None
+        assert restored._context.context == {
+            "payload": {"type": "program", "call_id": "not-a-run-item"}
+        }
+
     def test_supported_schema_versions_match_released_boundary(self):
         """The support set should include released versions plus the current unreleased writer."""
         assert SUPPORTED_SCHEMA_VERSIONS == frozenset(
@@ -4636,6 +9130,13 @@ class TestRunStateSerializationEdgeCases:
                 "1.7",
                 "1.8",
                 "1.9",
+                "1.10",
+                "1.11",
+                "1.12",
+                "1.13",
+                "1.14",
+                "1.15",
+                "1.16",
                 CURRENT_SCHEMA_VERSION,
             }
         )
@@ -4645,6 +9146,418 @@ class TestRunStateSerializationEdgeCases:
         assert frozenset(SCHEMA_VERSION_SUMMARIES) == SUPPORTED_SCHEMA_VERSIONS
         assert CURRENT_SCHEMA_VERSION in SCHEMA_VERSION_SUMMARIES
         assert all(summary.strip() for summary in SCHEMA_VERSION_SUMMARIES.values())
+
+    @pytest.mark.asyncio
+    async def test_nested_history_ownership_round_trips_and_defaults_for_schema_1_12(self):
+        """New snapshots persist ownership while released 1.12 snapshots default safely."""
+        agent = Agent(name="TestAgent")
+        message_item = MessageOutputItem(agent=agent, raw_item=make_message_output(text="owned"))
+        input_item = run_item_to_input_item(message_item)
+        assert input_item is not None
+        digest = digest_input_item(input_item)
+        assert digest is not None
+        state: RunState[Any] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+            original_input=[input_item],
+        )
+        state._session_items = [message_item]
+        state._generated_items = [message_item]
+        item_ref = NestedHistoryOwnedItemRef(
+            session_index=0,
+            digest=digest,
+            input_index=0,
+            run_item=message_item,
+            input_item=input_item,
+        )
+        state._nested_history_owned_session_item_refs = [item_ref]
+
+        serialized = state.to_json()
+        restored = await RunState.from_json(agent, serialized)
+
+        assert serialized["nested_history_owned_session_item_refs"] == [
+            {
+                "index": 0,
+                "digest": digest,
+                "input_index": 0,
+            }
+        ]
+        assert serialized["generated_session_item_indexes"] == [0]
+        assert restored._nested_history_owned_session_item_refs == [item_ref]
+        assert restored._generated_items[0] is restored._session_items[0]
+        assert isinstance(restored._original_input, list)
+        assert (
+            restored._nested_history_owned_session_item_refs[0].input_item
+            is (restored._original_input[0])
+        )
+
+        serialized["$schemaVersion"] = "1.12"
+        serialized.pop("nested_history_owned_session_item_refs")
+        serialized.pop("generated_session_item_indexes")
+        restored_1_12 = await RunState.from_json(agent, serialized)
+
+        assert restored_1_12._nested_history_owned_session_item_refs == []
+        assert restored_1_12._generated_items[0] is not restored_1_12._session_items[0]
+
+    @pytest.mark.asyncio
+    async def test_nested_history_ownership_normalizes_raw_assistant_input_digest(self):
+        """Ownership digests must match the normalized original input written to JSON."""
+        agent = Agent(name="TestAgent")
+        raw_message = {
+            "id": "msg_raw",
+            "type": "message",
+            "role": "assistant",
+            "content": "owned",
+        }
+        message_item = MessageOutputItem(agent=agent, raw_item=cast(Any, raw_message))
+        input_item = run_item_to_input_item(message_item)
+        assert input_item is not None
+        digest = digest_input_item(input_item)
+        assert digest is not None
+        state: RunState[Any] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+            original_input=[input_item],
+        )
+        state._session_items = [message_item]
+        state._generated_items = [message_item]
+        state._nested_history_owned_session_item_refs = [
+            NestedHistoryOwnedItemRef(
+                session_index=0,
+                digest=digest,
+                input_index=0,
+                run_item=message_item,
+                input_item=input_item,
+            )
+        ]
+
+        serialized = state.to_json()
+
+        assert serialized["nested_history_owned_session_item_refs"][0]["digest"] == (
+            digest_input_item(serialized["original_input"][0])
+        )
+        restored = await RunState.from_json(agent, serialized)
+        assert (
+            restored._nested_history_owned_session_item_refs[0].input_item
+            == (restored._original_input[0])
+        )
+
+    @pytest.mark.asyncio
+    async def test_nested_history_ownership_remaps_after_skipped_session_item(self):
+        """A skipped unrelated item must not shift a surviving ownership reference."""
+        agent = Agent(name="TestAgent")
+        skipped_item = MessageOutputItem(
+            agent=agent,
+            raw_item=make_message_output(text="skip me"),
+        )
+        owned_item = MessageOutputItem(
+            agent=agent,
+            raw_item=make_message_output(text="owned"),
+        )
+        owned_input = run_item_to_input_item(owned_item)
+        assert owned_input is not None
+        digest = digest_input_item(owned_input)
+        assert digest is not None
+        state: RunState[Any] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+            original_input=[owned_input],
+        )
+        state._generated_items = [owned_item]
+        state._session_items = [skipped_item, owned_item]
+        state._nested_history_owned_session_item_refs = [
+            NestedHistoryOwnedItemRef(
+                session_index=1,
+                digest=digest,
+                input_index=0,
+                run_item=owned_item,
+                input_item=owned_input,
+            )
+        ]
+        serialized = state.to_json()
+        serialized["session_items"][0]["agent"]["name"] = "UnknownAgent"
+
+        restored = await RunState.from_json(agent, serialized)
+
+        assert len(restored._session_items) == 1
+        assert restored._generated_items[0] is restored._session_items[0]
+        assert restored._nested_history_owned_session_item_refs[0].session_index == 0
+        assert (
+            restored._nested_history_owned_session_item_refs[0].run_item
+            is (restored._session_items[0])
+        )
+
+    @pytest.mark.asyncio
+    async def test_copied_generated_item_round_trips_to_its_session_occurrence(self):
+        """The generated/session sidecar must recognize an explicitly copied occurrence."""
+        agent = Agent(name="TestAgent")
+        session_item = MessageOutputItem(
+            agent=agent,
+            raw_item=make_message_output(text="copied"),
+        )
+        ensure_nested_history_run_item_occurrence_key(session_item)
+        generated_copy = deepcopy(session_item)
+        state: RunState[Any] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+        )
+        state._generated_items = [generated_copy]
+        state._session_items = [session_item]
+
+        serialized = state.to_json()
+        restored = await RunState.from_json(agent, serialized)
+
+        assert serialized["generated_session_item_indexes"] == [0]
+        assert "_agents_nested_history_occurrence_key" not in json.dumps(serialized)
+        assert restored._generated_items[0] is restored._session_items[0]
+
+    @pytest.mark.asyncio
+    async def test_repeated_generated_item_identity_maps_to_distinct_session_occurrences(self):
+        """Repeated references must retain multiplicity in generated/session coordinates."""
+        agent = Agent(name="TestAgent")
+        repeated = MessageOutputItem(
+            agent=agent,
+            raw_item=make_message_output(text="same"),
+        )
+        state: RunState[Any] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+        )
+        state._generated_items = [repeated, repeated]
+        state._session_items = [repeated, repeated]
+
+        serialized = state.to_json()
+        restored = await RunState.from_json(agent, serialized)
+
+        assert serialized["generated_session_item_indexes"] == [0, 1]
+        assert restored._generated_items[0] is restored._session_items[0]
+        assert restored._generated_items[1] is restored._session_items[1]
+
+    @pytest.mark.parametrize(
+        "invalid_mapping",
+        [
+            "not-a-list",
+            [0],
+            [-1, None],
+            [2, None],
+            [True, None],
+            [0, 0],
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_invalid_generated_session_item_indexes_are_ignored(
+        self,
+        invalid_mapping: object,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A malformed alias sidecar must not partially bind generated and session items."""
+        agent = Agent(name="TestAgent")
+        first = MessageOutputItem(agent=agent, raw_item=make_message_output(text="first"))
+        second = MessageOutputItem(agent=agent, raw_item=make_message_output(text="second"))
+        state: RunState[Any] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+        )
+        state._generated_items = [first, second]
+        state._session_items = [first, second]
+        serialized = state.to_json()
+        serialized["generated_session_item_indexes"] = invalid_mapping
+
+        with caplog.at_level(logging.WARNING, logger="openai.agents"):
+            restored = await RunState.from_json(agent, serialized)
+
+        assert all(
+            generated is not session
+            for generated, session in zip(
+                restored._generated_items,
+                restored._session_items,
+                strict=True,
+            )
+        )
+        assert "Ignoring invalid generated_session_item_indexes" in caplog.text
+
+    @pytest.mark.parametrize(
+        "invalid_sidecar",
+        [
+            {},
+            ["not-an-object"],
+            [{"index": -1, "digest": "a" * 64, "input_index": 0}],
+            [{"index": 0, "digest": "short", "input_index": 0}],
+            [{"index": 0, "digest": "a" * 64, "input_index": -1}],
+            [{"index": 9, "digest": "a" * 64, "input_index": 0}],
+            [{"index": 0, "digest": "a" * 64, "input_index": 9}],
+            [{"index": 0, "digest": "a" * 64, "input_index": 0}],
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_invalid_nested_history_ownership_sidecars_are_rejected(
+        self,
+        invalid_sidecar: object,
+    ) -> None:
+        """Malformed or mismatched ownership must fail closed during RunState restore."""
+        agent = Agent(name="TestAgent")
+        item = MessageOutputItem(agent=agent, raw_item=make_message_output(text="owned"))
+        input_item = run_item_to_input_item(item)
+        assert input_item is not None
+        state: RunState[Any] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+            original_input=[input_item],
+        )
+        state._generated_items = [item]
+        state._session_items = [item]
+        serialized = state.to_json()
+        serialized["nested_history_owned_session_item_refs"] = invalid_sidecar
+
+        with pytest.raises(UserError):
+            await RunState.from_json(agent, serialized)
+
+    @pytest.mark.asyncio
+    async def test_mismatched_generated_session_occurrence_is_not_aliased(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A valid coordinate cannot alias generated and session items with different payloads."""
+        agent = Agent(name="TestAgent")
+        item = MessageOutputItem(agent=agent, raw_item=make_message_output(text="same"))
+        state: RunState[Any] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+        )
+        state._generated_items = [item]
+        state._session_items = [item]
+        serialized = state.to_json()
+        serialized["session_items"][0]["raw_item"]["content"][0]["text"] = "changed"
+
+        with caplog.at_level(logging.WARNING, logger="openai.agents"):
+            restored = await RunState.from_json(agent, serialized)
+
+        assert restored._generated_items[0] is not restored._session_items[0]
+        assert "Ignoring mismatched generated/session occurrence" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_nested_history_ownership_with_changed_input_digest_is_rejected(self) -> None:
+        """A sidecar cannot claim an input occurrence whose payload changed after serialization."""
+        agent = Agent(name="TestAgent")
+        item = MessageOutputItem(agent=agent, raw_item=make_message_output(text="owned"))
+        input_item = run_item_to_input_item(item)
+        assert input_item is not None
+        digest = digest_input_item(input_item)
+        assert digest is not None
+        state: RunState[Any] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+            original_input=[input_item],
+        )
+        state._generated_items = [item]
+        state._session_items = [item]
+        state._nested_history_owned_session_item_refs = [
+            NestedHistoryOwnedItemRef(
+                session_index=0,
+                digest=digest,
+                input_index=0,
+                run_item=item,
+                input_item=input_item,
+            )
+        ]
+        serialized = state.to_json()
+        serialized["original_input"][0]["content"][0]["text"] = "changed"
+
+        with pytest.raises(UserError, match="input digest does not match"):
+            await RunState.from_json(agent, serialized)
+
+    @pytest.mark.asyncio
+    async def test_nested_history_ownership_for_skipped_session_item_is_ignored(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Ownership for an item that cannot be restored must not shift to another occurrence."""
+        agent = Agent(name="TestAgent")
+        skipped = MessageOutputItem(agent=agent, raw_item=make_message_output(text="skipped"))
+        kept = MessageOutputItem(agent=agent, raw_item=make_message_output(text="kept"))
+        skipped_input = run_item_to_input_item(skipped)
+        assert skipped_input is not None
+        digest = digest_input_item(skipped_input)
+        assert digest is not None
+        state: RunState[Any] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+            original_input=[skipped_input],
+        )
+        state._generated_items = [skipped]
+        state._session_items = [skipped, kept]
+        state._nested_history_owned_session_item_refs = [
+            NestedHistoryOwnedItemRef(
+                session_index=0,
+                digest=digest,
+                input_index=0,
+                run_item=skipped,
+                input_item=skipped_input,
+            )
+        ]
+        serialized = state.to_json()
+        serialized["session_items"][0]["agent"]["name"] = "UnknownAgent"
+
+        with caplog.at_level(logging.WARNING, logger="openai.agents"):
+            restored = await RunState.from_json(agent, serialized)
+
+        assert len(restored._session_items) == 1
+        assert restored._session_items[0].raw_item == kept.raw_item
+        assert restored._generated_items[0].raw_item == skipped.raw_item
+        assert restored._generated_items[0] is not restored._session_items[0]
+        assert restored._nested_history_owned_session_item_refs == []
+        assert "Ignoring nested history ownership for skipped session item" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_equal_generated_replacement_does_not_claim_session_occurrence(self):
+        """Equal payloads without explicit lineage must serialize as distinct occurrences."""
+        agent = Agent(name="TestAgent")
+        session_item = MessageOutputItem(
+            agent=agent,
+            raw_item=make_message_output(text="same"),
+        )
+        generated_replacement = MessageOutputItem(
+            agent=agent,
+            raw_item=deepcopy(session_item.raw_item),
+        )
+        state: RunState[Any] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+        )
+        state._generated_items = [generated_replacement]
+        state._session_items = [session_item]
+
+        serialized = state.to_json()
+        restored = await RunState.from_json(agent, serialized)
+
+        assert serialized["generated_session_item_indexes"] == [None]
+        assert restored._generated_items[0] is not restored._session_items[0]
+
+        serialized["$schemaVersion"] = "1.12"
+        serialized.pop("nested_history_owned_session_item_refs")
+        serialized.pop("generated_session_item_indexes")
+        restored_1_12 = await RunState.from_json(agent, serialized)
+
+        assert restored_1_12._generated_items[0] is not restored_1_12._session_items[0]
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_copied_generated_item_does_not_claim_equal_session_occurrence(self):
+        """An equal partial copy must remain separate when its session occurrence is ambiguous."""
+        agent = Agent(name="TestAgent")
+        first = MessageOutputItem(agent=agent, raw_item=make_message_output(text="same"))
+        second = MessageOutputItem(agent=agent, raw_item=make_message_output(text="same"))
+        state: RunState[Any] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+        )
+        state._generated_items = [deepcopy(second)]
+        state._session_items = [first, second]
+
+        serialized = state.to_json()
+        restored = await RunState.from_json(agent, serialized)
+
+        assert serialized["generated_session_item_indexes"] == [None]
+        assert all(restored._generated_items[0] is not item for item in restored._session_items)
 
     @pytest.mark.asyncio
     async def test_from_json_accepts_schema_version_1_5_without_sandbox_payload(self):
@@ -4717,6 +9630,568 @@ class TestRunStateSerializationEdgeCases:
         assert restored_session_state.snapshot.base_path == Path("/tmp/snapshots")
 
     @pytest.mark.asyncio
+    async def test_run_state_sanitizes_raw_mount_credentials_without_provider_imports(self):
+        agent = Agent(name="TestAgent")
+        context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+        state: RunState[Any, Agent[Any]] = make_state(agent, context=context, original_input="test")
+        raw_session_state = {
+            "type": "unimported-provider",
+            "manifest": {
+                "version": 1,
+                "root": "/workspace",
+                "entries": {
+                    "malformed-parent": {
+                        "type": "unknown-parent",
+                        "children": {
+                            "data": {
+                                "type": "s3_mount",
+                                "access_key_id": "raw-access-key",
+                                "secret_access_key": "raw-secret-key",
+                                "mount_strategy": {
+                                    "type": {"invalid": "raw-strategy-discriminator-secret"},
+                                    "driver": "rclone",
+                                    "driver_options": {
+                                        "vfs-cache-mode": "off",
+                                        "s3-secret-access-key": "raw-driver-secret",
+                                    },
+                                    "pattern": {
+                                        "type": {"invalid": "pattern-discriminator"},
+                                        "config_file_path": "/workspace/raw-pattern-secret",
+                                        "extra_args": [
+                                            "--header",
+                                            "Authorization: raw-header-secret",
+                                        ],
+                                        "options": {
+                                            "endpoint_url": {"credential": "raw-endpoint-secret"},
+                                            "extra_options": {"password": "raw-option-secret"},
+                                        },
+                                    },
+                                },
+                            }
+                        },
+                    },
+                },
+                "environment": {"value": {}},
+            },
+        }
+        state._sandbox = {
+            "backend_id": "unimported-provider",
+            "session_state": raw_session_state,
+            "sessions_by_agent": {
+                agent.name: {
+                    "agent_name": agent.name,
+                    "session_state": raw_session_state,
+                }
+            },
+        }
+
+        serialized = state.to_json()
+        serialized_text = json.dumps(serialized)
+
+        assert "raw-access-key" not in serialized_text
+        assert "raw-secret-key" not in serialized_text
+        assert "raw-driver-secret" not in serialized_text
+        assert "raw-pattern-secret" not in serialized_text
+        assert "raw-header-secret" not in serialized_text
+        assert "raw-endpoint-secret" not in serialized_text
+        assert "raw-option-secret" not in serialized_text
+        assert "raw-strategy-discriminator-secret" not in serialized_text
+        assert "vfs-cache-mode" not in serialized_text
+        serialized_session = serialized["sandbox"]["session_state"]
+        assert serialized_session["__openai_agents_redacted_mount_authority"] is True
+
+        serialized["sandbox"]["session_state"] = raw_session_state
+        restored = await RunState.from_json(agent, serialized)
+
+        assert restored._sandbox is not None
+        assert "raw-secret-key" not in repr(restored._sandbox)
+        assert "raw-strategy-discriminator-secret" not in repr(restored._sandbox)
+        assert "raw-secret-key" not in repr(serialized)
+        assert "raw-strategy-discriminator-secret" not in repr(serialized)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("operation", ["to_json", "from_json"])
+    async def test_run_state_rejects_non_string_mount_entry_type_without_values(
+        self,
+        operation: str,
+    ) -> None:
+        agent = Agent(name="TestAgent")
+        state: RunState[Any, Agent[Any]] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+            original_input="test",
+        )
+        sentinel = "malformed-mount-entry-type-secret"
+        sandbox = {
+            "backend_id": "unimported-provider",
+            "session_state": {
+                "type": "unimported-provider",
+                "manifest": {
+                    "version": 1,
+                    "root": "/workspace",
+                    "entries": {
+                        "data": {
+                            "type": {"invalid": "discriminator"},
+                            "secret_access_key": sentinel,
+                            "mount_strategy": {"type": "in_container"},
+                        }
+                    },
+                    "environment": {"value": {}},
+                },
+            },
+        }
+        if operation == "to_json":
+            state._sandbox = sandbox
+            serialized = None
+        else:
+            serialized = state.to_json()
+            serialized["sandbox"] = sandbox
+
+        with pytest.raises(ValueError, match="invalid manifest") as exc_info:
+            if operation == "to_json":
+                state.to_json()
+            else:
+                assert serialized is not None
+                await RunState.from_json(agent, serialized)
+
+        assert sandbox == {}
+        assert sentinel not in str(exc_info.value)
+        assert sentinel not in repr(exc_info.value)
+        traceback = exc_info.value.__traceback__
+        while traceback is not None:
+            module_name = traceback.tb_frame.f_globals.get("__name__", "")
+            if isinstance(module_name, str) and module_name.startswith("agents."):
+                assert sentinel not in repr(traceback.tb_frame.f_locals)
+            traceback = traceback.tb_next
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("collision_kind", ["strategy", "extension_entry"])
+    async def test_run_state_rejects_reserved_mount_registration_collision_without_values(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        collision_kind: str,
+    ) -> None:
+        sentinel = f"reserved-{collision_kind}-collision-secret"
+        agent = Agent(name="TestAgent")
+        state: RunState[Any, Agent[Any]] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+            original_input="test",
+        )
+        entries: dict[str, Any]
+        if collision_kind == "strategy":
+            entries = {
+                "data": {
+                    "type": "s3_mount",
+                    "bucket": "bucket",
+                    "access_key_id": "access-key",
+                    "secret_access_key": sentinel,
+                    "mount_strategy": {"type": "cloudflare_bucket_mount"},
+                }
+            }
+        else:
+            entries = {
+                "drive": {
+                    "type": "blaxel_drive_mount",
+                    "drive_name": "drive",
+                    "drive_mount_path": "/data",
+                    "drive_path": "/",
+                    "drive_read_only": True,
+                    "mount_strategy": {"type": "blaxel_drive"},
+                },
+                "data": {
+                    "type": "s3_mount",
+                    "bucket": "bucket",
+                    "access_key_id": "access-key",
+                    "secret_access_key": sentinel,
+                    "mount_strategy": {"type": "docker_volume", "driver": "rclone"},
+                },
+            }
+        state_json = state.to_json()
+        state_json["sandbox"] = {
+            "backend_id": "cloudflare",
+            "session_state": {
+                "type": "cloudflare",
+                "manifest": {
+                    "version": 1,
+                    "root": "/workspace",
+                    "entries": entries,
+                    "environment": {"value": {}},
+                },
+            },
+        }
+        original_import_module = importlib.import_module
+
+        def import_module_with_registration_collision(name: str, package: str | None = None) -> Any:
+            if (
+                collision_kind == "strategy"
+                and name == "agents.extensions.sandbox.cloudflare.mounts"
+            ):
+                raise TypeError("mount strategy type is already registered")
+            if (
+                collision_kind == "extension_entry"
+                and name == "agents.extensions.sandbox.blaxel.mounts"
+            ):
+                raise ValueError("artifact type is already registered")
+            return original_import_module(name, package)
+
+        if collision_kind == "strategy":
+            monkeypatch.setitem(
+                MountStrategyBase._subclass_registry,
+                "cloudflare_bucket_mount",
+                cast(Any, object()),
+            )
+        else:
+            monkeypatch.setitem(
+                BaseEntry._subclass_registry,
+                "blaxel_drive_mount",
+                Mount,
+            )
+        monkeypatch.setattr(
+            importlib,
+            "import_module",
+            import_module_with_registration_collision,
+        )
+
+        with pytest.raises(ValueError) as exc_info:
+            await RunState.from_json(agent, state_json)
+
+        assert sentinel not in str(exc_info.value)
+        assert sentinel not in repr(exc_info.value)
+        traceback = exc_info.value.__traceback__
+        while traceback is not None:
+            frame_path = Path(traceback.tb_frame.f_code.co_filename).as_posix()
+            if "/src/agents/" in frame_path:
+                assert sentinel not in repr(traceback.tb_frame.f_locals)
+            traceback = traceback.tb_next
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("provider_entry_registered", [False, True])
+    async def test_run_state_preserves_blaxel_drive_mount(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        provider_entry_registered: bool,
+    ) -> None:
+        if provider_entry_registered:
+            from agents.extensions.sandbox.blaxel.mounts import BlaxelDriveMount
+
+            monkeypatch.setitem(
+                BaseEntry._subclass_registry,
+                "blaxel_drive_mount",
+                BlaxelDriveMount,
+            )
+        else:
+            monkeypatch.delitem(BaseEntry._subclass_registry, "blaxel_drive_mount", raising=False)
+        agent = Agent(name="TestAgent")
+        state: RunState[Any, Agent[Any]] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+            original_input="test",
+        )
+        raw_session_state = {
+            "type": "blaxel",
+            "manifest": {
+                "version": 1,
+                "root": "/workspace",
+                "entries": {
+                    "drive": {
+                        "type": "blaxel_drive_mount",
+                        "drive_name": "shared-drive",
+                        "drive_mount_path": "/data",
+                        "drive_path": "/",
+                        "drive_read_only": True,
+                        "mount_strategy": {"type": "blaxel_drive"},
+                    }
+                },
+                "environment": {"value": {}},
+            },
+        }
+        state._sandbox = {
+            "backend_id": "blaxel",
+            "session_state": raw_session_state,
+        }
+
+        serialized = state.to_json()
+        restored = await RunState.from_json(agent, serialized)
+
+        assert restored._sandbox is not None
+        restored_session = cast(dict[str, object], restored._sandbox["session_state"])
+        restored_manifest = cast(dict[str, object], restored_session["manifest"])
+        restored_entries = cast(dict[str, object], restored_manifest["entries"])
+        expected_manifest = cast(dict[str, object], raw_session_state["manifest"])
+        expected_entries = cast(dict[str, object], expected_manifest["entries"])
+        assert restored_entries["drive"] == expected_entries["drive"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("operation", ["to_json", "from_json"])
+    async def test_run_state_rejects_malformed_manifest_entry_containers_without_values(
+        self,
+        operation: str,
+    ) -> None:
+        agent = Agent(name="TestAgent")
+        state: RunState[Any, Agent[Any]] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+            original_input="test",
+        )
+        sentinel = "malformed-entry-container-secret"
+        sandbox = {
+            "backend_id": "unimported-provider",
+            "session_state": {
+                "type": "unimported-provider",
+                "manifest": {
+                    "version": 1,
+                    "root": "/workspace",
+                    "entries": [sentinel],
+                    "environment": {"value": {}},
+                },
+            },
+        }
+        if operation == "to_json":
+            state._sandbox = sandbox
+            serialized = None
+        else:
+            serialized = state.to_json()
+            serialized["sandbox"] = sandbox
+
+        with pytest.raises(ValueError, match="invalid manifest") as exc:
+            if operation == "to_json":
+                state.to_json()
+            else:
+                assert serialized is not None
+                await RunState.from_json(agent, serialized)
+
+        assert sandbox == {}
+        assert sentinel not in str(exc.value)
+        traceback = exc.value.__traceback__
+        while traceback is not None:
+            module_name = traceback.tb_frame.f_globals.get("__name__", "")
+            if isinstance(module_name, str) and module_name.startswith("agents."):
+                assert sentinel not in repr(traceback.tb_frame.f_locals)
+            traceback = traceback.tb_next
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("operation", ["to_json", "from_json"])
+    async def test_run_state_rejects_non_mapping_session_manifest(
+        self,
+        operation: str,
+    ) -> None:
+        agent = Agent(name="TestAgent")
+        state: RunState[Any, Agent[Any]] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+            original_input="test",
+        )
+        sentinel = "non-mapping-manifest-secret"
+        sandbox = {
+            "backend_id": "unimported-provider",
+            "session_state": {
+                "type": "unimported-provider",
+                "manifest": [{"secret_access_key": sentinel}],
+            },
+        }
+        if operation == "to_json":
+            state._sandbox = sandbox
+            serialized = None
+        else:
+            serialized = state.to_json()
+            serialized["sandbox"] = sandbox
+
+        with pytest.raises(ValueError, match="invalid manifest") as exc:
+            if operation == "to_json":
+                state.to_json()
+            else:
+                assert serialized is not None
+                await RunState.from_json(agent, serialized)
+
+        assert sandbox == {}
+        assert sentinel not in str(exc.value)
+        traceback = exc.value.__traceback__
+        while traceback is not None:
+            frame_path = Path(traceback.tb_frame.f_code.co_filename).as_posix()
+            if "/src/agents/" in frame_path:
+                assert sentinel not in repr(traceback.tb_frame.f_locals)
+            traceback = traceback.tb_next
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("operation", ["to_json", "from_json"])
+    @pytest.mark.parametrize("location", ["strategy", "pattern"])
+    async def test_run_state_rejects_unknown_mount_discriminators_without_values(
+        self,
+        operation: str,
+        location: str,
+    ) -> None:
+        agent = Agent(name="TestAgent")
+        state: RunState[Any, Agent[Any]] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+            original_input="test",
+        )
+        sentinel = f"unknown-{location}-discriminator-secret"
+        raw_session_state: dict[str, Any] = {
+            "type": "unimported-provider",
+            "manifest": {
+                "version": 1,
+                "root": "/workspace",
+                "entries": {
+                    "data": {
+                        "type": "s3_mount",
+                        "bucket": "bucket",
+                        "mount_strategy": {
+                            "type": "in_container",
+                            "pattern": {
+                                "type": "rclone",
+                            },
+                        },
+                    },
+                },
+                "environment": {"value": {}},
+            },
+        }
+        strategy = cast(
+            dict[str, Any],
+            raw_session_state["manifest"]["entries"]["data"]["mount_strategy"],
+        )
+        if location == "strategy":
+            strategy["type"] = sentinel
+        else:
+            cast(dict[str, Any], strategy["pattern"])["type"] = sentinel
+        sandbox = {
+            "backend_id": "unimported-provider",
+            "session_state": raw_session_state,
+        }
+
+        if operation == "to_json":
+            state._sandbox = sandbox
+            serialized = None
+        else:
+            serialized = state.to_json()
+            serialized["sandbox"] = sandbox
+
+        with pytest.raises(ValueError, match="invalid manifest") as exc_info:
+            if operation == "to_json":
+                state.to_json()
+            else:
+                assert serialized is not None
+                await RunState.from_json(agent, serialized)
+
+        assert sandbox == {}
+        assert sentinel not in str(exc_info.value)
+        assert sentinel not in repr(exc_info.value)
+        traceback = exc_info.value.__traceback__
+        while traceback is not None:
+            module_name = traceback.tb_frame.f_globals.get("__name__", "")
+            if isinstance(module_name, str) and module_name.startswith("agents."):
+                assert sentinel not in repr(traceback.tb_frame.f_locals)
+            traceback = traceback.tb_next
+
+    def test_run_state_redacts_unknown_mount_strategy_configuration(self) -> None:
+        agent = Agent(name="TestAgent")
+        state: RunState[Any, Agent[Any]] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+            original_input="test",
+        )
+        state._sandbox = {
+            "backend_id": "unimported-provider",
+            "session_state": {
+                "type": "unimported-provider",
+                "manifest": {
+                    "version": 1,
+                    "root": "/workspace",
+                    "entries": {
+                        "data": {
+                            "type": "s3_mount",
+                            "bucket": "bucket",
+                            "mount_strategy": {
+                                "type": "in_container",
+                                "api_token": "custom-strategy-secret",
+                                "pattern": {
+                                    "type": "rclone",
+                                    "api_token": "nested-pattern-secret",
+                                    "options": {
+                                        "authorization": "nested-options-secret",
+                                    },
+                                },
+                            },
+                        }
+                    },
+                    "environment": {"value": {}},
+                },
+            },
+        }
+
+        serialized = state.to_json()
+
+        strategy = serialized["sandbox"]["session_state"]["manifest"]["entries"]["data"][
+            "mount_strategy"
+        ]
+        assert strategy["type"] == "in_container"
+        assert strategy["pattern"]["type"] == "rclone"
+        assert "api_token" not in strategy
+        assert "api_token" not in strategy["pattern"]
+        assert "options" not in strategy["pattern"]
+        assert "custom-strategy-secret" not in repr(serialized)
+        assert "nested-pattern-secret" not in repr(serialized)
+        assert "nested-options-secret" not in repr(serialized)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("operation", ["to_json", "from_json"])
+    @pytest.mark.parametrize("location", ["top_level", "current", "sessions_by_agent"])
+    async def test_run_state_rejects_malformed_sandbox_session_envelopes_without_values(
+        self,
+        operation: str,
+        location: str,
+    ) -> None:
+        agent = Agent(name="TestAgent")
+        context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+        state: RunState[Any, Agent[Any]] = make_state(agent, context=context, original_input="test")
+        sentinel = "malformed-sandbox-secret"
+        if location == "top_level":
+            malformed: object = sentinel
+        elif location == "current":
+            malformed = {"session_state": [sentinel]}
+        else:
+            malformed = {
+                "sessions_by_agent": {
+                    agent.name: {
+                        "agent_name": agent.name,
+                        "session_state": [sentinel],
+                    }
+                }
+            }
+
+        if operation == "to_json":
+            state._sandbox = cast(Any, malformed)
+            serialized = None
+        else:
+            serialized = state.to_json()
+            serialized["sandbox"] = malformed
+
+        with pytest.raises(ValueError, match="invalid envelope") as exc:
+            if operation == "to_json":
+                state.to_json()
+            else:
+                assert serialized is not None
+                await RunState.from_json(agent, serialized)
+
+        if isinstance(malformed, dict):
+            assert malformed == {}
+        elif operation == "to_json":
+            assert state._sandbox is None
+        else:
+            assert serialized is not None
+            assert serialized["sandbox"] == {}
+        assert sentinel not in str(exc.value)
+        assert sentinel not in repr(exc.value)
+        traceback = exc.value.__traceback__
+        while traceback is not None:
+            module_name = traceback.tb_frame.f_globals.get("__name__", "")
+            if isinstance(module_name, str) and module_name.startswith("agents."):
+                assert sentinel not in repr(traceback.tb_frame.f_locals)
+            traceback = traceback.tb_next
+
+    @pytest.mark.asyncio
     async def test_from_json_agent_not_found(self):
         """Test that from_json raises error when agent is not found in agent map."""
         agent = Agent(name="TestAgent")
@@ -4735,7 +10210,7 @@ class TestRunStateSerializationEdgeCases:
             "generated_items": [],
         }
 
-        with pytest.raises(UserError, match="Agent NonExistentAgent not found in agent map"):
+        with pytest.raises(UserError, match="Run state agent not found in agent map"):
             await RunState.from_json(agent, state_json)
 
     @pytest.mark.asyncio
@@ -5083,8 +10558,8 @@ class TestToolApprovalItem:
 
         assert context.is_tool_approved(tool_name="explicit_name", call_id="call123") is True
 
-    def test_approve_tool_extracts_call_id_from_dict(self):
-        """Test that approve_tool extracts call_id from dict raw_item."""
+    def test_approve_tool_rejects_uncanonical_hosted_call_dict(self):
+        """A generic hosted call cannot create approval authority from its item ID."""
         context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
         agent = Agent(name="TestAgent")
         # Dict with hosted tool identifiers (id instead of call_id)
@@ -5095,9 +10570,10 @@ class TestToolApprovalItem:
         }
 
         approval_item = ToolApprovalItem(agent=agent, raw_item=raw_item)
-        context.approve_tool(approval_item)
+        with pytest.raises(ModelBehaviorError, match="canonical invocation identity"):
+            context.approve_tool(approval_item)
 
-        assert context.is_tool_approved(tool_name="hosted_tool", call_id="hosted_call_123") is True
+        assert context.is_tool_approved(tool_name="hosted_tool", call_id="hosted_call_123") is None
 
     def test_reject_tool_with_explicit_tool_name(self):
         """Test that reject_tool works with explicit tool_name."""
@@ -5959,3 +11435,676 @@ async def test_resume_rejected_function_approval_emits_output() -> None:
         for item in resumed.new_items
     )
     assert calls == []
+
+
+def test_resolve_resumed_context_keeps_restored_wrapper_and_replaces_app_context() -> None:
+    """Override must mutate the restored wrapper in place, not allocate a replacement."""
+    from agents.run_context import _ApprovalRecord
+
+    agent = Agent(name="unit-agent")
+    original_context = {"user": "original"}
+    restored_wrapper = RunContextWrapper(context=original_context)
+    restored_wrapper.tool_input = {"scoped": True}
+    restored_wrapper.turn_input = [{"role": "user", "content": "hi"}]
+    restored_usage = restored_wrapper.usage
+    restored_approvals = restored_wrapper._approvals
+    restored_approvals["needs_ok"] = _ApprovalRecord(approved=["1"])
+
+    state = make_state(agent, context=restored_wrapper, original_input="hi")
+    override = {"user": "reviewer"}
+
+    resolved = resolve_resumed_context(run_state=state, context=override)
+
+    assert resolved is restored_wrapper
+    assert resolved is state._context
+    assert resolved.context is override
+    assert resolved.context is not original_context
+    assert resolved.usage is restored_usage
+    assert resolved._approvals is restored_approvals
+    assert resolved._approvals["needs_ok"].approved == ["1"]
+    assert resolved.turn_input == [{"role": "user", "content": "hi"}]
+    assert resolved.tool_input == {"scoped": True}
+
+    # Passing a wrapper only donates its application value; run-owned state stays.
+    donor = RunContextWrapper(context={"user": "from-wrapper"})
+    donor.tool_input = {"should": "not-win"}
+    resolved_again = resolve_resumed_context(run_state=state, context=donor)
+    assert resolved_again is restored_wrapper
+    assert resolved_again.context == {"user": "from-wrapper"}
+    assert resolved_again.tool_input == {"scoped": True}
+
+
+async def _interrupted_approval_state_with_tool_input(
+    *,
+    calls: list[str],
+    seen_contexts: list[dict[str, str]],
+    seen_tool_inputs: list[object],
+) -> tuple[Any, Any, RunState[Any, Agent[Any]]]:
+    @function_tool(needs_approval=True)
+    async def needs_ok(ctx: RunContextWrapper[dict[str, str]], text: str) -> str:
+        seen_contexts.append(dict(ctx.context))
+        seen_tool_inputs.append(ctx.tool_input)
+        calls.append(text)
+        return text
+
+    model, agent = make_model_and_agent(tools=[needs_ok], name="agent")
+    model.extend(
+        [
+            [get_function_tool_call("needs_ok", json.dumps({"text": "one"}), call_id="1")],
+            [get_final_output_message("done")],
+        ]
+    )
+
+    first = await Runner.run(agent, input="hi", context={"user": "original"})
+    assert first.interruptions
+    state = first.to_state()
+    assert state._context is not None
+    state._context.tool_input = {"scoped": True}
+    state.approve(first.interruptions[0])
+    restored = await RunState.from_json(agent, state.to_json())
+    assert restored._context is not None
+    assert restored._context.tool_input == {"scoped": True}
+    assert restored._context._approvals
+    return model, agent, restored
+
+
+@pytest.mark.asyncio
+async def test_resume_approved_function_approval_via_json_with_context_override() -> None:
+    """JSON resume + context= keeps approvals/tool_input and applies the new app context."""
+    calls: list[str] = []
+    seen_contexts: list[dict[str, str]] = []
+    seen_tool_inputs: list[object] = []
+    _model, agent, restored = await _interrupted_approval_state_with_tool_input(
+        calls=calls, seen_contexts=seen_contexts, seen_tool_inputs=seen_tool_inputs
+    )
+    restored_wrapper = restored._context
+    assert restored_wrapper is not None
+    override = {"user": "reviewer"}
+
+    resumed = await Runner.run(agent, input=restored, context=override)
+
+    assert resumed.final_output == "done"
+    assert resumed.interruptions == []
+    assert calls == ["one"]
+    assert seen_contexts == [override]
+    assert seen_tool_inputs == [{"scoped": True}]
+    assert resumed.context_wrapper is restored_wrapper
+    assert resumed.context_wrapper.context == override
+    assert resumed.context_wrapper.tool_input == {"scoped": True}
+    assert resumed.context_wrapper._approvals is restored_wrapper._approvals
+
+
+@pytest.mark.asyncio
+async def test_resume_approved_function_approval_streamed_with_context_override() -> None:
+    """Streamed resume + context= keeps approvals/tool_input and applies the new app context."""
+    calls: list[str] = []
+    seen_contexts: list[dict[str, str]] = []
+    seen_tool_inputs: list[object] = []
+    _model, agent, restored = await _interrupted_approval_state_with_tool_input(
+        calls=calls, seen_contexts=seen_contexts, seen_tool_inputs=seen_tool_inputs
+    )
+    restored_wrapper = restored._context
+    assert restored_wrapper is not None
+    override = {"user": "reviewer"}
+
+    resumed = Runner.run_streamed(agent, restored, context=override)
+    async for _ in resumed.stream_events():
+        pass
+
+    assert resumed.final_output == "done"
+    assert resumed.interruptions == []
+    assert calls == ["one"]
+    assert seen_contexts == [override]
+    assert seen_tool_inputs == [{"scoped": True}]
+    assert resumed.context_wrapper is restored_wrapper
+    assert resumed.context_wrapper.context == override
+    assert resumed.context_wrapper.tool_input == {"scoped": True}
+    assert resumed.context_wrapper._approvals is restored_wrapper._approvals
+
+
+@pytest.mark.asyncio
+async def test_resume_nested_agent_as_tool_with_context_override() -> None:
+    """Nested Agent.as_tool() resume sees context= while keeping nested wrapper-owned state."""
+    seen_contexts: list[dict[str, str]] = []
+    seen_tool_inputs: list[object] = []
+    calls: list[str] = []
+
+    @dataclass
+    class NestedParams:
+        input: str
+
+    @function_tool(needs_approval=True)
+    async def needs_ok(ctx: RunContextWrapper[dict[str, str]], text: str) -> str:
+        seen_contexts.append(dict(ctx.context))
+        seen_tool_inputs.append(ctx.tool_input)
+        calls.append(text)
+        return text
+
+    nested_turn_usage = Usage(
+        requests=1,
+        input_tokens=17,
+        output_tokens=3,
+        total_tokens=20,
+    )
+    nested_model = ScriptedModel()
+    nested_model.set_default_usage(nested_turn_usage)
+    nested_agent = Agent(name="nested", tools=[needs_ok], model=nested_model)
+    nested_model.extend(
+        [
+            [get_function_tool_call("needs_ok", json.dumps({"text": "one"}), call_id="inner-1")],
+            [get_final_output_message("nested-done")],
+        ]
+    )
+
+    outer_model = ScriptedModel()
+    outer = Agent(
+        name="outer",
+        tools=[
+            nested_agent.as_tool(
+                tool_name="nested_agent",
+                tool_description="Run nested agent",
+                parameters=NestedParams,
+            )
+        ],
+        model=outer_model,
+    )
+    outer_model.extend(
+        [
+            [
+                get_function_tool_call(
+                    "nested_agent",
+                    json.dumps({"input": "hi"}),
+                    call_id="outer-1",
+                )
+            ],
+            [get_final_output_message("done")],
+        ]
+    )
+
+    first = await Runner.run(outer, input="hi", context={"user": "original"})
+    assert first.interruptions
+    assert first.interruptions[0].tool_name == "needs_ok"
+
+    state = first.to_state()
+    assert state._context is not None
+    state._context.tool_input = {"scoped": True}
+    state.approve(first.interruptions[0])
+    restored = await RunState.from_json(outer, state.to_json())
+    restored_wrapper = restored._context
+    assert restored_wrapper is not None
+    assert restored_wrapper.tool_input == {"scoped": True}
+    assert restored_wrapper._approvals == {}
+    assert restored._last_processed_response is not None
+    from agents.agent_tool_state import peek_agent_tool_run_result
+
+    restored_nested_result = peek_agent_tool_run_result(
+        restored._last_processed_response.functions[0].tool_call,
+        scope_id=restored._agent_tool_state_scope_id,
+    )
+    assert restored_nested_result is not None
+    restored_nested_state = restored_nested_result.to_state()
+    assert restored_nested_state._context is not None
+    assert restored_nested_state._context._approvals
+    usage_before_resume = restored_wrapper.usage.input_tokens
+    override = {"user": "reviewer"}
+
+    resumed = await Runner.run(outer, input=restored, context=override)
+
+    assert resumed.final_output == "done"
+    assert resumed.interruptions == []
+    assert calls == ["one"]
+    assert seen_contexts == [override]
+    assert seen_tool_inputs == [{"input": "hi"}]
+    assert resumed.context_wrapper is restored_wrapper
+    assert resumed.context_wrapper.context == override
+    assert resumed.context_wrapper.tool_input == {"scoped": True}
+    assert resumed.context_wrapper._approvals is restored_wrapper._approvals
+    # Nested post-resume model turns must keep accruing on the parent usage object.
+    assert resumed.context_wrapper.usage.input_tokens == (
+        usage_before_resume + nested_turn_usage.input_tokens
+    )
+
+
+@pytest.mark.parametrize("nesting_edges", [2, 3])
+@pytest.mark.parametrize("approval_timing", ["live", "before_restore", "after_restore"])
+@pytest.mark.parametrize("approve", [True, False])
+@pytest.mark.parametrize("streamed", [False, True])
+@pytest.mark.asyncio
+async def test_resume_recursively_nested_agent_as_tool_decision(
+    streamed: bool,
+    approve: bool,
+    approval_timing: str,
+    nesting_edges: int,
+) -> None:
+    """Tool decisions reach a protected tool through nested agent tools."""
+    calls: list[str] = []
+
+    @function_tool(needs_approval=True)
+    async def protected(text: str) -> str:
+        calls.append(text)
+        return f"approved:{text}"
+
+    leaf_model = ScriptedModel()
+    leaf_model.extend(
+        [
+            [get_function_tool_call("protected", json.dumps({"text": "one"}), call_id="inner-1")],
+            [get_final_output_message("inner-done")],
+        ]
+    )
+    outer = Agent(name="inner", model=leaf_model, tools=[protected])
+    for edge in range(nesting_edges):
+        tool_name = f"agent_tool_{edge}"
+        model = ScriptedModel()
+        model.extend(
+            [
+                [
+                    get_function_tool_call(
+                        tool_name,
+                        json.dumps({"input": "go"}),
+                        call_id=f"agent-call-{edge}",
+                    )
+                ],
+                [get_final_output_message(f"done-{edge}")],
+            ]
+        )
+        outer = Agent(
+            name=f"agent-{edge}",
+            model=model,
+            tools=[outer.as_tool(tool_name=tool_name, tool_description="Run nested agent")],
+        )
+
+    if streamed:
+        first = Runner.run_streamed(outer, "start")
+        async for _ in first.stream_events():
+            pass
+    else:
+        first = await Runner.run(outer, "start")
+
+    state = first.to_state()
+    assert len(state.get_interruptions()) == 1
+
+    def apply_decision() -> None:
+        if approve:
+            state.approve(state.get_interruptions()[0])
+        else:
+            state.reject(state.get_interruptions()[0])
+
+    if approval_timing == "before_restore":
+        apply_decision()
+        state = await RunState.from_json(outer, state.to_json())
+    elif approval_timing == "after_restore":
+        state = await RunState.from_json(outer, state.to_json())
+        apply_decision()
+    else:
+        apply_decision()
+
+    if streamed:
+        resumed = Runner.run_streamed(outer, state)
+        async for _ in resumed.stream_events():
+            pass
+    else:
+        resumed = await Runner.run(outer, state)
+
+    assert resumed.final_output == f"done-{nesting_edges - 1}"
+    assert resumed.interruptions == []
+    assert calls == (["one"] if approve else [])
+
+
+@pytest.mark.asyncio
+async def test_hosted_mcp_approval_request_restores_matching_server_tool() -> None:
+    class FalsyHostedMCPTool(HostedMCPTool):
+        def __bool__(self) -> bool:
+            return False
+
+    server_a = FalsyHostedMCPTool(
+        tool_config=Mcp(
+            type="mcp",
+            server_label="server-a",
+            server_url="https://server-a.example/mcp",
+        )
+    )
+    server_b = HostedMCPTool(
+        tool_config=Mcp(
+            type="mcp",
+            server_label="server-b",
+            server_url="https://server-b.example/mcp",
+        )
+    )
+    agent = Agent(name="test", tools=[server_a, server_b])
+    request_item = McpApprovalRequest(
+        id="request-a",
+        type="mcp_approval_request",
+        arguments="{}",
+        name="lookup_account",
+        server_label="server-a",
+    )
+    context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+    state = make_state(agent, context=context)
+    state._last_processed_response = make_processed_response(
+        mcp_approval_requests=[
+            ToolRunMCPApprovalRequest(
+                request_item=request_item,
+                mcp_tool=server_a,
+            )
+        ]
+    )
+
+    restored = await RunState.from_json(agent, state.to_json())
+
+    assert restored._last_processed_response is not None
+    restored_requests = restored._last_processed_response.mcp_approval_requests
+    assert len(restored_requests) == 1
+    assert restored_requests[0].mcp_tool is server_a
+
+
+@pytest.mark.asyncio
+async def test_hosted_mcp_approval_round_trip_uses_typed_identity_records() -> None:
+    agent = Agent(name="test")
+    context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+    state = make_state(agent, context=context)
+    approval = ToolApprovalItem(
+        agent=agent,
+        raw_item=McpApprovalRequest(
+            id="request-a",
+            type="mcp_approval_request",
+            arguments="{}",
+            name="lookup_account",
+            server_label="server-a",
+        ),
+    )
+    state.approve(approval, always_approve=True)
+
+    serialized = state.to_json()
+
+    assert serialized["context"]["approvals"] == {}
+    hosted_approvals = serialized["context"]["hosted_mcp_approvals"]
+    assert [entry["identity"] for entry in hosted_approvals] == [
+        {
+            "type": "server_tool",
+            "server_label": "server-a",
+            "tool_name": "lookup_account",
+        },
+        {
+            "type": "query",
+            "tool_name": "lookup_account",
+            "request_id": "request-a",
+        },
+    ]
+    server_decision = hosted_approvals[0]["decision"]
+    assert server_decision["approved"] is True
+    assert server_decision["rejected"] == []
+    assert isinstance(server_decision["sticky_scope"], str)
+    server_binding = serialized["context"]["tool_invocations"]["request-a"]
+    assert server_binding["type"] == "mcp_approval_request"
+    assert server_binding["approval_scope"] == server_decision["sticky_scope"]
+    assert isinstance(server_binding["fingerprint"], str)
+    assert server_binding["executed"] is False
+    assert server_binding["completed"] is False
+    query_decision = hosted_approvals[1]["decision"]
+    assert query_decision["approved"] == ["request-a"]
+    assert query_decision["rejected"] == []
+    assert "invocations" not in query_decision
+    restored = await RunState.from_json(agent, serialized)
+
+    assert restored._context is not None
+    assert restored._context.is_tool_approved("lookup_account", "request-a") is True
+    assert restored._context.is_tool_approved("lookup_account", "request-next") is None
+    assert (
+        restored._context.get_approval_status(
+            "lookup_account",
+            "request-next",
+            existing_pending=ToolApprovalItem(
+                agent=agent,
+                raw_item=McpApprovalRequest(
+                    id="request-next",
+                    type="mcp_approval_request",
+                    arguments="{}",
+                    name="lookup_account",
+                    server_label="server-a",
+                ),
+            ),
+        )
+        is True
+    )
+
+
+@pytest.mark.asyncio
+async def test_hosted_mcp_exact_rejection_overrides_sticky_approval_after_round_trip() -> None:
+    agent = Agent(name="test")
+    context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+    state = make_state(agent, context=context)
+
+    def approval(request_id: str) -> ToolApprovalItem:
+        return ToolApprovalItem(
+            agent=agent,
+            raw_item=McpApprovalRequest(
+                id=request_id,
+                type="mcp_approval_request",
+                arguments="{}",
+                name="lookup_account",
+                server_label="server-a",
+            ),
+        )
+
+    state.approve(approval("sticky-request"), always_approve=True)
+    state.reject(approval("exception-request"), rejection_message="denied exactly")
+
+    restored = await RunState.from_json(agent, state.to_json())
+    assert restored._context is not None
+    assert (
+        restored._context.get_approval_status(
+            "lookup_account",
+            "exception-request",
+            existing_pending=approval("exception-request"),
+        )
+        is False
+    )
+    assert (
+        restored._context.get_rejection_message(
+            "lookup_account",
+            "exception-request",
+            existing_pending=approval("exception-request"),
+        )
+        == "denied exactly"
+    )
+    assert (
+        restored._context.get_approval_status(
+            "lookup_account",
+            "other-request",
+            existing_pending=approval("other-request"),
+        )
+        is True
+    )
+
+
+@pytest.mark.asyncio
+async def test_incomplete_hosted_mcp_query_cannot_create_approval_authority() -> None:
+    agent = Agent(name="test")
+    context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+    state = make_state(agent, context=context)
+    approval = ToolApprovalItem(
+        agent=agent,
+        raw_item={
+            "type": "hosted_tool_call",
+            "provider_data": {
+                "type": "mcp_approval_request",
+                "id": "request-a",
+            },
+        },
+        tool_name="lookup_account",
+    )
+    with pytest.raises(ModelBehaviorError, match="canonical invocation identity"):
+        state.reject(approval, rejection_message="exact denial")
+
+    assert context._approvals == {}
+    assert state._serialize_hosted_mcp_approvals() == []
+
+
+@pytest.mark.asyncio
+async def test_hosted_mcp_rejection_query_round_trip_does_not_cross_servers() -> None:
+    agent = Agent(name="test")
+    context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+    state = make_state(agent, context=context)
+    server_a = ToolApprovalItem(
+        agent=agent,
+        raw_item=McpApprovalRequest(
+            id="shared-request",
+            type="mcp_approval_request",
+            arguments="{}",
+            name="lookup_account",
+            server_label="server-a",
+        ),
+    )
+    server_b = ToolApprovalItem(
+        agent=agent,
+        raw_item=McpApprovalRequest(
+            id="shared-request",
+            type="mcp_approval_request",
+            arguments="{}",
+            name="lookup_account",
+            server_label="server-b",
+        ),
+    )
+    state.reject(server_a, rejection_message="server-a denied")
+
+    restored = await RunState.from_json(agent, state.to_json())
+
+    assert restored._context is not None
+    assert restored._context.is_tool_approved("lookup_account", "shared-request") is False
+    assert (
+        restored._context.get_rejection_message("lookup_account", "shared-request")
+        == "server-a denied"
+    )
+    assert (
+        restored._context.get_approval_status(
+            "lookup_account",
+            "shared-request",
+            existing_pending=server_b,
+        )
+        is None
+    )
+    assert (
+        restored._context.get_rejection_message(
+            "lookup_account",
+            "shared-request",
+            existing_pending=server_b,
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_schema_1_13_ignores_typed_hosted_mcp_approval_records() -> None:
+    agent = Agent(name="test")
+    context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+    state = make_state(agent, context=context)
+    approval = ToolApprovalItem(
+        agent=agent,
+        raw_item=McpApprovalRequest(
+            id="request-a",
+            type="mcp_approval_request",
+            arguments="{}",
+            name="lookup_account",
+            server_label="server-a",
+        ),
+    )
+    state.approve(approval, always_approve=True)
+    serialized = state.to_json()
+    serialized["$schemaVersion"] = "1.13"
+
+    restored = await RunState.from_json(agent, serialized)
+
+    assert restored._context is not None
+    assert (
+        restored._context.get_approval_status(
+            "lookup_account",
+            "request-next",
+            existing_pending=ToolApprovalItem(
+                agent=agent,
+                raw_item=McpApprovalRequest(
+                    id="request-next",
+                    type="mcp_approval_request",
+                    arguments="{}",
+                    name="lookup_account",
+                    server_label="server-a",
+                ),
+            ),
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_schema_1_13_hosted_mcp_orphaned_call_decisions_require_reapproval() -> None:
+    agent = Agent(name="test")
+    context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+    context._rebuild_approvals(  # noqa: SLF001
+        {
+            "lookup_account": {
+                "approved": ["request-approved"],
+                "rejected": ["request-rejected"],
+                "rejection_messages": {"request-rejected": "legacy exact denial"},
+            }
+        }
+    )
+    state = make_state(agent, context=context)
+    serialized = state.to_json()
+    serialized["$schemaVersion"] = "1.13"
+
+    restored = await RunState.from_json(agent, serialized)
+
+    assert restored._context is not None
+    approved = ToolApprovalItem(
+        agent=agent,
+        raw_item=McpApprovalRequest(
+            id="request-approved",
+            type="mcp_approval_request",
+            arguments="{}",
+            name="lookup_account",
+            server_label="server-a",
+        ),
+    )
+    rejected = ToolApprovalItem(
+        agent=agent,
+        raw_item={
+            "type": "hosted_tool_call",
+            "provider_data": {
+                "type": "mcp_approval_request",
+                "id": "request-rejected",
+            },
+        },
+        tool_name="lookup_account",
+    )
+    assert (
+        restored._context.get_approval_status(
+            "lookup_account",
+            "request-approved",
+            existing_pending=approved,
+        )
+        is None
+    )
+    restored._context.approve_tool(approved)
+    assert (
+        restored._context.get_approval_status(
+            "lookup_account",
+            "request-approved",
+            existing_pending=approved,
+        )
+        is True
+    )
+    assert (
+        restored._context.get_approval_status(
+            "lookup_account",
+            "request-rejected",
+            existing_pending=rejected,
+        )
+        is None
+    )
+    assert (
+        restored._context.get_rejection_message(
+            "lookup_account",
+            "request-rejected",
+            existing_pending=rejected,
+        )
+        == "legacy exact denial"
+    )

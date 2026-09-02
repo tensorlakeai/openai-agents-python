@@ -21,8 +21,16 @@ from agents.run_state import RunState
 from agents.sandbox import Manifest, SandboxPathGrant
 from agents.sandbox.capabilities import Shell
 from agents.sandbox.capabilities.tools.shell_tool import ExecCommandArgs, ExecCommandTool
-from agents.sandbox.entries import File, InContainerMountStrategy, Mount, MountpointMountPattern
+from agents.sandbox.entries import (
+    File,
+    InContainerMountStrategy,
+    Mount,
+    MountpointMountPattern,
+    RcloneMountPattern,
+    S3Mount,
+)
 from agents.sandbox.entries.mounts.base import InContainerMountAdapter
+from agents.sandbox.errors import MountConfigError
 from agents.sandbox.manifest import Environment
 from agents.sandbox.materialization import MaterializedFile
 from agents.sandbox.session.base_sandbox_session import BaseSandboxSession
@@ -161,6 +169,42 @@ class _FakeAPIResponseValidationError(_FakeAPIError):
         )
 
 
+class _FakeAuthenticationError(_FakeAPIStatusError):
+    def __init__(
+        self,
+        message: str = "authentication failed",
+        *,
+        body: object | None = None,
+        url: str = "https://api.runloop.ai/v1/test",
+        method: str = "POST",
+    ) -> None:
+        super().__init__(401, body=body, url=url, method=method, message=message)
+
+
+class _FakeBadRequestError(_FakeAPIStatusError):
+    def __init__(
+        self,
+        message: str = "bad request",
+        *,
+        body: object | None = None,
+        url: str = "https://api.runloop.ai/v1/test",
+        method: str = "POST",
+    ) -> None:
+        super().__init__(400, body=body, url=url, method=method, message=message)
+
+
+class _FakeInternalServerError(_FakeAPIStatusError):
+    def __init__(
+        self,
+        message: str = "internal server error",
+        *,
+        body: object | None = None,
+        url: str = "https://api.runloop.ai/v1/test",
+        method: str = "POST",
+    ) -> None:
+        super().__init__(500, body=body, url=url, method=method, message=message)
+
+
 class _FakeNotFoundError(_FakeAPIStatusError):
     def __init__(
         self,
@@ -171,6 +215,42 @@ class _FakeNotFoundError(_FakeAPIStatusError):
         method: str = "GET",
     ) -> None:
         super().__init__(404, body=body, url=url, method=method, message=message)
+
+
+class _FakePermissionDeniedError(_FakeAPIStatusError):
+    def __init__(
+        self,
+        message: str = "permission denied",
+        *,
+        body: object | None = None,
+        url: str = "https://api.runloop.ai/v1/test",
+        method: str = "POST",
+    ) -> None:
+        super().__init__(403, body=body, url=url, method=method, message=message)
+
+
+class _FakeRateLimitError(_FakeAPIStatusError):
+    def __init__(
+        self,
+        message: str = "rate limited",
+        *,
+        body: object | None = None,
+        url: str = "https://api.runloop.ai/v1/test",
+        method: str = "POST",
+    ) -> None:
+        super().__init__(429, body=body, url=url, method=method, message=message)
+
+
+class _FakeUnprocessableEntityError(_FakeAPIStatusError):
+    def __init__(
+        self,
+        message: str = "unprocessable entity",
+        *,
+        body: object | None = None,
+        url: str = "https://api.runloop.ai/v1/test",
+        method: str = "POST",
+    ) -> None:
+        super().__init__(422, body=body, url=url, method=method, message=message)
 
 
 class _FakeExecutionResult:
@@ -1165,8 +1245,14 @@ def _load_runloop_module(monkeypatch: pytest.MonkeyPatch) -> Any:
     fake_runloop.APIResponseValidationError = _FakeAPIResponseValidationError
     fake_runloop.APITimeoutError = _FakeAPITimeoutError
     fake_runloop.APIStatusError = _FakeAPIStatusError
+    fake_runloop.AuthenticationError = _FakeAuthenticationError
+    fake_runloop.BadRequestError = _FakeBadRequestError
+    fake_runloop.InternalServerError = _FakeInternalServerError
     fake_runloop.NotFoundError = _FakeNotFoundError
+    fake_runloop.PermissionDeniedError = _FakePermissionDeniedError
+    fake_runloop.RateLimitError = _FakeRateLimitError
     fake_runloop.RunloopError = _FakeRunloopError
+    fake_runloop.UnprocessableEntityError = _FakeUnprocessableEntityError
 
     fake_sdk: Any = types.ModuleType("runloop_api_client.sdk")
     fake_sdk.AsyncRunloopSDK = _FakeAsyncRunloopSDK
@@ -1215,6 +1301,18 @@ def test_runloop_package_re_exports_backend_symbols(monkeypatch: pytest.MonkeyPa
     assert package_module.RunloopLaunchParameters is runloop_module.RunloopLaunchParameters
     assert package_module.RunloopAfterIdle is runloop_module.RunloopAfterIdle
     assert package_module.RunloopUserParameters is runloop_module.RunloopUserParameters
+
+
+@pytest.fixture(autouse=True)
+def _trust_recording_mounts_for_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agents.sandbox import _mount_security
+
+    original = _mount_security._mount_class_is_trusted
+    monkeypatch.setattr(
+        _mount_security,
+        "_mount_class_is_trusted",
+        lambda mount: isinstance(mount, _RecordingMount) or original(mount),
+    )
 
 
 class _RecordingMount(Mount):
@@ -1776,6 +1874,90 @@ class TestRunloopSandbox:
         assert session.state.secret_refs == {"API_KEY": "API_KEY"}
 
     @pytest.mark.asyncio
+    async def test_create_references_existing_managed_secrets_without_uploading_values(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runloop_module = _load_runloop_module(monkeypatch)
+
+        async with runloop_module.RunloopSandboxClient() as client:
+            session = await client.create(
+                options=runloop_module.RunloopSandboxClientOptions(
+                    managed_secrets={
+                        "SHARED_TOKEN": runloop_module.RunloopExistingSecret(),
+                        "API_KEY": runloop_module.RunloopExistingSecret(),
+                    },
+                )
+            )
+            sdk = _FakeAsyncRunloopSDK.created_instances[-1]
+
+        assert sdk.secret.create_calls == []
+        assert sdk.secret.update_calls == []
+        create_params = sdk.devbox.create_calls[0]
+        assert create_params["secrets"] == {
+            "API_KEY": "API_KEY",
+            "SHARED_TOKEN": "SHARED_TOKEN",
+        }
+        assert session.state.secret_refs == {
+            "API_KEY": "API_KEY",
+            "SHARED_TOKEN": "SHARED_TOKEN",
+        }
+
+    @pytest.mark.asyncio
+    async def test_create_mixes_existing_and_uploaded_managed_secrets(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runloop_module = _load_runloop_module(monkeypatch)
+
+        async with runloop_module.RunloopSandboxClient() as client:
+            session = await client.create(
+                options=runloop_module.RunloopSandboxClientOptions(
+                    managed_secrets={
+                        "API_KEY": "super-secret",
+                        "SHARED_TOKEN": runloop_module.RunloopExistingSecret(),
+                    },
+                )
+            )
+            sdk = _FakeAsyncRunloopSDK.created_instances[-1]
+
+        assert sdk.secret.create_calls == [("API_KEY", "super-secret", {"timeout": 30.0})]
+        assert sdk.secret.update_calls == []
+        assert "SHARED_TOKEN" not in sdk.secret.secrets
+        create_params = sdk.devbox.create_calls[0]
+        assert create_params["secrets"] == {
+            "API_KEY": "API_KEY",
+            "SHARED_TOKEN": "SHARED_TOKEN",
+        }
+        assert session.state.secret_refs == {
+            "API_KEY": "API_KEY",
+            "SHARED_TOKEN": "SHARED_TOKEN",
+        }
+        assert "super-secret" not in json.dumps(session.state.model_dump(mode="json"))
+
+    def test_runloop_client_options_round_trip_existing_managed_secrets(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runloop_module = _load_runloop_module(monkeypatch)
+
+        options = runloop_module.RunloopSandboxClientOptions(
+            managed_secrets={
+                "API_KEY": "super-secret",
+                "SHARED_TOKEN": runloop_module.RunloopExistingSecret(),
+            },
+        )
+
+        restored = runloop_module.RunloopSandboxClientOptions.model_validate(
+            json.loads(json.dumps(options.model_dump(mode="json")))
+        )
+
+        assert restored.managed_secrets == {
+            "API_KEY": "super-secret",
+            "SHARED_TOKEN": runloop_module.RunloopExistingSecret(),
+        }
+
+    @pytest.mark.asyncio
     async def test_resume_and_snapshot_restore_reuse_runloop_native_options(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -1971,7 +2153,10 @@ class TestRunloopSandbox:
             session = await client.create(
                 options=runloop_module.RunloopSandboxClientOptions(pause_on_exit=True),
             )
-            state = session.state
+            state = cast(
+                Any,
+                client.deserialize_session_state(client.serialize_session_state(session.state)),
+            )
             sdk = _FakeAsyncRunloopSDK.created_instances[-1]
             sdk.devbox.create_calls.clear()
             sdk.devbox.devboxes[state.devbox_id].status = "suspended"
@@ -1981,6 +2166,41 @@ class TestRunloopSandbox:
         assert sdk.devbox.from_id_calls == [state.devbox_id]
         assert sdk.devbox.create_calls == []
         assert resumed._inner._skip_start is True  # noqa: SLF001
+
+    @pytest.mark.asyncio
+    async def test_skip_start_rejects_unsafe_mount_before_provider_work(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        sentinel = "runloop-start-secret"
+        runloop_module = _load_runloop_module(monkeypatch)
+
+        async with runloop_module.RunloopSandboxClient() as client:
+            session = await client.create(options=runloop_module.RunloopSandboxClientOptions())
+            sdk = _FakeAsyncRunloopSDK.created_instances[-1]
+            devbox = sdk.devbox.devboxes[session.state.devbox_id]
+            session.state.manifest = Manifest(
+                entries={
+                    "data": S3Mount(
+                        bucket="bucket",
+                        access_key_id="access-key",
+                        secret_access_key=sentinel,
+                        mount_strategy=InContainerMountStrategy(pattern=RcloneMountPattern()),
+                    )
+                }
+            )
+            session._inner._skip_start = True  # noqa: SLF001
+            exec_calls_before = len(devbox.exec_calls)
+            resume_calls_before = devbox.resume_calls
+            snapshot_calls_before = len(devbox.snapshot_calls)
+
+            with pytest.raises(MountConfigError) as exc:
+                await session.start()
+
+        assert len(devbox.exec_calls) == exec_calls_before
+        assert devbox.resume_calls == resume_calls_before
+        assert len(devbox.snapshot_calls) == snapshot_calls_before
+        assert sentinel not in str(exc.value)
 
     @pytest.mark.asyncio
     async def test_resume_reconnects_running_devbox_without_pause(
@@ -2338,6 +2558,66 @@ class TestRunloopSandbox:
         assert exc_info.value.context["cause_type"] == "_FakeAPIStatusError"
         assert exc_info.value.context["provider_body"] == {"error": "rate limited"}
         assert exc_info.value.context["detail"] == "exec_failed"
+        assert exc_info.value.retryable is True
+
+    @pytest.mark.asyncio
+    async def test_exec_marks_typed_runloop_bad_request_non_retryable(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runloop_module = _load_runloop_module(monkeypatch)
+
+        async with runloop_module.RunloopSandboxClient() as client:
+            session = await client.create(options=runloop_module.RunloopSandboxClientOptions())
+            await session.start()
+            sdk = _FakeAsyncRunloopSDK.created_instances[-1]
+            devbox = sdk.devbox.devboxes[session.state.devbox_id]
+
+            async def _raise_bad_request(*args: object, **kwargs: object) -> object:
+                _ = (args, kwargs)
+                raise _FakeBadRequestError(
+                    body={"error": "invalid command"},
+                    url=f"https://api.runloop.ai/v1/devboxes/{devbox.id}/execute",
+                    method="POST",
+                )
+
+            monkeypatch.setattr(devbox.cmd, "exec", _raise_bad_request)
+
+            with pytest.raises(runloop_module.ExecTransportError) as exc_info:
+                await session.exec("pwd", shell=False)
+
+        assert exc_info.value.context["http_status"] == 400
+        assert exc_info.value.context["cause_type"] == "_FakeBadRequestError"
+        assert exc_info.value.context["provider_body"] == {"error": "invalid command"}
+        assert exc_info.value.context["detail"] == "exec_failed"
+        assert exc_info.value.retryable is False
+
+    @pytest.mark.parametrize(
+        ("status", "expected_retryable"),
+        [
+            (400, False),
+            (401, False),
+            (403, False),
+            (404, False),
+            (408, True),
+            (422, False),
+            (429, True),
+            (500, True),
+            (502, True),
+            (503, True),
+            (504, True),
+        ],
+    )
+    def test_runloop_retryability_status_table(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        status: int,
+        expected_retryable: bool,
+    ) -> None:
+        runloop_module = _load_runloop_module(monkeypatch)
+        error = _FakeAPIStatusError(status, body={"error": f"HTTP {status}"})
+
+        assert runloop_module._runloop_provider_retryability(error) is expected_retryable
 
     @pytest.mark.asyncio
     async def test_exec_wraps_command_with_workspace_context(
@@ -2486,6 +2766,7 @@ class TestRunloopSandbox:
         assert exc_info.value.context["cause_type"] == "_FakeAPIStatusError"
         assert exc_info.value.context["provider_body"] == {"error": "download failed"}
         assert exc_info.value.context["detail"] == "file_download_failed"
+        assert exc_info.value.retryable is True
 
     @pytest.mark.asyncio
     async def test_write_wraps_runloop_http_error_with_provider_context(
@@ -2518,6 +2799,7 @@ class TestRunloopSandbox:
         assert exc_info.value.context["cause_type"] == "_FakeAPIStatusError"
         assert exc_info.value.context["provider_body"] == {"error": "upload rate limited"}
         assert exc_info.value.context["detail"] == "file_upload_failed"
+        assert exc_info.value.retryable is True
 
     @pytest.mark.asyncio
     async def test_manifest_apply_preserves_existing_files_in_non_empty_directory(

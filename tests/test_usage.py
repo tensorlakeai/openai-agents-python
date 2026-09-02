@@ -1,13 +1,73 @@
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
-from openai.types.completion_usage import CompletionTokensDetails, PromptTokensDetails
+from openai.types.completion_usage import (
+    CompletionTokensDetails,
+    CompletionUsage,
+    PromptTokensDetails,
+)
 from openai.types.responses.response_usage import InputTokensDetails, OutputTokensDetails
 
 from agents import Agent, Runner
-from agents.usage import RequestUsage, Usage
-from tests.fake_model import FakeModel
+from agents.run_internal.agent_runner_helpers import snapshot_usage, usage_delta
+from agents.testing import ScriptedModel
+from agents.usage import (
+    RequestUsage,
+    Usage,
+    _raw_usage_snapshot,
+    deserialize_usage,
+    model_usage_to_span_usage,
+    serialize_usage,
+)
 from tests.test_responses import get_text_message
+
+
+def test_usage_defaults_cache_write_tokens_to_zero() -> None:
+    usage = Usage()
+
+    assert usage.input_tokens_details.cached_tokens == 0
+    assert getattr(usage.input_tokens_details, "cache_write_tokens", None) == 0
+
+
+def test_raw_usage_snapshot_preserves_presence_and_is_detached() -> None:
+    raw_usage: dict[str, Any] = {
+        "input_tokens": 3,
+        "input_tokens_details": {"cached_tokens": 0},
+        "provider_metric": None,
+    }
+
+    snapshot = _raw_usage_snapshot(raw_usage)
+    raw_usage["input_tokens_details"]["cached_tokens"] = 9
+
+    assert snapshot == {
+        "input_tokens": 3,
+        "input_tokens_details": {"cached_tokens": 0},
+        "provider_metric": None,
+    }
+
+
+def test_raw_usage_snapshot_does_not_add_unset_pydantic_fields() -> None:
+    usage = CompletionUsage.model_validate(
+        {
+            "completion_tokens": 2,
+            "prompt_tokens": 3,
+            "total_tokens": 5,
+            "prompt_tokens_details": {},
+        }
+    )
+
+    assert _raw_usage_snapshot(usage) == {
+        "completion_tokens": 2,
+        "prompt_tokens": 3,
+        "total_tokens": 5,
+        "prompt_tokens_details": {},
+    }
+
+
+def test_raw_usage_snapshot_rejects_non_json_values() -> None:
+    assert _raw_usage_snapshot({"provider_metric": object()}) is None
 
 
 @pytest.mark.asyncio
@@ -23,13 +83,15 @@ async def test_runner_run_carries_request_usage_entries() -> None:
                 input_tokens=10,
                 output_tokens=5,
                 total_tokens=15,
-                input_tokens_details=InputTokensDetails(cached_tokens=0),
+                input_tokens_details=InputTokensDetails.model_validate(
+                    {"cache_write_tokens": 0, "cached_tokens": 0}
+                ),
                 output_tokens_details=OutputTokensDetails(reasoning_tokens=0),
             )
         ],
     )
-    model = FakeModel(initial_output=[get_text_message("done")])
-    model.set_hardcoded_usage(usage)
+    model = ScriptedModel(steps=[[get_text_message("done")]])
+    model.set_default_usage(usage)
     agent = Agent(name="usage-agent", model=model)
 
     result = await Runner.run(agent, input="hi")
@@ -48,7 +110,9 @@ def test_usage_add_aggregates_all_fields():
     u1 = Usage(
         requests=1,
         input_tokens=10,
-        input_tokens_details=InputTokensDetails(cached_tokens=3),
+        input_tokens_details=InputTokensDetails.model_validate(
+            {"cache_write_tokens": 5, "cached_tokens": 3}
+        ),
         output_tokens=20,
         output_tokens_details=OutputTokensDetails(reasoning_tokens=5),
         total_tokens=30,
@@ -56,7 +120,9 @@ def test_usage_add_aggregates_all_fields():
     u2 = Usage(
         requests=2,
         input_tokens=7,
-        input_tokens_details=InputTokensDetails(cached_tokens=4),
+        input_tokens_details=InputTokensDetails.model_validate(
+            {"cache_write_tokens": 6, "cached_tokens": 4}
+        ),
         output_tokens=8,
         output_tokens_details=OutputTokensDetails(reasoning_tokens=6),
         total_tokens=15,
@@ -69,6 +135,7 @@ def test_usage_add_aggregates_all_fields():
     assert u1.output_tokens == 28
     assert u1.total_tokens == 45
     assert u1.input_tokens_details.cached_tokens == 7
+    assert getattr(u1.input_tokens_details, "cache_write_tokens", None) == 11
     assert u1.output_tokens_details.reasoning_tokens == 11
 
 
@@ -77,7 +144,9 @@ def test_usage_add_aggregates_with_none_values():
     u2 = Usage(
         requests=2,
         input_tokens=7,
-        input_tokens_details=InputTokensDetails(cached_tokens=4),
+        input_tokens_details=InputTokensDetails.model_validate(
+            {"cache_write_tokens": 0, "cached_tokens": 4}
+        ),
         output_tokens=8,
         output_tokens_details=OutputTokensDetails(reasoning_tokens=6),
         total_tokens=15,
@@ -99,7 +168,9 @@ def test_request_usage_creation():
         input_tokens=100,
         output_tokens=200,
         total_tokens=300,
-        input_tokens_details=InputTokensDetails(cached_tokens=10),
+        input_tokens_details=InputTokensDetails.model_validate(
+            {"cache_write_tokens": 0, "cached_tokens": 10}
+        ),
         output_tokens_details=OutputTokensDetails(reasoning_tokens=20),
     )
 
@@ -116,7 +187,9 @@ def test_usage_add_preserves_single_request():
     u2 = Usage(
         requests=1,
         input_tokens=100,
-        input_tokens_details=InputTokensDetails(cached_tokens=10),
+        input_tokens_details=InputTokensDetails.model_validate(
+            {"cache_write_tokens": 0, "cached_tokens": 10}
+        ),
         output_tokens=200,
         output_tokens_details=OutputTokensDetails(reasoning_tokens=20),
         total_tokens=300,
@@ -140,7 +213,9 @@ def test_usage_add_ignores_zero_token_requests():
     u2 = Usage(
         requests=1,
         input_tokens=0,
-        input_tokens_details=InputTokensDetails(cached_tokens=0),
+        input_tokens_details=InputTokensDetails.model_validate(
+            {"cache_write_tokens": 0, "cached_tokens": 0}
+        ),
         output_tokens=0,
         output_tokens_details=OutputTokensDetails(reasoning_tokens=0),
         total_tokens=0,
@@ -158,7 +233,9 @@ def test_usage_add_ignores_multi_request_usage():
     u2 = Usage(
         requests=3,  # Multiple requests
         input_tokens=100,
-        input_tokens_details=InputTokensDetails(cached_tokens=10),
+        input_tokens_details=InputTokensDetails.model_validate(
+            {"cache_write_tokens": 0, "cached_tokens": 10}
+        ),
         output_tokens=200,
         output_tokens_details=OutputTokensDetails(reasoning_tokens=20),
         total_tokens=300,
@@ -177,7 +254,9 @@ def test_usage_add_merges_existing_request_usage_entries():
     u2 = Usage(
         requests=1,
         input_tokens=100,
-        input_tokens_details=InputTokensDetails(cached_tokens=10),
+        input_tokens_details=InputTokensDetails.model_validate(
+            {"cache_write_tokens": 0, "cached_tokens": 10}
+        ),
         output_tokens=200,
         output_tokens_details=OutputTokensDetails(reasoning_tokens=20),
         total_tokens=300,
@@ -188,7 +267,9 @@ def test_usage_add_merges_existing_request_usage_entries():
     u3 = Usage(
         requests=1,
         input_tokens=50,
-        input_tokens_details=InputTokensDetails(cached_tokens=5),
+        input_tokens_details=InputTokensDetails.model_validate(
+            {"cache_write_tokens": 0, "cached_tokens": 5}
+        ),
         output_tokens=75,
         output_tokens_details=OutputTokensDetails(reasoning_tokens=10),
         total_tokens=125,
@@ -220,7 +301,9 @@ def test_usage_add_with_pre_existing_request_usage_entries():
     u2 = Usage(
         requests=1,
         input_tokens=100,
-        input_tokens_details=InputTokensDetails(cached_tokens=10),
+        input_tokens_details=InputTokensDetails.model_validate(
+            {"cache_write_tokens": 0, "cached_tokens": 10}
+        ),
         output_tokens=200,
         output_tokens_details=OutputTokensDetails(reasoning_tokens=20),
         total_tokens=300,
@@ -231,7 +314,9 @@ def test_usage_add_with_pre_existing_request_usage_entries():
     u3 = Usage(
         requests=1,
         input_tokens=50,
-        input_tokens_details=InputTokensDetails(cached_tokens=5),
+        input_tokens_details=InputTokensDetails.model_validate(
+            {"cache_write_tokens": 0, "cached_tokens": 5}
+        ),
         output_tokens=75,
         output_tokens_details=OutputTokensDetails(reasoning_tokens=10),
         total_tokens=125,
@@ -263,7 +348,9 @@ def test_usage_add_preserves_existing_entries_when_top_level_also_set():
                 input_tokens=100,
                 output_tokens=50,
                 total_tokens=150,
-                input_tokens_details=InputTokensDetails(cached_tokens=10),
+                input_tokens_details=InputTokensDetails.model_validate(
+                    {"cache_write_tokens": 0, "cached_tokens": 10}
+                ),
                 output_tokens_details=OutputTokensDetails(reasoning_tokens=5),
             )
         ],
@@ -277,6 +364,58 @@ def test_usage_add_preserves_existing_entries_when_top_level_also_set():
     entry = u1.request_usage_entries[0]
     assert entry.input_tokens_details.cached_tokens == 10
     assert entry.output_tokens_details.reasoning_tokens == 5
+
+
+def test_usage_add_detaches_pre_existing_request_usage_entries():
+    source_entry = RequestUsage(
+        input_tokens=100,
+        output_tokens=50,
+        total_tokens=150,
+        input_tokens_details=InputTokensDetails.model_validate(
+            {"cache_write_tokens": 0, "cached_tokens": 10}
+        ),
+        output_tokens_details=OutputTokensDetails(reasoning_tokens=5),
+    )
+    source = Usage(
+        requests=1,
+        input_tokens=100,
+        output_tokens=50,
+        total_tokens=150,
+        request_usage_entries=[source_entry],
+    )
+    aggregate = Usage()
+
+    aggregate.add(source)
+    source_entry.input_tokens = 999
+    source_entry.input_tokens_details.cached_tokens = 99
+    source_entry.output_tokens_details.reasoning_tokens = 99
+
+    aggregate_entry = aggregate.request_usage_entries[0]
+    assert aggregate_entry.input_tokens == 100
+    assert aggregate_entry.input_tokens_details.cached_tokens == 10
+    assert aggregate_entry.output_tokens_details.reasoning_tokens == 5
+
+
+def test_usage_add_detaches_synthesized_request_usage_details():
+    source = Usage(
+        requests=1,
+        input_tokens=100,
+        output_tokens=50,
+        total_tokens=150,
+        input_tokens_details=InputTokensDetails.model_validate(
+            {"cache_write_tokens": 0, "cached_tokens": 10}
+        ),
+        output_tokens_details=OutputTokensDetails(reasoning_tokens=5),
+    )
+    aggregate = Usage()
+
+    aggregate.add(source)
+    source.input_tokens_details.cached_tokens = 99
+    source.output_tokens_details.reasoning_tokens = 99
+
+    aggregate_entry = aggregate.request_usage_entries[0]
+    assert aggregate_entry.input_tokens_details.cached_tokens == 10
+    assert aggregate_entry.output_tokens_details.reasoning_tokens == 5
 
 
 def test_usage_request_usage_entries_default_empty():
@@ -296,7 +435,9 @@ def test_anthropic_cost_calculation_scenario():
     req1 = Usage(
         requests=1,
         input_tokens=100_000,
-        input_tokens_details=InputTokensDetails(cached_tokens=0),
+        input_tokens_details=InputTokensDetails.model_validate(
+            {"cache_write_tokens": 0, "cached_tokens": 0}
+        ),
         output_tokens=50_000,
         output_tokens_details=OutputTokensDetails(reasoning_tokens=0),
         total_tokens=150_000,
@@ -307,7 +448,9 @@ def test_anthropic_cost_calculation_scenario():
     req2 = Usage(
         requests=1,
         input_tokens=150_000,
-        input_tokens_details=InputTokensDetails(cached_tokens=0),
+        input_tokens_details=InputTokensDetails.model_validate(
+            {"cache_write_tokens": 0, "cached_tokens": 0}
+        ),
         output_tokens=75_000,
         output_tokens_details=OutputTokensDetails(reasoning_tokens=0),
         total_tokens=225_000,
@@ -318,7 +461,9 @@ def test_anthropic_cost_calculation_scenario():
     req3 = Usage(
         requests=1,
         input_tokens=80_000,
-        input_tokens_details=InputTokensDetails(cached_tokens=0),
+        input_tokens_details=InputTokensDetails.model_validate(
+            {"cache_write_tokens": 0, "cached_tokens": 0}
+        ),
         output_tokens=40_000,
         output_tokens_details=OutputTokensDetails(reasoning_tokens=0),
         total_tokens=120_000,
@@ -362,8 +507,9 @@ def test_usage_normalizes_none_token_details():
     assert usage.output_tokens_details.reasoning_tokens == 0
 
     # Test fields within objects being None (__post_init__)
-    input_details = InputTokensDetails(cached_tokens=0)
+    input_details = InputTokensDetails.model_validate({"cache_write_tokens": 0, "cached_tokens": 0})
     input_details.__dict__["cached_tokens"] = None
+    input_details.__dict__["cache_write_tokens"] = None
 
     output_details = OutputTokensDetails(reasoning_tokens=0)
     output_details.__dict__["reasoning_tokens"] = None
@@ -379,6 +525,7 @@ def test_usage_normalizes_none_token_details():
 
     # __post_init__ should normalize None to 0
     assert usage.input_tokens_details.cached_tokens == 0
+    assert getattr(usage.input_tokens_details, "cache_write_tokens", None) == 0
     assert usage.output_tokens_details.reasoning_tokens == 0
 
 
@@ -387,7 +534,13 @@ def test_usage_normalizes_chat_completions_types():
     # while Usage expects InputTokensDetails and OutputTokensDetails (Responses API).
     # The BeforeValidator should convert between these types.
 
-    prompt_details = PromptTokensDetails(audio_tokens=10, cached_tokens=50)
+    prompt_details = PromptTokensDetails.model_validate(
+        {
+            "audio_tokens": 10,
+            "cached_tokens": 50,
+            "cache_write_tokens": 7,
+        }
+    )
     completion_details = CompletionTokensDetails(
         accepted_prediction_tokens=5,
         audio_tokens=10,
@@ -407,6 +560,109 @@ def test_usage_normalizes_chat_completions_types():
     # Should convert to Responses API types, extracting the relevant fields
     assert isinstance(usage.input_tokens_details, InputTokensDetails)
     assert usage.input_tokens_details.cached_tokens == 50
+    assert getattr(usage.input_tokens_details, "cache_write_tokens", None) == 7
 
     assert isinstance(usage.output_tokens_details, OutputTokensDetails)
     assert usage.output_tokens_details.reasoning_tokens == 100
+
+
+def test_usage_serialization_preserves_cache_write_tokens() -> None:
+    usage = Usage(
+        requests=1,
+        input_tokens=20,
+        input_tokens_details=InputTokensDetails.model_validate(
+            {"cache_write_tokens": 7, "cached_tokens": 3}
+        ),
+        output_tokens=5,
+        total_tokens=25,
+        request_usage_entries=[
+            RequestUsage(
+                input_tokens=20,
+                output_tokens=5,
+                total_tokens=25,
+                input_tokens_details=InputTokensDetails.model_validate(
+                    {"cache_write_tokens": 7, "cached_tokens": 3}
+                ),
+                output_tokens_details=OutputTokensDetails(reasoning_tokens=0),
+            )
+        ],
+    )
+
+    serialized = serialize_usage(usage)
+    restored = deserialize_usage(serialized)
+
+    assert serialized["input_tokens_details"] == [{"cached_tokens": 3, "cache_write_tokens": 7}]
+    assert getattr(restored.input_tokens_details, "cache_write_tokens", None) == 7
+    assert (
+        getattr(
+            restored.request_usage_entries[0].input_tokens_details,
+            "cache_write_tokens",
+            None,
+        )
+        == 7
+    )
+
+
+def test_usage_deserialization_defaults_legacy_cache_write_tokens() -> None:
+    restored = deserialize_usage(
+        {
+            "requests": 1,
+            "input_tokens": 20,
+            "output_tokens": 5,
+            "total_tokens": 25,
+            "input_tokens_details": [{"cached_tokens": 3}],
+            "request_usage_entries": [
+                {
+                    "input_tokens": 20,
+                    "output_tokens": 5,
+                    "total_tokens": 25,
+                    "input_tokens_details": {"cached_tokens": 3},
+                }
+            ],
+        }
+    )
+
+    assert restored.input_tokens_details.cached_tokens == 3
+    assert getattr(restored.input_tokens_details, "cache_write_tokens", None) == 0
+    assert restored.request_usage_entries[0].input_tokens_details.cached_tokens == 3
+    assert (
+        getattr(
+            restored.request_usage_entries[0].input_tokens_details,
+            "cache_write_tokens",
+            None,
+        )
+        == 0
+    )
+
+
+def test_usage_snapshot_delta_and_span_preserve_cache_write_tokens() -> None:
+    start = Usage(
+        requests=1,
+        input_tokens=10,
+        input_tokens_details=InputTokensDetails.model_validate(
+            {"cache_write_tokens": 2, "cached_tokens": 3}
+        ),
+        output_tokens=4,
+        total_tokens=14,
+    )
+    end = Usage(
+        requests=2,
+        input_tokens=30,
+        input_tokens_details=InputTokensDetails.model_validate(
+            {"cache_write_tokens": 9, "cached_tokens": 8}
+        ),
+        output_tokens=10,
+        total_tokens=40,
+    )
+
+    snapshot = snapshot_usage(start)
+    delta = usage_delta(snapshot, end)
+    span_usage = model_usage_to_span_usage(delta)
+
+    assert getattr(snapshot.input_tokens_details, "cache_write_tokens", None) == 2
+    assert delta.input_tokens_details.cached_tokens == 5
+    assert getattr(delta.input_tokens_details, "cache_write_tokens", None) == 7
+    assert span_usage["input_tokens_details"] == {
+        "cached_tokens": 5,
+        "cache_write_tokens": 7,
+    }

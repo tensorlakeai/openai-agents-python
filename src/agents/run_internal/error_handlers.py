@@ -2,13 +2,20 @@ from __future__ import annotations
 
 import inspect
 import json
-from typing import Any
+from typing import Any, Literal
 
 from openai.types.responses import ResponseOutputMessage, ResponseOutputText
 
 from ..agent import Agent
 from ..agent_output import _WRAPPER_DICT_KEY, AgentOutputSchema
-from ..exceptions import MaxTurnsExceeded, ModelBehaviorError, ModelRefusalError, UserError
+from ..exceptions import (
+    InputGuardrailTripwireTriggered,
+    MaxTurnsExceeded,
+    ModelBehaviorError,
+    ModelRefusalError,
+    OutputGuardrailTripwireTriggered,
+    UserError,
+)
 from ..items import (
     ItemHelpers,
     MessageOutputItem,
@@ -16,6 +23,7 @@ from ..items import (
     RunItem,
     TResponseInputItem,
 )
+from ..logger import logger
 from ..models.fake_id import FAKE_RESPONSES_ID
 from ..run_context import RunContextWrapper, TContext
 from ..run_error_handlers import (
@@ -24,8 +32,82 @@ from ..run_error_handlers import (
     RunErrorHandlerResult,
     RunErrorHandlers,
 )
+from ..tracing import Span, SpanError
+from ..util import _error_tracing
+from ..util._error_tracing import REDACTED_TRACE_ERROR_MESSAGE
 from .items import ReasoningItemIdPolicy, run_item_to_input_item
 from .turn_preparation import get_output_schema
+
+RunErrorHandlerKind = Literal["max_turns", "model_refusal", "invalid_final_output"]
+
+GENERIC_AGENT_ERROR_MESSAGE = "Error in agent run"
+UNFORMATTABLE_TRACE_ERROR_MESSAGE = "Error details are unavailable."
+
+
+def _is_generic_agent_error(exc: BaseException) -> bool:
+    """Return whether a failed run still needs the generic agent-span error.
+
+    Only ``Exception`` is eligible: the non-streaming handler also catches ``BaseException``, but
+    cancellation is not an agent failure and the streamed path never marks it. Failures that
+    already write their own agent-span error, or that a dedicated child span reports, are excluded
+    so the span keeps the more specific diagnosis.
+    """
+    if not isinstance(exc, Exception):
+        return False
+    return not isinstance(
+        exc,
+        ModelBehaviorError | InputGuardrailTripwireTriggered | OutputGuardrailTripwireTriggered,
+    )
+
+
+def _format_agent_error_detail(exc: BaseException) -> str:
+    """Stringify an exception for tracing without ever raising.
+
+    A custom exception whose ``__str__`` raises must not replace the exception the run is
+    propagating, so the formatting failure is swallowed and reported as a placeholder.
+    """
+    try:
+        return str(exc)
+    except BaseException:
+        return UNFORMATTABLE_TRACE_ERROR_MESSAGE
+
+
+def attach_generic_agent_error(
+    span: Span[Any] | None,
+    exc: BaseException,
+    *,
+    trace_include_sensitive_data: bool,
+) -> None:
+    """Mark the agent span of a failed run with the generic ``Error in agent run`` error.
+
+    This owns the whole policy shared by the streaming and non-streaming paths: eligibility,
+    preserving a more specific error already on the span, redaction, the span error payload, and
+    the attachment itself. Tracing never changes what the run raises: the exception is stringified
+    only when sensitive data is traced, and a formatting failure cannot propagate.
+    """
+    if span is None or not _is_generic_agent_error(exc):
+        return
+
+    try:
+        if span.error is not None:
+            return
+        detail = (
+            _format_agent_error_detail(exc)
+            if trace_include_sensitive_data
+            else REDACTED_TRACE_ERROR_MESSAGE
+        )
+        _error_tracing.attach_error_to_span(
+            span,
+            SpanError(message=GENERIC_AGENT_ERROR_MESSAGE, data={"error": detail}),
+        )
+    except BaseException as tracing_error:
+        try:
+            logger.warning(
+                "Failed to record a generic agent error on the span (%s)",
+                type(tracing_error).__name__,
+            )
+        except BaseException:
+            pass
 
 
 def build_run_error_data(
@@ -54,7 +136,12 @@ def build_run_error_data(
     )
 
 
-def format_final_output_text(agent: Agent[Any], final_output: Any) -> str:
+def format_final_output_text(
+    agent: Agent[Any],
+    final_output: Any,
+    *,
+    data_redacted: bool = False,
+) -> str:
     output_schema = get_output_schema(agent)
     if output_schema is None or output_schema.is_plain_text():
         return str(final_output)
@@ -66,7 +153,10 @@ def format_final_output_text(agent: Agent[Any], final_output: Any) -> str:
             payload_value = {_WRAPPER_DICT_KEY: final_output}
     try:
         if isinstance(output_schema, AgentOutputSchema):
-            payload_bytes = output_schema._type_adapter.dump_json(payload_value)
+            payload_bytes = output_schema._type_adapter.dump_json(
+                payload_value,
+                warnings="none" if data_redacted else "warn",
+            )
             return (
                 payload_bytes.decode()
                 if isinstance(payload_bytes, bytes | bytearray)
@@ -77,7 +167,12 @@ def format_final_output_text(agent: Agent[Any], final_output: Any) -> str:
         return str(final_output)
 
 
-def validate_handler_final_output(agent: Agent[Any], final_output: Any) -> Any:
+def validate_handler_final_output(
+    agent: Agent[Any],
+    final_output: Any,
+    *,
+    data_redacted: bool = False,
+) -> Any:
     output_schema = get_output_schema(agent)
     if output_schema is None or output_schema.is_plain_text():
         return final_output
@@ -89,7 +184,10 @@ def validate_handler_final_output(agent: Agent[Any], final_output: Any) -> Any:
             payload_value = {_WRAPPER_DICT_KEY: final_output}
     try:
         if isinstance(output_schema, AgentOutputSchema):
-            payload_bytes = output_schema._type_adapter.dump_json(payload_value)
+            payload_bytes = output_schema._type_adapter.dump_json(
+                payload_value,
+                warnings="none" if data_redacted else "warn",
+            )
             payload = (
                 payload_bytes.decode()
                 if isinstance(payload_bytes, bytes | bytearray)
@@ -128,16 +226,14 @@ def create_message_output_item(agent: Agent[Any], output_text: str) -> MessageOu
 async def resolve_run_error_handler_result(
     *,
     error_handlers: RunErrorHandlers[TContext] | None,
-    error: MaxTurnsExceeded | ModelRefusalError,
+    error_kind: RunErrorHandlerKind,
+    error: MaxTurnsExceeded | ModelRefusalError | ModelBehaviorError,
     context_wrapper: RunContextWrapper[TContext],
     run_data: RunErrorData,
 ) -> RunErrorHandlerResult | None:
     if not error_handlers:
         return None
-    if isinstance(error, ModelRefusalError):
-        handler = error_handlers.get("model_refusal")
-    else:
-        handler = error_handlers.get("max_turns")
+    handler = error_handlers.get(error_kind)
     if handler is None:
         return None
     handler_input = RunErrorHandlerInput(

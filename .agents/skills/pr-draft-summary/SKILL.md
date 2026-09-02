@@ -1,17 +1,18 @@
 ---
 name: pr-draft-summary
-description: Create the required PR-ready summary block, branch suggestion, title, and draft description for openai-agents-python. Use in the final handoff after moderate-or-larger changes to runtime code, tests, examples, build/test configuration, or docs with behavior impact; skip only for trivial or conversation-only tasks, repo-meta/doc-only tasks without behavior impact, or when the user explicitly says not to include the PR draft block.
+description: Create the required PR-ready summary block, branch suggestion, title, and draft description for openai-agents-python. Use before the final response whenever the current task changed runtime code, tests, examples, build/test configuration, or docs with behavior impact, regardless of perceived change size and including local-only or uncommitted work. Skip only for trivial or conversation-only tasks, repo-meta/doc-only tasks without behavior impact, an explicitly invoked $release-candidate-prep handoff, or when the user explicitly says not to include the PR draft block.
 ---
 
 # PR Draft Summary
 
 ## Purpose
-Produce the PR-ready summary required in this repository after substantive code work is complete: a concise summary plus a PR-ready title and draft description that begins with "This pull request <verb> ...". The block should be ready to paste into a PR for openai-agents-python.
+Produce the PR-ready summary required in this repository after eligible code work is complete: a concise summary plus a PR-ready title and draft description that begins with "This pull request <verb> ...". The block should be ready to paste into a PR for openai-agents-python.
 
 ## When to Trigger
-- The task for this repo is finished (or ready for review) and it touched runtime code, tests, examples, docs with behavior impact, or build/test configuration.
-- Treat this as the default final handoff step for substantive code work. Run it after any required verification or changeset work and before sending the "work complete" response.
-- Skip only for trivial or conversation-only tasks, repo-meta/doc-only tasks without behavior impact, or when the user explicitly says not to include the PR draft block.
+- Before every final response, check whether the current task changed runtime code (`src/agents/`), tests (`tests/`), examples (`examples/`), build/test configuration, or docs with behavior impact.
+- If it did, run this skill after required verification and before sending the final response. Do not use perceived change size to decide whether to run it.
+- Run it for eligible local-only and uncommitted work even when the user did not ask to create a pull request. Producing this text does not authorize creating a branch, committing, pushing, or opening a pull request.
+- Skip only for trivial or conversation-only tasks, repo-meta/doc-only tasks without behavior impact, an explicitly invoked `$release-candidate-prep` handoff that uses the complete `$final-release-review` report as its release-specific PR description, or when the user explicitly says not to include the PR draft block. This exception applies to preparing the release candidate itself, not to implementing or changing the release-preparation skill.
 
 ## Inputs to Collect Automatically (do not ask the user)
 - Current branch: `git rev-parse --abbrev-ref HEAD`.
@@ -32,9 +33,10 @@ Produce the PR-ready summary required in this repository after substantive code 
 4) Summarize changes in 1–3 short sentences using the key paths (top 5) and `git diff --stat` output; explicitly call out untracked files from `git status -sb`/`git ls-files --others --exclude-standard` because `--stat` does not include them. If the working tree is clean but there are commits ahead of `${BASE_COMMIT}`, summarize using those commit messages.
 5) Choose the lead verb for the description: feature → `adds`, bug fix → `fixes`, refactor/perf → `improves` or `updates`, docs-only → `updates`.
 6) Suggest a branch name. If already off main, keep it; otherwise propose `feat/<slug>`, `fix/<slug>`, or `docs/<slug>` based on the primary area (e.g., `docs/pr-draft-summary-guidance`).
-7) If the current branch matches `issue-<number>` (digits only), keep that branch suggestion. Optionally pull light issue context (for example via the GitHub API) when available, but do not block or retry if it is not. When an issue number is present, reference `https://github.com/openai/openai-agents-python/issues/<number>` and include an auto-closing line such as `This pull request resolves #<number>.`.
-8) Draft the PR title and description using the template below.
-9) Output only the block in "Output Format". Keep any surrounding status note minimal and in English.
+7) If the current branch matches `issue-<number>` (digits only), keep that branch suggestion. Optionally pull light issue context (for example via the GitHub API) when available, but do not block or retry if it is not. When an issue number is present, use the native same-repository reference `#<number>` and include an auto-closing line such as `This pull request resolves #<number>.`. Do not add the explicit issue URL or wrap the reference in a Markdown link.
+8) Draft the PR title and description using the template below. Apply the repository-wide GitHub paste-readiness rule: use exactly `#123` for same-repository issues or PRs and `owner/repo#123` for cross-repository references; never emit `[PR #123](https://github.com/owner/repo/pull/123)`, `[#123](...)`, Codex navigation links, local file links, Codex-only citation markers or footnotes, or app directives in the copy-ready block. Preserve ordinary descriptive links to API docs, design notes, and other targets without native GitHub issue or pull-request syntax.
+9) Normalize references before returning the block: replace every same-repository URL or `openai/openai-agents-python#<number>` reference with `#<number>`, replace every cross-repository issue or pull-request URL with `owner/repo#<number>`, then rescan the full block. Do not return it while a Markdown-linked issue or pull-request label, a same-repository qualified reference, or a bare GitHub issue or pull-request URL remains.
+10) Output only the block in "Output Format". Keep any surrounding status note minimal and in English.
 
 ## Output Format
 When closing out a task, add this concise Markdown block (English only) after any brief status note unless the task falls under the documented skip cases or the user says they do not want it.

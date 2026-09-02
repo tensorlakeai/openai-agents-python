@@ -1,5 +1,7 @@
 # MCP Prompt Server Example
 
+This repository example targets MCP Python SDK v2 and is intended to run with the repository's locked development environment. The Agents SDK client itself supports both MCP v1 and v2.
+
 This example uses a local MCP prompt server in [server.py](server.py).
 
 Run the example via:
@@ -10,8 +12,7 @@ uv run python examples/mcp/prompt_server/main.py
 
 ## Details
 
-The example uses the `MCPServerStreamableHttp` class from `agents.mcp`. The script auto-selects an open localhost port (or honors `STREAMABLE_HTTP_PORT`) and runs the server at `http://<host>:<port>/mcp`, providing user-controlled prompts that generate agent instructions.
-If you need a specific address, set `STREAMABLE_HTTP_PORT` and `STREAMABLE_HTTP_HOST`.
+The example uses the `MCPServerStreamableHttp` class from `agents.mcp`. The script auto-selects an open localhost port (or honors `STREAMABLE_HTTP_PORT`) and runs the server at `http://<host>:<port>/mcp`, providing user-controlled prompts that generate agent instructions. If you need a specific address, set `STREAMABLE_HTTP_PORT` and `STREAMABLE_HTTP_HOST`.
 
 The server exposes prompts like `generate_code_review_instructions` that take parameters such as focus area and programming language. The agent calls these prompts to dynamically generate its system instructions based on user-provided parameters.
 

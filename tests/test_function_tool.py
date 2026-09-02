@@ -40,6 +40,26 @@ def argless_function() -> str:
     return "ok"
 
 
+def _nested_object_schema(depth: int) -> dict[str, Any]:
+    root: dict[str, Any] = {"type": "object", "properties": {}}
+    current = root
+    for _ in range(depth):
+        child: dict[str, Any] = {"type": "object", "properties": {}}
+        current["properties"]["child"] = child
+        current = child
+    return root
+
+
+def _chained_ref_schema(depth: int) -> dict[str, Any]:
+    definitions: dict[str, Any] = {f"L{i}": {"$ref": f"#/$defs/L{i + 1}"} for i in range(depth)}
+    definitions[f"L{depth}"] = {"type": "string"}
+    return {
+        "$defs": definitions,
+        "type": "object",
+        "properties": {"value": {"$ref": "#/$defs/L0", "description": "value"}},
+    }
+
+
 def test_tool_namespace_copies_tools_with_metadata() -> None:
     tool = function_tool(argless_function)
 
@@ -332,6 +352,83 @@ def test_func_schema_is_strict():
     )
 
 
+def test_manual_function_tool_normalizes_typeless_object_schemas():
+    async def run_function(ctx: ToolContext[Any], args: str) -> str:
+        return args
+
+    tool = FunctionTool(
+        name="test",
+        description="Processes nested data",
+        params_json_schema={
+            "properties": {
+                "config": {"properties": {"key": {"type": "string"}}},
+                "optional": {
+                    "type": ["object", "null"],
+                    "properties": {"value": {"type": "integer"}},
+                },
+            }
+        },
+        on_invoke_tool=run_function,
+    )
+
+    assert tool.strict_json_schema is True
+    assert tool.params_json_schema == {
+        "type": "object",
+        "properties": {
+            "config": {
+                "type": "object",
+                "properties": {"key": {"type": "string"}},
+                "additionalProperties": False,
+                "required": ["key"],
+            },
+            "optional": {
+                "type": ["object", "null"],
+                "properties": {"value": {"type": "integer"}},
+                "additionalProperties": False,
+                "required": ["value"],
+            },
+        },
+        "additionalProperties": False,
+        "required": ["config", "optional"],
+    }
+
+
+def test_manual_function_tool_rejects_root_union():
+    async def run_function(ctx: ToolContext[Any], args: str) -> str:
+        return args
+
+    with pytest.raises(UserError, match="root of a strict JSON schema"):
+        FunctionTool(
+            name="test",
+            description="Processes nullable data",
+            params_json_schema={
+                "anyOf": [
+                    {"properties": {"value": {"type": "string"}}},
+                    {"type": "null"},
+                ]
+            },
+            on_invoke_tool=run_function,
+        )
+
+
+def test_manual_function_tool_rejects_nested_typeless_open_map():
+    async def run_function(ctx: ToolContext[Any], args: str) -> str:
+        return args
+
+    with pytest.raises(UserError, match="additionalProperties"):
+        FunctionTool(
+            name="test",
+            description="Processes metadata",
+            params_json_schema={
+                "type": "object",
+                "properties": {
+                    "metadata": {"additionalProperties": {"type": "string"}},
+                },
+            },
+            on_invoke_tool=run_function,
+        )
+
+
 @pytest.mark.asyncio
 async def test_manual_function_tool_creation_works():
     def do_some_work(data: str) -> str:
@@ -496,6 +593,44 @@ async def test_is_enabled_bool_and_callable():
     assert len(tools_with_ctx) == 2
     assert tools_with_ctx[0].name == "another_tool"
     assert tools_with_ctx[1].name == "third_tool"
+
+
+@pytest.mark.asyncio
+async def test_get_all_tools_cancels_sibling_enablement_checks_on_error() -> None:
+    slow_started = asyncio.Event()
+    slow_cancelled = asyncio.Event()
+    slow_finished = asyncio.Event()
+
+    async def slow_enabled(_ctx: RunContextWrapper[Any], _agent: AgentBase) -> bool:
+        slow_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            slow_cancelled.set()
+            raise
+        finally:
+            slow_finished.set()
+        return True
+
+    async def failing_enabled(_ctx: RunContextWrapper[Any], _agent: AgentBase) -> bool:
+        await slow_started.wait()
+        raise RuntimeError("enablement failed")
+
+    @function_tool(is_enabled=slow_enabled)
+    def slow_tool() -> str:
+        return "slow"
+
+    @function_tool(is_enabled=failing_enabled)
+    def failing_tool() -> str:
+        return "failing"
+
+    agent = Agent(name="t", tools=[slow_tool, failing_tool])
+
+    with pytest.raises(RuntimeError, match="enablement failed"):
+        await agent.get_all_tools(RunContextWrapper(None))
+
+    assert slow_cancelled.is_set()
+    assert slow_finished.is_set()
 
 
 @pytest.mark.asyncio
@@ -705,6 +840,143 @@ async def test_shallow_copied_function_tool_normal_failure_uses_copied_policy() 
     assert cast(Any, copied_tool).custom_state is custom_state
 
 
+@dataclasses.dataclass(init=False)
+class _CustomConstructorFunctionTool(FunctionTool):
+    """FunctionTool subclass with its own constructor, like the sandbox shell tools."""
+
+    session: Any = dataclasses.field(init=False, repr=False, compare=False)
+
+    def __init__(self, *, session: Any) -> None:
+        self.session = session
+        super().__init__(
+            name="custom_constructor_tool",
+            description="Tool with a custom constructor.",
+            params_json_schema={
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": False,
+            },
+            on_invoke_tool=self._invoke,
+        )
+
+    async def _invoke(self, _ctx: ToolContext[Any], raw_input: str) -> str:
+        # Reads instance state so a copy that is still bound to the original is visible.
+        return f"{self.session}:{raw_input}"
+
+
+@dataclasses.dataclass
+class _PostInitStateFunctionTool(FunctionTool):
+    """FunctionTool subclass whose lifecycle hook owns additional shallow state."""
+
+    post_init_calls: int = dataclasses.field(default=0, init=False)
+    derived_state: list[str] = dataclasses.field(default_factory=list, init=False)
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.post_init_calls += 1
+        self.derived_state.append(f"initialized-{self.post_init_calls}")
+
+
+def _tool_context(tool: FunctionTool) -> ToolContext[Any]:
+    return ToolContext(None, tool_name=tool.name, tool_call_id="1", tool_arguments="{}")
+
+
+@pytest.mark.asyncio
+async def test_shallow_copy_supports_function_tool_subclass_constructors() -> None:
+    session = object()
+    original_tool = _CustomConstructorFunctionTool(session=session)
+
+    copied_tool = copy.copy(original_tool)
+
+    assert isinstance(copied_tool, _CustomConstructorFunctionTool)
+    assert copied_tool is not original_tool
+    assert copied_tool.session is session
+    assert copied_tool.name == original_tool.name
+    assert await copied_tool.on_invoke_tool(_tool_context(copied_tool), "{}") == f"{session}:{{}}"
+
+
+@pytest.mark.asyncio
+async def test_shallow_copied_subclass_invoker_uses_the_copied_instance_state() -> None:
+    original_tool = _CustomConstructorFunctionTool(session="original-session")
+
+    copied_tool = copy.copy(original_tool)
+    copied_tool.session = "copied-session"
+
+    # The subclass passes its own bound method as the invoker, so the copy must be
+    # rebound; otherwise it keeps reading the original instance's session.
+    assert await copied_tool.on_invoke_tool(_tool_context(copied_tool), "{}") == (
+        "copied-session:{}"
+    )
+    assert await original_tool.on_invoke_tool(_tool_context(original_tool), "{}") == (
+        "original-session:{}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_shallow_copy_preserves_callable_with_bound_method_metadata() -> None:
+    async def invoke(_ctx: ToolContext[Any], raw_input: str) -> str:
+        return raw_input
+
+    async def metadata_target(_tool: FunctionTool, _ctx: ToolContext[Any], _raw_input: str) -> str:
+        return "metadata-target"
+
+    class CallableProxy:
+        def __init__(self, owner: FunctionTool) -> None:
+            self.__self__ = owner
+            self.__func__ = metadata_target
+
+        async def __call__(self, _ctx: ToolContext[Any], _raw_input: str) -> str:
+            return "proxy-call"
+
+    original_tool = FunctionTool(
+        name="callable_proxy_tool",
+        description="Tool with bound-method-like callable metadata.",
+        params_json_schema={},
+        on_invoke_tool=invoke,
+    )
+    proxy = CallableProxy(original_tool)
+    original_tool.on_invoke_tool = proxy
+
+    copied_tool = copy.copy(original_tool)
+
+    assert copied_tool.on_invoke_tool is proxy
+    assert await copied_tool.on_invoke_tool(_tool_context(copied_tool), "{}") == "proxy-call"
+
+
+def test_shallow_copy_does_not_rerun_subclass_post_init() -> None:
+    async def invoke(_ctx: ToolContext[Any], raw_input: str) -> str:
+        return raw_input
+
+    original_tool = _PostInitStateFunctionTool(
+        name="post_init_tool",
+        description="Tool with subclass post-init state.",
+        params_json_schema={},
+        on_invoke_tool=invoke,
+    )
+    original_tool.derived_state.append("mutated")
+
+    copied_tool = copy.copy(original_tool)
+
+    assert copied_tool.post_init_calls == 1
+    assert copied_tool.derived_state is original_tool.derived_state
+    assert copied_tool.derived_state == ["initialized-1", "mutated"]
+
+
+def test_tool_namespace_supports_function_tool_subclass_constructors() -> None:
+    original_tool = _CustomConstructorFunctionTool(session=object())
+
+    namespaced_tool = tool_namespace(
+        name="workspace",
+        description="Workspace tools.",
+        tools=[original_tool],
+    )[0]
+
+    assert isinstance(namespaced_tool, _CustomConstructorFunctionTool)
+    assert namespaced_tool.qualified_name == "workspace.custom_constructor_tool"
+    assert original_tool.qualified_name == "custom_constructor_tool"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("copy_style", ["replace", "shallow_copy"])
 async def test_copied_function_tool_invalid_input_uses_current_name(copy_style: str) -> None:
@@ -753,6 +1025,57 @@ def test_function_tool_does_not_mutate_params_json_schema() -> None:
     assert tool.params_json_schema is not schema
     assert tool.params_json_schema["additionalProperties"] is False
     assert tool.params_json_schema["required"] == ["x"]
+
+
+def test_function_tool_rejects_deep_schema_before_copying() -> None:
+    async def noop(ctx: ToolContext[Any], input: str) -> str:
+        return ""
+
+    schema = _nested_object_schema(1_000)
+
+    with pytest.raises(UserError, match="too deeply nested"):
+        FunctionTool(
+            name="strict_tool",
+            description="Uses a strict schema",
+            params_json_schema=schema,
+            on_invoke_tool=noop,
+        )
+
+    non_strict_tool = FunctionTool(
+        name="non_strict_tool",
+        description="Uses the original schema",
+        params_json_schema=schema,
+        on_invoke_tool=noop,
+        strict_json_schema=False,
+    )
+    assert non_strict_tool.params_json_schema is schema
+
+
+def test_function_tool_rejects_deeply_chained_refs_before_conversion() -> None:
+    async def noop(ctx: ToolContext[Any], input: str) -> str:
+        return ""
+
+    with pytest.raises(UserError, match="too deeply nested"):
+        FunctionTool(
+            name="strict_tool",
+            description="Uses a strict schema",
+            params_json_schema=_chained_ref_schema(1_000),
+            on_invoke_tool=noop,
+        )
+
+
+def test_function_tool_rejects_deep_output_schema_before_copying() -> None:
+    async def noop(ctx: ToolContext[Any], input: str) -> str:
+        return ""
+
+    with pytest.raises(UserError, match="too deeply nested"):
+        FunctionTool(
+            name="output_tool",
+            description="Uses a structured output schema",
+            params_json_schema={"type": "object", "properties": {}},
+            on_invoke_tool=noop,
+            output_json_schema=_nested_object_schema(1_000),
+        )
 
 
 @pytest.mark.asyncio
@@ -842,6 +1165,55 @@ async def test_function_tool_bad_json_includes_payload_when_tool_logging_enabled
     assert exc_info.value.__cause__.doc == bad_json
     assert "SECRET_TOKEN_123" in str(exc_info.value)
     assert "SECRET_TOKEN_123" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_function_tool_argument_logging_excludes_live_context(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    context_secret = "CONTEXT_SECRET_SENTINEL"
+    model_argument = "MODEL_ARGUMENT_SENTINEL"
+
+    class SensitiveContext:
+        def __repr__(self) -> str:
+            return context_secret
+
+    def echo(ctx: ToolContext[Any], value: str) -> str:
+        assert isinstance(ctx.context, SensitiveContext)
+        return value
+
+    monkeypatch.setattr(_debug, "DONT_LOG_TOOL_DATA", False)
+    tool = function_tool(echo)
+    live_context = ToolContext(
+        SensitiveContext(),
+        tool_name=tool.name,
+        tool_call_id="sensitive-context",
+        tool_arguments=json.dumps({"value": model_argument}),
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="openai.agents"):
+        assert (
+            await tool.on_invoke_tool(
+                live_context,
+                json.dumps({"value": model_argument}),
+            )
+            == model_argument
+        )
+
+    records = [
+        record for record in caplog.records if record.msg == "Tool call args: %s, kwargs: %s"
+    ]
+    assert len(records) == 1
+    record = records[0]
+    assert model_argument in logging.Formatter().format(record)
+    assert context_secret not in repr(record.__dict__)
+    assert isinstance(record.args, tuple)
+    logged_args, logged_kwargs = record.args
+    assert isinstance(logged_args, list)
+    assert isinstance(logged_kwargs, dict)
+    assert live_context not in logged_args
+    assert live_context not in logged_kwargs.values()
 
 
 @pytest.mark.asyncio
@@ -1063,3 +1435,26 @@ def test_function_tool_timeout_error_function_must_be_callable() -> None:
             on_invoke_tool=_noop_on_invoke_tool,
             timeout_error_function=cast(Any, "not-callable"),
         )
+
+
+def kwargs_collision_function(x: int, *rest: int, **kw: Any) -> str:
+    return f"x={x} rest={rest} kw={kw}"
+
+
+@pytest.mark.asyncio
+async def test_kwargs_key_colliding_with_param_is_reported_as_model_behavior_error():
+    """The collision reaches the model as feedback, not as an unhandled TypeError.
+
+    ``kw={"x": 99}`` used to splat into the call as ``f(1, 2, 3, x=99)``, which raised
+    ``TypeError: got multiple values for argument 'x'`` from inside the tool call.
+    """
+    tool = function_tool(kwargs_collision_function, strict_mode=False, failure_error_function=None)
+    arguments = '{"x": 1, "rest": [2, 3], "kw": {"x": 99}}'
+
+    with pytest.raises(ModelBehaviorError) as exc_info:
+        await tool.on_invoke_tool(
+            ToolContext(None, tool_name=tool.name, tool_call_id="1", tool_arguments=arguments),
+            arguments,
+        )
+
+    assert "'x'" in str(exc_info.value)

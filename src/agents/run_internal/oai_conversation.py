@@ -9,7 +9,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, cast
 
+from ..exceptions import UserError
 from ..items import (
+    InputItem,
     ItemHelpers,
     ModelResponse,
     RunItem,
@@ -95,6 +97,29 @@ def _has_output_payload(item: Any) -> bool:
     return (isinstance(item, dict) and "output" in item) or hasattr(item, "output")
 
 
+def _is_tracked_object(items: Sequence[Any], candidate: Any) -> bool:
+    """Return True when the exact object instance is already tracked."""
+    return any(item is candidate for item in items)
+
+
+def _track_object_once(items: list[Any], candidate: Any) -> None:
+    """Track an object instance once, keeping it alive while identity dedupe is needed."""
+    if not _is_tracked_object(items, candidate):
+        items.append(candidate)
+
+
+def _untrack_object(items: list[Any], candidate: Any) -> None:
+    """Remove an object instance from an identity-tracking list."""
+    for index, item in enumerate(items):
+        if item is candidate:
+            items.pop(index)
+            return
+
+
+_PreparedItemSource = tuple[TResponseInputItem, TResponseInputItem, str | None]
+_PreparedSourceIdentity = tuple[TResponseInputItem, str | None]
+
+
 @dataclass
 class OpenAIServerConversationTracker:
     """Track server-side conversation state for conversation-aware runs.
@@ -113,17 +138,19 @@ class OpenAIServerConversationTracker:
     previous_response_id: str | None = None
     auto_previous_response_id: bool = False
 
-    # In-process object identity for items that have already been delivered or acknowledged.
-    sent_items: set[int] = field(default_factory=set)
-    server_items: set[int] = field(default_factory=set)
+    # In-process object identity for delivered or acknowledged items. Keep object references
+    # instead of id(obj) integers so a later allocation cannot reuse a stale address.
+    sent_items: list[Any] = field(default_factory=list)
+    server_items: list[Any] = field(default_factory=list)
 
     # Stable provider identifiers returned by the Responses API.
     server_item_ids: set[str] = field(default_factory=set)
     server_tool_call_ids: set[str] = field(default_factory=set)
     server_output_fingerprints: set[str] = field(default_factory=set)
 
-    # Content-based dedupe for resume/retry paths where objects are reconstructed.
+    # Durable occurrence and content dedupe for resume/retry paths where objects are rebuilt.
     sent_item_fingerprints: set[str] = field(default_factory=set)
+    accepted_input_item_ids: set[str] = field(default_factory=set)
     restored_anonymous_tool_search_fingerprints: set[str] = field(default_factory=set)
     sent_initial_input: bool = False
     remaining_initial_input: list[TResponseInputItem] | None = None
@@ -132,10 +159,12 @@ class OpenAIServerConversationTracker:
 
     # Mapping from normalized prepared items back to their original source objects so that
     # mark_input_as_sent() can mark the right object identities after the model call succeeds.
-    prepared_item_sources: dict[int, TResponseInputItem] = field(default_factory=dict)
-    prepared_item_sources_by_fingerprint: dict[str, list[TResponseInputItem]] = field(
+    # Keep the prepared item alive so its object ID cannot be reused before the input is marked.
+    prepared_item_sources: dict[int, _PreparedItemSource] = field(default_factory=dict)
+    prepared_item_sources_by_fingerprint: dict[str, list[_PreparedSourceIdentity]] = field(
         default_factory=dict
     )
+    delivered_item_sources: dict[int, _PreparedItemSource] = field(default_factory=dict)
 
     def __post_init__(self):
         """Log initial tracker state to make conversation resume behavior debuggable."""
@@ -200,7 +229,7 @@ class OpenAIServerConversationTracker:
             for output_item in response.output:
                 if output_item is None:
                     continue
-                self.server_items.add(id(output_item))
+                _track_object_once(self.server_items, output_item)
                 item_id = _normalize_server_item_id(
                     output_item.get("id")
                     if isinstance(output_item, dict)
@@ -239,6 +268,7 @@ class OpenAIServerConversationTracker:
             if raw_item is None:
                 continue
             is_tool_call_item = run_item.type in {"tool_call_item", "handoff_call_item"}
+            is_input_item = isinstance(run_item, InputItem)
             is_tool_search_item = run_item.type in {
                 "tool_search_call_item",
                 "tool_search_output_item",
@@ -258,15 +288,17 @@ class OpenAIServerConversationTracker:
                 should_mark = (
                     item_id is not None
                     or (has_call_id and (has_output_payload or is_tool_call_item))
+                    or is_input_item
                     or is_tool_search_item
                 )
                 if not should_mark:
                     continue
 
-                raw_item_id = id(raw_item)
-                self.sent_items.add(raw_item_id)
+                _track_object_once(self.sent_items, raw_item)
                 fp = _fingerprint_for_tracker(raw_item)
-                if fp:
+                if is_input_item:
+                    self.accepted_input_item_ids.add(run_item.input_id)
+                elif fp:
                     self.sent_item_fingerprints.add(fp)
                     if is_tool_search_item:
                         self.server_output_fingerprints.add(fp)
@@ -292,14 +324,17 @@ class OpenAIServerConversationTracker:
                 should_mark = (
                     item_id is not None
                     or (has_call_id and (has_output_payload or is_tool_call_item))
+                    or is_input_item
                     or is_tool_search_item
                 )
                 if not should_mark:
                     continue
 
-                self.sent_items.add(id(raw_item))
+                _track_object_once(self.sent_items, raw_item)
                 fp = _fingerprint_for_tracker(raw_item)
-                if fp:
+                if is_input_item:
+                    self.accepted_input_item_ids.add(run_item.input_id)
+                elif fp:
                     self.sent_item_fingerprints.add(fp)
                     if is_tool_search_item:
                         self.server_output_fingerprints.add(fp)
@@ -321,7 +356,7 @@ class OpenAIServerConversationTracker:
         for output_item in model_response.output:
             if output_item is None:
                 continue
-            self.server_items.add(id(output_item))
+            _track_object_once(self.server_items, output_item)
             item_id = _normalize_server_item_id(
                 output_item.get("id")
                 if isinstance(output_item, dict)
@@ -361,28 +396,28 @@ class OpenAIServerConversationTracker:
         if not items:
             return
 
-        delivered_source_ids: set[int] = set()
+        delivered_sources: list[TResponseInputItem] = []
         delivered_by_content: set[str] = set()
         for item in items:
             if item is None:
                 continue
-            source_item = self._consume_prepared_item_source(item)
-            source_item_id = id(source_item)
-            if source_item_id in delivered_source_ids:
+            source_item, input_id = self._delivery_source(item)
+            if _is_tracked_object(delivered_sources, source_item):
                 continue
-            delivered_source_ids.add(source_item_id)
-            self.sent_items.add(source_item_id)
+            delivered_sources.append(source_item)
+            _track_object_once(self.sent_items, source_item)
             fp = _fingerprint_for_tracker(source_item)
             if fp:
                 delivered_by_content.add(fp)
-                self.sent_item_fingerprints.add(fp)
+                if input_id is None:
+                    self.sent_item_fingerprints.add(fp)
 
         if not self.remaining_initial_input:
             return
 
         remaining: list[TResponseInputItem] = []
         for pending in self.remaining_initial_input:
-            if id(pending) in delivered_source_ids:
+            if _is_tracked_object(delivered_sources, pending):
                 continue
             pending_fp = _fingerprint_for_tracker(pending)
             if pending_fp and pending_fp in delivered_by_content:
@@ -390,6 +425,72 @@ class OpenAIServerConversationTracker:
             remaining.append(pending)
 
         self.remaining_initial_input = remaining or None
+
+    def validate_pending_input_filter(self, items: Sequence[TResponseInputItem]) -> None:
+        """Reject filter rewrites whose pending-input lineage cannot be determined safely."""
+        pending_ids = {
+            input_id
+            for _prepared_item, _source_item, input_id in self.prepared_item_sources.values()
+            if input_id is not None
+        }
+        if not pending_ids:
+            return
+
+        sources_by_fingerprint = {
+            fingerprint: list(sources)
+            for fingerprint, sources in self.prepared_item_sources_by_fingerprint.items()
+        }
+        filtered_counts_by_fingerprint: dict[str, int] = {}
+        for item in items:
+            fingerprint = _fingerprint_for_tracker(item)
+            if fingerprint:
+                filtered_counts_by_fingerprint[fingerprint] = (
+                    filtered_counts_by_fingerprint.get(fingerprint, 0) + 1
+                )
+
+        matched_pending_ids: set[str] = set()
+        unmatched_filtered_item = False
+        for item in items:
+            direct_entry = self.prepared_item_sources.get(id(item))
+            source: _PreparedSourceIdentity | None = None
+            if direct_entry is not None and direct_entry[0] is item:
+                source = (direct_entry[1], direct_entry[2])
+
+            fingerprint = _fingerprint_for_tracker(item)
+            candidates = (
+                sources_by_fingerprint.get(fingerprint, []) if fingerprint is not None else []
+            )
+            if source is not None:
+                for index, candidate in enumerate(candidates):
+                    if candidate[0] is source[0] and candidate[1] == source[1]:
+                        candidates.pop(index)
+                        break
+            elif candidates:
+                candidate_input_ids = {candidate[1] for candidate in candidates}
+                if (
+                    None in candidate_input_ids
+                    and len(candidate_input_ids) > 1
+                    and fingerprint is not None
+                    and filtered_counts_by_fingerprint.get(fingerprint, 0) < len(candidates)
+                ):
+                    raise UserError(
+                        "call_model_input_filter cannot safely associate a reconstructed item "
+                        "with pending RunState input. Preserve the input item object, return an "
+                        "unchanged copy, or omit the pending item."
+                    )
+                source = candidates.pop(0)
+            else:
+                unmatched_filtered_item = True
+
+            if source is not None and source[1] is not None:
+                matched_pending_ids.add(source[1])
+
+        if pending_ids - matched_pending_ids and unmatched_filtered_item:
+            raise UserError(
+                "call_model_input_filter cannot safely associate a reconstructed item with "
+                "pending RunState input. Preserve the input item object, return an unchanged "
+                "copy, or omit the pending item."
+            )
 
     def rewind_input(self, items: Sequence[TResponseInputItem]) -> None:
         """Rewind previously marked inputs so they can be resent."""
@@ -400,11 +501,11 @@ class OpenAIServerConversationTracker:
         for item in items:
             if item is None:
                 continue
-            source_item = self._consume_prepared_item_source(item)
+            source_item, input_id = self._delivery_source(item)
             rewind_items.append(source_item)
-            self.sent_items.discard(id(source_item))
+            _untrack_object(self.sent_items, source_item)
             fp = _fingerprint_for_tracker(source_item)
-            if fp:
+            if input_id is None and fp:
                 self.sent_item_fingerprints.discard(fp)
 
         if not rewind_items:
@@ -420,9 +521,13 @@ class OpenAIServerConversationTracker:
         generated_items: list[RunItem],
     ) -> list[TResponseInputItem]:
         """Assemble the next model input while skipping duplicates and approvals."""
+        self.prepared_item_sources.clear()
+        self.prepared_item_sources_by_fingerprint.clear()
+        self.delivered_item_sources.clear()
+
         prepared_initial_items: list[TResponseInputItem] = []
         prepared_generated_items: list[TResponseInputItem] = []
-        generated_item_sources: dict[int, TResponseInputItem] = {}
+        generated_item_sources: dict[int, _PreparedSourceIdentity] = {}
 
         if not self.sent_initial_input:
             initial_items = ItemHelpers.input_to_new_input_list(original_input)
@@ -454,6 +559,10 @@ class OpenAIServerConversationTracker:
             if raw_item is None:
                 continue
 
+            input_id = run_item.input_id if isinstance(run_item, InputItem) else None
+            if input_id is not None and input_id in self.accepted_input_item_ids:
+                continue
+
             item_id = _normalize_server_item_id(
                 raw_item.get("id") if isinstance(raw_item, dict) else getattr(raw_item, "id", None)
             )
@@ -469,8 +578,9 @@ class OpenAIServerConversationTracker:
             ):
                 continue
 
-            raw_item_id = id(raw_item)
-            if raw_item_id in self.sent_items or raw_item_id in self.server_items:
+            if _is_tracked_object(self.sent_items, raw_item) or _is_tracked_object(
+                self.server_items, raw_item
+            ):
                 continue
 
             converted_input_item = run_item_to_input_item(run_item, self.reasoning_item_id_policy)
@@ -479,7 +589,12 @@ class OpenAIServerConversationTracker:
             fp = _fingerprint_for_tracker(converted_input_item)
             if fp and fp in self.server_output_fingerprints:
                 continue
-            if fp and self.primed_from_state and fp in self.sent_item_fingerprints:
+            if (
+                input_id is None
+                and fp
+                and self.primed_from_state
+                and fp in self.sent_item_fingerprints
+            ):
                 continue
             anonymous_tool_search_fp = _anonymous_tool_search_fingerprint(converted_input_item)
             if (
@@ -492,10 +607,13 @@ class OpenAIServerConversationTracker:
                 continue
 
             prepared_generated_items.append(converted_input_item)
-            generated_item_sources[id(converted_input_item)] = cast(TResponseInputItem, raw_item)
+            generated_item_sources[id(converted_input_item)] = (
+                cast(TResponseInputItem, raw_item),
+                input_id,
+            )
 
         normalized_generated_items = normalize_input_items_for_api(prepared_generated_items)
-        normalized_generated_sources = {
+        normalized_generated_sources: dict[int, _PreparedSourceIdentity] = {
             id(normalized_item): generated_item_sources[id(source_item)]
             for normalized_item, source_item in zip(
                 normalized_generated_items, prepared_generated_items, strict=False
@@ -503,59 +621,72 @@ class OpenAIServerConversationTracker:
         }
         filtered_generated_items = drop_orphan_function_calls(normalized_generated_items)
         for item in filtered_generated_items:
-            prepared_source_item = normalized_generated_sources.get(id(item))
-            if prepared_source_item is not None:
-                self._register_prepared_item_source(item, prepared_source_item)
+            prepared_source = normalized_generated_sources.get(id(item))
+            if prepared_source is not None:
+                source_item, input_id = prepared_source
+                self._register_prepared_item_source(item, source_item, input_id=input_id)
 
         return prepared_initial_items + filtered_generated_items
 
     def _register_prepared_item_source(
-        self, prepared_item: TResponseInputItem, source_item: TResponseInputItem | None = None
+        self,
+        prepared_item: TResponseInputItem,
+        source_item: TResponseInputItem | None = None,
+        *,
+        input_id: str | None = None,
     ) -> None:
         if source_item is None:
             source_item = prepared_item
-        self.prepared_item_sources[id(prepared_item)] = source_item
+        self.prepared_item_sources[id(prepared_item)] = (prepared_item, source_item, input_id)
         fingerprint = _fingerprint_for_tracker(prepared_item)
         if fingerprint:
             self.prepared_item_sources_by_fingerprint.setdefault(fingerprint, []).append(
-                source_item
+                (source_item, input_id)
             )
 
-    def _resolve_prepared_item_source(self, item: TResponseInputItem) -> TResponseInputItem:
-        source_item = self.prepared_item_sources.get(id(item))
-        if source_item is not None:
-            return source_item
+    def _consume_prepared_item_source(self, item: TResponseInputItem) -> _PreparedSourceIdentity:
+        direct_entry = self.prepared_item_sources.get(id(item))
+        direct_source: _PreparedSourceIdentity | None = None
+        if direct_entry is not None and direct_entry[0] is item:
+            self.prepared_item_sources.pop(id(item), None)
+            direct_source = (direct_entry[1], direct_entry[2])
 
         fingerprint = _fingerprint_for_tracker(item)
         if not fingerprint:
-            return item
+            return direct_source if direct_source is not None else (item, None)
 
         source_items = self.prepared_item_sources_by_fingerprint.get(fingerprint)
         if not source_items:
-            return item
-        return source_items[0]
+            return direct_source if direct_source is not None else (item, None)
 
-    def _consume_prepared_item_source(self, item: TResponseInputItem) -> TResponseInputItem:
-        source_item = self._resolve_prepared_item_source(item)
-        direct_source = self.prepared_item_sources.pop(id(item), None)
-
-        fingerprint = _fingerprint_for_tracker(item)
-        if not fingerprint:
-            return source_item
-
-        source_items = self.prepared_item_sources_by_fingerprint.get(fingerprint)
-        if not source_items:
-            return source_item
-
-        target_source = direct_source if direct_source is not None else source_item
+        source_item = direct_source if direct_source is not None else source_items[0]
         for index, candidate in enumerate(source_items):
-            if candidate is target_source:
+            if candidate[0] is source_item[0] and candidate[1] == source_item[1]:
                 source_items.pop(index)
                 break
-        else:
-            source_items.pop(0)
 
         if not source_items:
             self.prepared_item_sources_by_fingerprint.pop(fingerprint, None)
 
         return source_item
+
+    def _delivery_source(self, item: TResponseInputItem) -> _PreparedSourceIdentity:
+        delivered_entry = self.delivered_item_sources.get(id(item))
+        if delivered_entry is not None and delivered_entry[0] is item:
+            return delivered_entry[1], delivered_entry[2]
+
+        source_item, input_id = self._consume_prepared_item_source(item)
+        self.delivered_item_sources[id(item)] = (item, source_item, input_id)
+        return source_item, input_id
+
+    def mark_input_as_accepted(self, items: Sequence[TResponseInputItem]) -> set[str]:
+        """Record pending-input occurrences present in a successful server request."""
+        accepted_ids: set[str] = set()
+        for item in items:
+            if item is None:
+                continue
+            _source_item, input_id = self._delivery_source(item)
+            if input_id is not None:
+                accepted_ids.add(input_id)
+        self.accepted_input_item_ids.update(accepted_ids)
+        return accepted_ids

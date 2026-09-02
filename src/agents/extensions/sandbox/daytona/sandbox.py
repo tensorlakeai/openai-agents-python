@@ -26,6 +26,8 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field
 
+from ....logger import log_tool_action_debug
+from ....sandbox._mount_security import redact_mount_error_data
 from ....sandbox.entries import Mount
 from ....sandbox.errors import (
     ExecTimeoutError,
@@ -43,6 +45,7 @@ from ....sandbox.session import SandboxSession, SandboxSessionState
 from ....sandbox.session.base_sandbox_session import BaseSandboxSession
 from ....sandbox.session.dependencies import Dependencies
 from ....sandbox.session.manager import Instrumentation
+from ....sandbox.session.pty_output import collect_pty_output
 from ....sandbox.session.pty_types import (
     PTY_PROCESSES_MAX,
     PTY_PROCESSES_WARNING,
@@ -51,7 +54,6 @@ from ....sandbox.session.pty_types import (
     clamp_pty_yield_time_ms,
     process_id_to_prune_from_meta,
     resolve_pty_write_yield_time_ms,
-    truncate_text_by_tokens,
 )
 from ....sandbox.session.runtime_helpers import RESOLVE_WORKSPACE_PATH_HELPER, RuntimeHelperScript
 from ....sandbox.session.sandbox_client import BaseSandboxClient, BaseSandboxClientOptions
@@ -62,6 +64,7 @@ from ....sandbox.util.retry import (
     TRANSIENT_HTTP_STATUS_CODES,
     exception_chain_contains_type,
     exception_chain_has_status_code,
+    iter_exception_chain,
     retry_async,
 )
 from ....sandbox.util.tar_utils import UnsafeTarMemberError, validate_tar_bytes
@@ -76,6 +79,22 @@ DEFAULT_DAYTONA_WORKSPACE_ROOT = "/home/daytona/workspace"
 logger = logging.getLogger(__name__)
 
 
+# Daytona documents SDK error subclasses plus `status_code` and `error_code` fields at:
+# https://www.daytona.io/docs/en/python-sdk/common/errors/
+_DAYTONA_HTTP_STATUS_RETRYABLE: dict[int, bool] = {
+    400: False,
+    401: False,
+    403: False,
+    404: False,
+    409: False,
+    429: True,
+    500: True,
+    502: True,
+    503: True,
+    504: True,
+}
+
+
 def _daytona_provider_error_detail(error: BaseException) -> str | None:
     message = str(error)
     status = getattr(error, "status_code", None) or getattr(error, "status", None)
@@ -88,6 +107,35 @@ def _daytona_provider_error_detail(error: BaseException) -> str | None:
     return type(error).__name__
 
 
+def _daytona_provider_retryability(error: BaseException) -> tuple[bool | None, str | None]:
+    non_retryable_types = _daytona_non_retryable_error_types()
+    retryable_types = _daytona_retryable_error_types()
+
+    for candidate in iter_exception_chain(error):
+        provider_error_code = getattr(candidate, "error_code", None)
+        reason = str(provider_error_code) if isinstance(provider_error_code, str) else None
+
+        if non_retryable_types and isinstance(candidate, non_retryable_types):
+            return False, reason
+
+        if retryable_types and isinstance(candidate, retryable_types):
+            return True, reason
+
+        status = getattr(candidate, "status_code", None) or getattr(candidate, "status", None)
+        if isinstance(status, int):
+            retryable = _DAYTONA_HTTP_STATUS_RETRYABLE.get(status)
+            if retryable is not None:
+                return retryable, reason or f"http_{status}"
+
+        message = str(candidate).lower()
+        if "is the sandbox started" in message or "no ip address found" in message:
+            return False, "sandbox_not_running"
+
+    if exception_chain_contains_type(error, _retryable_persist_workspace_error_types()):
+        return True, "provider_timeout"
+    return None, None
+
+
 def _daytona_exec_transport_error(
     *,
     command: tuple[str | Path, ...],
@@ -95,15 +143,27 @@ def _daytona_exec_transport_error(
 ) -> ExecTransportError:
     detail = _daytona_provider_error_detail(cause)
     context: dict[str, object] = {"backend": "daytona"}
+    retryable, reason = _daytona_provider_retryability(cause)
+    if reason is not None:
+        context["reason"] = reason
     if detail:
         context["provider_error"] = detail
+    provider_error_code = getattr(cause, "error_code", None)
+    if isinstance(provider_error_code, str) and provider_error_code:
+        context["provider_error_code"] = provider_error_code
     status = getattr(cause, "status_code", None) or getattr(cause, "status", None)
     if isinstance(status, int):
         context["http_status"] = status
     message = "Daytona exec failed"
     if detail:
         message = f"{message}: {detail}"
-    return ExecTransportError(command=command, context=context, cause=cause, message=message)
+    return ExecTransportError(
+        command=command,
+        context=context,
+        cause=cause,
+        message=message,
+        retryable=retryable,
+    )
 
 
 def _import_daytona_sdk() -> tuple[Any, Any, Any, Any]:
@@ -178,32 +238,49 @@ def _import_session_execute_request() -> Any:
         ) from e
 
 
-def _import_daytona_exceptions() -> dict[str, type[BaseException]]:
-    """Best-effort import Daytona exception classes for fine-grained error mapping."""
+def _daytona_exception_types(*names: str) -> tuple[type[BaseException], ...]:
+    """Best-effort import of Daytona exception classes by name."""
     try:
-        from daytona import (
-            DaytonaError,
-            DaytonaNotFoundError,
-            DaytonaRateLimitError,
-            DaytonaTimeoutError,
-        )
+        daytona_module = __import__("daytona")
     except Exception:
-        return {}
-    return {
-        "base": DaytonaError,
-        "timeout": DaytonaTimeoutError,
-        "not_found": DaytonaNotFoundError,
-        "rate_limit": DaytonaRateLimitError,
-    }
+        return ()
+
+    exceptions: list[type[BaseException]] = []
+    for name in names:
+        value = getattr(daytona_module, name, None)
+        if isinstance(value, type) and issubclass(value, BaseException):
+            exceptions.append(value)
+    return tuple(exceptions)
+
+
+def _daytona_retryable_error_types() -> tuple[type[BaseException], ...]:
+    return _daytona_exception_types(
+        "DaytonaRateLimitError",
+        "DaytonaTimeoutError",
+        "DaytonaConnectionError",
+    )
+
+
+def _daytona_timeout_error_types() -> tuple[type[BaseException], ...]:
+    return _daytona_exception_types("DaytonaTimeoutError")
+
+
+def _daytona_non_retryable_error_types() -> tuple[type[BaseException], ...]:
+    return _daytona_exception_types(
+        "DaytonaNotFoundError",
+        "DaytonaAuthenticationError",
+        "DaytonaAuthorizationError",
+        "DaytonaValidationError",
+        "DaytonaConflictError",
+    )
+
+
+def _daytona_not_found_error_types() -> tuple[type[BaseException], ...]:
+    return _daytona_exception_types("DaytonaNotFoundError")
 
 
 def _retryable_persist_workspace_error_types() -> tuple[type[BaseException], ...]:
-    excs = _import_daytona_exceptions()
-    retryable: list[type[BaseException]] = [asyncio.TimeoutError]
-    timeout_exc = excs.get("timeout")
-    if timeout_exc is not None:
-        retryable.append(timeout_exc)
-    return tuple(retryable)
+    return (asyncio.TimeoutError, *_daytona_timeout_error_types())
 
 
 class DaytonaSandboxResources(BaseModel):
@@ -313,6 +390,7 @@ class _DaytonaPtySessionEntry:
     last_used: float = field(default_factory=time.monotonic)
     done: bool = False
     exit_code: int | None = None
+    worker_task: asyncio.Task[None] | None = None
 
 
 class DaytonaSandboxSession(BaseSandboxSession):
@@ -495,8 +573,7 @@ class DaytonaSandboxSession(BaseSandboxSession):
         caller_timeout = self._coerce_exec_timeout(timeout)
         deadline = time.monotonic() + caller_timeout
         SessionExecuteRequest = _import_session_execute_request()
-        daytona_exc = _import_daytona_exceptions()
-        timeout_exc = daytona_exc.get("timeout")
+        timeout_error_types = _daytona_timeout_error_types()
 
         def _remaining_timeout() -> float:
             return max(0.0, deadline - time.monotonic())
@@ -535,7 +612,7 @@ class DaytonaSandboxSession(BaseSandboxSession):
         except asyncio.TimeoutError as e:
             raise ExecTimeoutError(command=command, timeout_s=timeout, cause=e) from e
         except Exception as e:
-            if timeout_exc is not None and isinstance(e, timeout_exc):
+            if timeout_error_types and isinstance(e, timeout_error_types):
                 raise ExecTimeoutError(command=command, timeout_s=timeout, cause=e) from e
             raise _daytona_exec_transport_error(command=command, cause=e) from e
         finally:
@@ -566,8 +643,7 @@ class DaytonaSandboxSession(BaseSandboxSession):
         envs = await self._resolved_envs()
         cwd = sandbox_path_str(self.state.manifest.root)
         exec_timeout = self._coerce_exec_timeout(timeout)
-        daytona_exc = _import_daytona_exceptions()
-        timeout_exc = daytona_exc.get("timeout")
+        timeout_error_types = _daytona_timeout_error_types()
 
         daytona_session_id = f"sandbox-{uuid.uuid4().hex[:12]}"
         entry = _DaytonaPtySessionEntry(
@@ -599,7 +675,7 @@ class DaytonaSandboxSession(BaseSandboxSession):
                     timeout=exec_timeout,
                 )
                 entry.pty_handle = pty_handle
-                asyncio.create_task(self._run_pty_waiter(entry))
+                entry.worker_task = asyncio.create_task(self._run_pty_waiter(entry))
                 await asyncio.wait_for(pty_handle.wait_for_connection(), timeout=exec_timeout)
                 await asyncio.wait_for(
                     pty_handle.send_input(cmd_str + "\n"),
@@ -626,7 +702,7 @@ class DaytonaSandboxSession(BaseSandboxSession):
                     timeout=exec_timeout,
                 )
                 entry.cmd_id = resp.cmd_id
-                asyncio.create_task(
+                entry.worker_task = asyncio.create_task(
                     self._run_session_reader(
                         entry,
                         daytona_session_id,
@@ -657,7 +733,7 @@ class DaytonaSandboxSession(BaseSandboxSession):
                     await asyncio.shield(cleanup_task)
                 except BaseException:
                     await asyncio.shield(cleanup_task)
-            if timeout_exc is not None and isinstance(e, timeout_exc):
+            if timeout_error_types and isinstance(e, timeout_error_types):
                 raise ExecTimeoutError(command=command, timeout_s=timeout, cause=e) from e
             raise _daytona_exec_transport_error(command=command, cause=e) from e
         except BaseException:
@@ -812,36 +888,14 @@ class DaytonaSandboxSession(BaseSandboxSession):
         yield_time_ms: int,
         max_output_tokens: int | None,
     ) -> tuple[bytes, int | None]:
-        deadline = time.monotonic() + (yield_time_ms / 1000)
-        output = bytearray()
-
-        while True:
-            async with entry.output_lock:
-                while entry.output_chunks:
-                    output.extend(entry.output_chunks.popleft())
-
-            if time.monotonic() >= deadline:
-                break
-
-            if entry.done:
-                async with entry.output_lock:
-                    while entry.output_chunks:
-                        output.extend(entry.output_chunks.popleft())
-                break
-
-            remaining_s = deadline - time.monotonic()
-            if remaining_s <= 0:
-                break
-
-            try:
-                await asyncio.wait_for(entry.output_notify.wait(), timeout=remaining_s)
-            except asyncio.TimeoutError:
-                break
-            entry.output_notify.clear()
-
-        text = output.decode("utf-8", errors="replace")
-        truncated, original_token_count = truncate_text_by_tokens(text, max_output_tokens)
-        return truncated.encode("utf-8", errors="replace"), original_token_count
+        return await collect_pty_output(
+            output_chunks=entry.output_chunks,
+            output_lock=entry.output_lock,
+            output_notify=entry.output_notify,
+            is_done=lambda: entry.done,
+            yield_time_ms=yield_time_ms,
+            max_output_tokens=max_output_tokens,
+        )
 
     def _prune_pty_sessions_if_needed(self) -> _DaytonaPtySessionEntry | None:
         if len(self._pty_sessions) < PTY_PROCESSES_MAX:
@@ -863,6 +917,19 @@ class DaytonaSandboxSession(BaseSandboxSession):
                 await self._sandbox.process.delete_session(entry.daytona_session_id)
         except Exception:
             pass
+        finally:
+            worker_task = entry.worker_task
+            entry.worker_task = None
+            if worker_task is not None and worker_task is not asyncio.current_task():
+                if not worker_task.done():
+                    worker_task.cancel()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(worker_task, return_exceptions=True),
+                        timeout=self.state.timeouts.cleanup_s,
+                    )
+                except asyncio.TimeoutError:
+                    pass
 
     async def read(self, path: Path | str, *, user: str | User | None = None) -> io.IOBase:
         error_path = posix_path_as_path(coerce_posix_path(path))
@@ -871,8 +938,7 @@ class DaytonaSandboxSession(BaseSandboxSession):
         else:
             workspace_path = await self._validate_path_access(path)
 
-        daytona_exc = _import_daytona_exceptions()
-        not_found_exc = daytona_exc.get("not_found")
+        not_found_error_types = _daytona_not_found_error_types()
 
         try:
             data: bytes = await self._sandbox.fs.download_file(
@@ -881,7 +947,7 @@ class DaytonaSandboxSession(BaseSandboxSession):
             )
             return io.BytesIO(data)
         except Exception as e:
-            if not_found_exc is not None and isinstance(e, not_found_exc):
+            if not_found_error_types and isinstance(e, not_found_error_types):
                 raise WorkspaceReadNotFoundError(path=error_path, cause=e) from e
             raise WorkspaceArchiveReadError(path=error_path, cause=e) from e
 
@@ -946,6 +1012,7 @@ class DaytonaSandboxSession(BaseSandboxSession):
                 raise WorkspaceArchiveReadError(
                     path=self._workspace_root_path(),
                     context={"reason": "tar_failed", "output": result.result or ""},
+                    retryable=False,
                 )
             return cast(
                 bytes,
@@ -957,7 +1024,22 @@ class DaytonaSandboxSession(BaseSandboxSession):
         except WorkspaceArchiveReadError:
             raise
         except Exception as e:
-            raise WorkspaceArchiveReadError(path=self._workspace_root_path(), cause=e) from e
+            detail = _daytona_provider_error_detail(e)
+            retryable, reason = _daytona_provider_retryability(e)
+            context: dict[str, object] = {"backend": "daytona"}
+            if reason is not None:
+                context["reason"] = reason
+            if detail:
+                context["provider_error"] = detail
+            provider_error_code = getattr(e, "error_code", None)
+            if isinstance(provider_error_code, str) and provider_error_code:
+                context["provider_error_code"] = provider_error_code
+            raise WorkspaceArchiveReadError(
+                path=self._workspace_root_path(),
+                context=context,
+                cause=e,
+                retryable=retryable,
+            ) from e
 
     async def persist_workspace(self) -> io.IOBase:
         def _error_context_summary(error: WorkspaceArchiveReadError) -> dict[str, str]:
@@ -1114,7 +1196,9 @@ class DaytonaSandboxClient(BaseSandboxClient[DaytonaSandboxClientOptions]):
         AsyncDaytona, DaytonaConfig, _, _ = _import_daytona_sdk()
         config = DaytonaConfig(api_key=api_key, api_url=api_url) if (api_key or api_url) else None
         self._daytona = AsyncDaytona(config)
-        self._instrumentation = instrumentation or Instrumentation()
+        self._instrumentation = (
+            instrumentation if instrumentation is not None else Instrumentation()
+        )
         self._dependencies = dependencies
 
     async def _build_create_params(
@@ -1165,6 +1249,7 @@ class DaytonaSandboxClient(BaseSandboxClient[DaytonaSandboxClientOptions]):
             auto_stop_interval=auto_stop_interval,
         )
 
+    @redact_mount_error_data
     async def create(
         self,
         *,
@@ -1174,6 +1259,7 @@ class DaytonaSandboxClient(BaseSandboxClient[DaytonaSandboxClientOptions]):
     ) -> SandboxSession:
         if manifest is None:
             manifest = Manifest(root=DEFAULT_DAYTONA_WORKSPACE_ROOT)
+        self._validate_manifest_for_create(manifest)
 
         timeouts_in = options.timeouts
         if isinstance(timeouts_in, DaytonaSandboxTimeouts):
@@ -1239,12 +1325,14 @@ class DaytonaSandboxClient(BaseSandboxClient[DaytonaSandboxClientOptions]):
             pass
         return session
 
+    @redact_mount_error_data
     async def resume(
         self,
         state: SandboxSessionState,
     ) -> SandboxSession:
         if not isinstance(state, DaytonaSandboxSessionState):
             raise TypeError("DaytonaSandboxClient.resume expects a DaytonaSandboxSessionState")
+        state.assert_path_grants_rebound()
 
         daytona_sandbox = None
         reconnected = False
@@ -1255,7 +1343,7 @@ class DaytonaSandboxClient(BaseSandboxClient[DaytonaSandboxClientOptions]):
                 await daytona_sandbox.start(timeout=state.start_timeout)
             reconnected = True
         except Exception as e:
-            logger.debug("daytona sandbox get() failed, will recreate: %s", e)
+            log_tool_action_debug(logger, "Daytona sandbox lookup failed; recreating", e)
 
         if not reconnected or daytona_sandbox is None:
             params = await self._build_create_params(
@@ -1276,7 +1364,7 @@ class DaytonaSandboxClient(BaseSandboxClient[DaytonaSandboxClientOptions]):
         return self._wrap_session(inner, instrumentation=self._instrumentation)
 
     def deserialize_session_state(self, payload: dict[str, object]) -> SandboxSessionState:
-        return DaytonaSandboxSessionState.model_validate(payload)
+        return self._deserialize_session_state_payload(payload, DaytonaSandboxSessionState)
 
 
 __all__ = [

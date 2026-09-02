@@ -16,7 +16,7 @@ async def main():
         name="Code interpreter",
         # Note: using gpt-5-class models with streaming for this tool may require org verification.
         # Code interpreter does not support gpt-5 minimal reasoning effort; use default effort.
-        model="gpt-5.5",
+        model="gpt-5.6-sol",
         instructions=(
             "Always use the code interpreter tool to solve numeric problems, and show the code "
             "you ran when possible."
@@ -55,7 +55,7 @@ async def main():
             print(f"Other event: {event.item.type}")
 
         if not saw_code_interpreter_call:
-            print("No code_interpreter_call item was emitted.")
+            raise RuntimeError("No code_interpreter_call item was emitted.")
         print(f"Final output: {result.final_output}")
 
 

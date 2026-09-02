@@ -5,7 +5,7 @@ its state plus lightweight tool-call type utilities. Internal use only.
 
 from __future__ import annotations
 
-from typing import Any, get_args, get_origin
+from typing import TYPE_CHECKING, Any, get_args, get_origin
 
 from .._tool_identity import get_function_tool_trace_name
 from ..agent import Agent
@@ -23,6 +23,9 @@ from ..run_state import (
     _build_agent_map,
 )
 from .run_steps import ProcessedResponse, ToolRunFunction
+
+if TYPE_CHECKING:
+    from ..models.interface import Model
 
 __all__ = [
     "AgentToolUseTracker",
@@ -55,6 +58,12 @@ class AgentToolUseTracker:
         self.agent_map: dict[str, set[str]] = {}
         # Instance-keyed list is used for runtime checks.
         self.agent_to_tools: list[tuple[Agent[Any], list[str]]] = []
+        # Model instances are tracked by identity for run-scoped resource cleanup.
+        self.models: list[Model] = []
+
+    def record_model(self, model: Model) -> None:
+        if not any(existing is model for existing in self.models):
+            self.models.append(model)
 
     def record_used_tools(self, agent: Agent[Any], tools: list[ToolRunFunction]) -> None:
         tool_names = [
@@ -149,7 +158,9 @@ def hydrate_tool_use_tracker(
     agent_map = _build_agent_map(starting_agent)
     agent_identity_map = _build_agent_identity_map(starting_agent)
     for agent_name, tool_names in snapshot.items():
-        agent = agent_identity_map.get(agent_name) or agent_map.get(agent_name)
+        agent = agent_identity_map.get(agent_name)
+        if agent is None:
+            agent = agent_map.get(agent_name)
         if agent is None:
             continue
         tool_use_tracker.add_tool_use(agent, list(tool_names))

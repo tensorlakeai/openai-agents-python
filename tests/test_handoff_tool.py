@@ -1,11 +1,15 @@
+import asyncio
+import dataclasses
 import inspect
 import json
-from typing import Any
+import logging
+from typing import Any, cast
 
 import pytest
 from openai.types.responses import ResponseOutputMessage, ResponseOutputText
 from pydantic import BaseModel
 
+import agents._debug as _debug
 from agents import (
     Agent,
     Handoff,
@@ -16,6 +20,7 @@ from agents import (
     UserError,
     handoff,
 )
+from agents._tool_identity import resolve_tool_name_collisions
 from agents.run_internal.run_loop import get_handoffs
 
 
@@ -79,6 +84,148 @@ async def test_multiple_handoffs_setup():
 
     assert handoff_objects[0].agent_name == agent_1.name
     assert handoff_objects[1].agent_name == agent_2.name
+
+
+@pytest.mark.asyncio
+async def test_handoffs_reject_colliding_derived_names():
+    billing = Agent(name="Billing Agent")
+    normalized_billing = Agent(name="billing agent")
+    triage = Agent(name="triage", handoffs=[billing, normalized_billing])
+
+    handoffs = await get_handoffs(triage, RunContextWrapper(None))
+    with pytest.raises(UserError) as exc_info:
+        resolve_tool_name_collisions((), handoffs, collision_policy="error")
+
+    assert str(exc_info.value) == (
+        "Ambiguous handoff configuration: agents 'Billing Agent' and 'billing agent' both derive "
+        "the handoff tool name `transfer_to_billing_agent`. Pass an explicit "
+        "`tool_name_override=` to one of them."
+    )
+
+
+@pytest.mark.asyncio
+async def test_handoff_derived_name_collision_allows_explicit_override():
+    billing = Agent(name="Billing Agent")
+    normalized_billing = Agent(name="billing agent")
+    triage = Agent(
+        name="triage",
+        handoffs=[
+            billing,
+            handoff(normalized_billing, tool_name_override="transfer_to_normalized_billing"),
+        ],
+    )
+
+    handoffs = await get_handoffs(triage, RunContextWrapper(None))
+
+    assert [item.tool_name for item in handoffs] == [
+        "transfer_to_billing_agent",
+        "transfer_to_normalized_billing",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handoff_rejects_distinct_agents_with_the_same_name():
+    triage = Agent(
+        name="triage",
+        handoffs=[Agent(name="Billing"), Agent(name="Billing")],
+    )
+
+    handoffs = await get_handoffs(triage, RunContextWrapper(None))
+    with pytest.raises(
+        UserError,
+        match="handoff tool name `transfer_to_billing` is used by multiple handoffs",
+    ):
+        resolve_tool_name_collisions((), handoffs, collision_policy="error")
+
+
+@pytest.mark.asyncio
+async def test_handoff_warns_and_keeps_last_distinct_agent_with_the_same_name(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    monkeypatch.setattr(_debug, "DONT_LOG_TOOL_DATA", False)
+    triage = Agent(
+        name="triage",
+        handoffs=[Agent(name="Billing"), Agent(name="Billing")],
+    )
+    handoffs = await get_handoffs(triage, RunContextWrapper(None))
+
+    with caplog.at_level("WARNING", logger="openai.agents"):
+        _, resolved_handoffs = resolve_tool_name_collisions(
+            (),
+            handoffs,
+            collision_policy="warn",
+        )
+
+    assert resolved_handoffs == [handoffs[1]]
+    assert any(
+        "handoff tool name `transfer_to_billing` is used by multiple handoffs" in message
+        for message in caplog.messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_handoffs_ignore_disabled_derived_name_collision():
+    billing = Agent(name="Billing Agent")
+    normalized_billing = Agent(name="billing agent")
+    triage = Agent(
+        name="triage",
+        handoffs=[billing, handoff(normalized_billing, is_enabled=False)],
+    )
+
+    handoffs = await get_handoffs(triage, RunContextWrapper(None))
+
+    assert [item.agent_name for item in handoffs] == ["Billing Agent"]
+
+
+@pytest.mark.asyncio
+async def test_handoff_default_identity_tracks_the_current_tool_name():
+    billing = Agent(name="Billing Agent")
+    derived_handoff = handoff(billing)
+    copied_handoff = dataclasses.replace(derived_handoff)
+    renamed_handoff = dataclasses.replace(
+        derived_handoff,
+        tool_name="transfer_to_primary_billing",
+    )
+    normalized_billing = Agent(name="billing agent")
+
+    copied_triage = Agent(name="copied", handoffs=[copied_handoff, normalized_billing])
+    copied_handoffs = await get_handoffs(copied_triage, RunContextWrapper(None))
+    with pytest.raises(UserError, match="Ambiguous handoff configuration"):
+        resolve_tool_name_collisions((), copied_handoffs, collision_policy="error")
+
+    renamed_triage = Agent(name="renamed", handoffs=[renamed_handoff, normalized_billing])
+    handoffs = await get_handoffs(renamed_triage, RunContextWrapper(None))
+    resolve_tool_name_collisions((), handoffs, collision_policy="error")
+    assert [item.tool_name for item in handoffs] == [
+        "transfer_to_primary_billing",
+        "transfer_to_billing_agent",
+    ]
+
+
+def test_default_handoff_tool_name_allows_whitespace_without_warning(
+    caplog: pytest.LogCaptureFixture,
+):
+    agent = Agent(name="Refund agent")
+
+    with caplog.at_level(logging.WARNING):
+        tool_name = Handoff.default_tool_name(agent)
+
+    assert tool_name == "transfer_to_refund_agent"
+    assert not caplog.records
+
+
+def test_default_handoff_tool_name_warns_for_non_whitespace_invalid_characters(
+    caplog: pytest.LogCaptureFixture,
+):
+    agent = Agent(name="Refund/agent")
+
+    with caplog.at_level(logging.WARNING):
+        tool_name = Handoff.default_tool_name(agent)
+
+    assert tool_name == "transfer_to_refund_agent"
+    assert len(caplog.records) == 1
+    assert "contains invalid characters for function calling" in caplog.records[0].message
 
 
 @pytest.mark.asyncio
@@ -350,6 +497,17 @@ def test_handoff_input_schema_is_strict():
     ), "Input schema should be strict and have additionalProperties=False"
 
 
+def test_handoff_rejects_nullable_input_root():
+    agent = Agent(name="test")
+
+    with pytest.raises(UserError, match="root of a strict JSON schema"):
+        handoff(
+            agent,
+            input_type=cast(type[Any], Foo | None),
+            on_handoff=lambda ctx, input: None,
+        )
+
+
 def test_get_transfer_message_is_valid_json() -> None:
     agent = Agent(name="foo")
     obj = handoff(agent)
@@ -442,3 +600,121 @@ async def test_handoff_is_enabled_filtering_integration():
     agent_names = {h.agent_name for h in filtered_handoffs}
     assert agent_names == {"agent_1", "agent_3"}
     assert "agent_2" not in agent_names
+
+
+@pytest.mark.asyncio
+async def test_get_handoffs_cancels_sibling_enablement_checks_on_error() -> None:
+    slow_started = asyncio.Event()
+    slow_cancelled = asyncio.Event()
+    slow_finished = asyncio.Event()
+
+    async def slow_enabled(_ctx: RunContextWrapper[Any], _agent: Agent[Any]) -> bool:
+        slow_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            slow_cancelled.set()
+            raise
+        finally:
+            slow_finished.set()
+        return True
+
+    async def failing_enabled(_ctx: RunContextWrapper[Any], _agent: Agent[Any]) -> bool:
+        await slow_started.wait()
+        raise RuntimeError("enablement failed")
+
+    parent = Agent(
+        name="parent",
+        handoffs=[
+            handoff(Agent(name="slow"), is_enabled=slow_enabled),
+            handoff(Agent(name="failing"), is_enabled=failing_enabled),
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="enablement failed"):
+        await get_handoffs(parent, RunContextWrapper(None))
+
+    assert slow_cancelled.is_set()
+    assert slow_finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_handoff_is_enabled_sync_callable_false_filters_handoff():
+    target_agent = Agent(name="target")
+    main_agent = Agent(
+        name="main",
+        handoffs=[handoff(target_agent, is_enabled=lambda ctx, agent: False)],
+    )
+
+    filtered_handoffs = await get_handoffs(main_agent, RunContextWrapper(main_agent))
+
+    assert filtered_handoffs == []
+
+
+@pytest.mark.asyncio
+async def test_handoff_direct_sync_is_enabled_callable_filters_handoff():
+    async def invoke_handoff(ctx: RunContextWrapper[Any], input_json: str) -> Agent[Any]:
+        _ = (ctx, input_json)
+        return Agent(name="target")
+
+    handoff_obj = Handoff(
+        tool_name="transfer_to_target",
+        tool_description="Transfer to target.",
+        input_json_schema={},
+        on_invoke_handoff=invoke_handoff,
+        agent_name="target",
+        is_enabled=lambda ctx, agent: False,
+    )
+    main_agent = Agent(name="main", handoffs=[handoff_obj])
+
+    filtered_handoffs = await get_handoffs(main_agent, RunContextWrapper(main_agent))
+
+    assert filtered_handoffs == []
+
+
+class StrictInput(BaseModel):
+    name: str
+    age: int
+
+
+@pytest.mark.asyncio
+async def test_handoff_strict_json_rejects_type_coercion():
+    """With strict_json_schema=True (default), string input for an int field must raise
+    ModelBehaviorError instead of being silently coerced."""
+
+    async def _on_handoff(ctx: RunContextWrapper[Any], input: StrictInput):
+        pass  # pragma: no cover
+
+    agent = Agent(name="test")
+    obj = handoff(agent, input_type=StrictInput, on_handoff=_on_handoff)
+
+    # strict_json_schema defaults to True
+    assert obj.strict_json_schema is True
+
+    # age is a string "25" — strict mode should reject this
+    malformed_json = '{"name": "Alice", "age": "25"}'
+    with pytest.raises(ModelBehaviorError, match="Invalid JSON"):
+        await obj.on_invoke_handoff(RunContextWrapper(agent), malformed_json)
+
+    # Correctly typed input should still be accepted
+    valid_json = '{"name": "Alice", "age": 25}'
+    result = await obj.on_invoke_handoff(RunContextWrapper(agent), valid_json)
+    assert result == agent
+
+
+@pytest.mark.asyncio
+async def test_handoff_lenient_json_allows_type_coercion():
+    """Without strict validation, Pydantic's default lenient mode silently coerces
+    string input for an int field — verifying backward compatibility."""
+    from pydantic import TypeAdapter
+
+    from agents.util._json import validate_json
+
+    type_adapter = TypeAdapter(StrictInput)
+
+    # age is a string "25" — lenient mode should coerce it to int 25
+    malformed_json = '{"name": "Alice", "age": "25"}'
+    result = validate_json(malformed_json, type_adapter, partial=False)
+    assert result.name == "Alice"
+    assert result.age == 25
+    assert isinstance(result.age, int)

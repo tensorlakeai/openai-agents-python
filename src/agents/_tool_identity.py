@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any, Literal, cast
 
 from typing_extensions import Required, TypedDict
 
+from . import _debug
 from .exceptions import UserError
+from .logger import logger
 
 BareFunctionToolLookupKey = tuple[Literal["bare"], str]
 NamespacedFunctionToolLookupKey = tuple[Literal["namespaced"], str, str]
@@ -15,7 +18,42 @@ FunctionToolLookupKey = (
     | NamespacedFunctionToolLookupKey
     | DeferredTopLevelFunctionToolLookupKey
 )
+HostedMCPApprovalIdentity = tuple[Literal["hosted_mcp"], str, str]
+HostedMCPApprovalCallIdentity = tuple[Literal["hosted_mcp_call"], str]
+HostedMCPApprovalQueryIdentity = tuple[Literal["hosted_mcp_query"], str, str]
+HostedMCPApprovalKey = (
+    HostedMCPApprovalIdentity | HostedMCPApprovalCallIdentity | HostedMCPApprovalQueryIdentity
+)
 NamedToolLookupKey = FunctionToolLookupKey | str
+
+
+@dataclass(frozen=True)
+class HostedMCPApprovalRequestIdentity:
+    """Validated identity fields from a hosted MCP approval request."""
+
+    request_id: str | None
+    server_label: str | None
+    tool_name: str | None
+
+    @property
+    def approval_identity(self) -> HostedMCPApprovalIdentity | None:
+        """Return the persistent identity when all required fields are available."""
+        if self.server_label is None or self.tool_name is None:
+            return None
+        return ("hosted_mcp", self.server_label, self.tool_name)
+
+
+def validate_function_tool_fallback_name(name: str) -> str:
+    """Return an API-safe generated tool name or require an explicit override."""
+    if 1 <= len(name) <= 64 and all(
+        char.isascii() and (char.isalnum() or char in {"_", "-"}) for char in name
+    ):
+        return name
+    raise UserError(
+        f"Cannot derive a function tool name from callable class {name!r}. Generated names must "
+        "contain only ASCII letters, digits, underscores, or hyphens and be at most 64 "
+        "characters. Pass name_override to function_tool()."
+    )
 
 
 class SerializedFunctionToolLookupKey(TypedDict, total=False):
@@ -31,6 +69,61 @@ def get_mapping_or_attr(value: Any, key: str) -> Any:
     if isinstance(value, dict):
         return value.get(key)
     return getattr(value, key, None)
+
+
+def _non_empty_string(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def get_hosted_mcp_approval_request_identity(
+    value: Any,
+) -> HostedMCPApprovalRequestIdentity | None:
+    """Return strictly validated identity fields for a hosted MCP approval request."""
+    raw_item = get_mapping_or_attr(value, "raw_item")
+    if raw_item is None:
+        raw_item = value
+
+    raw_type = get_mapping_or_attr(raw_item, "type")
+    if raw_type == "mcp_approval_request":
+        request = raw_item
+        request_id = _non_empty_string(get_mapping_or_attr(request, "id"))
+        tool_name = _non_empty_string(get_mapping_or_attr(request, "name"))
+    elif raw_type == "hosted_tool_call":
+        request = get_mapping_or_attr(raw_item, "provider_data")
+        if get_mapping_or_attr(request, "type") != "mcp_approval_request":
+            return None
+
+        provider_request_id = get_mapping_or_attr(request, "id")
+        if provider_request_id is None:
+            request_id = _non_empty_string(get_mapping_or_attr(raw_item, "call_id"))
+            if request_id is None:
+                request_id = _non_empty_string(get_mapping_or_attr(raw_item, "id"))
+        else:
+            request_id = _non_empty_string(provider_request_id)
+        tool_name = _non_empty_string(get_mapping_or_attr(request, "name"))
+        if tool_name is None:
+            tool_name = _non_empty_string(get_mapping_or_attr(raw_item, "name"))
+    else:
+        return None
+
+    return HostedMCPApprovalRequestIdentity(
+        request_id=request_id,
+        server_label=_non_empty_string(get_mapping_or_attr(request, "server_label")),
+        tool_name=tool_name,
+    )
+
+
+def get_tool_approval_item_call_id(value: Any) -> str | None:
+    """Return the canonical call ID for a tool approval item."""
+    hosted_request = get_hosted_mcp_approval_request_identity(value)
+    if hosted_request is not None:
+        return hosted_request.request_id
+
+    raw_item = get_mapping_or_attr(value, "raw_item")
+    if raw_item is None:
+        raw_item = value
+    call_id = get_mapping_or_attr(raw_item, "call_id") or get_mapping_or_attr(raw_item, "id")
+    return _non_empty_string(call_id)
 
 
 def tool_qualified_name(name: str | None, namespace: str | None = None) -> str | None:
@@ -191,6 +284,34 @@ def _remove_tool_call_namespace(tool_call: Any) -> Any:
     return tool_call
 
 
+def restore_tool_call_routing_identity(
+    tool_call: Any,
+    lookup_key: FunctionToolLookupKey | None,
+) -> Any:
+    """Fill an absent call namespace from a persisted lookup key."""
+    if lookup_key is None or get_tool_call_name(tool_call) != lookup_key[-1]:
+        return tool_call
+    if get_tool_call_namespace(tool_call) is not None or lookup_key[0] == "bare":
+        return tool_call
+
+    namespace = lookup_key[1]
+    if isinstance(tool_call, dict):
+        restored = dict(tool_call)
+        restored["namespace"] = namespace
+        return restored
+
+    model_dump = getattr(tool_call, "model_dump", None)
+    if callable(model_dump):
+        payload = model_dump(exclude_unset=True)
+        if isinstance(payload, dict):
+            payload["namespace"] = namespace
+            try:
+                return type(tool_call)(**payload)
+            except Exception:
+                return payload
+    return tool_call
+
+
 def has_function_tool_shape(tool: Any) -> bool:
     """Return True when the object looks like a FunctionTool instance."""
     return callable(getattr(tool, "on_invoke_tool", None)) and isinstance(
@@ -304,6 +425,130 @@ def validate_function_tool_namespace_shape(
         "Responses tool-search reserves the synthetic namespace "
         f"`{reserved_key}` for deferred top-level function tools. "
         "Rename the namespace or tool name to avoid ambiguous dispatch."
+    )
+
+
+def _format_tool_name_collision_message(
+    lookup_key: BareFunctionToolLookupKey,
+    entries: Sequence[tuple[str, int, Any]],
+) -> str:
+    """Build a detailed diagnostic for errors or unredacted warnings."""
+    derived_owners: dict[str, str] = {}
+    for entry_type, _, entry in entries:
+        identity_attribute = (
+            "_agent_tool_default_identity" if entry_type == "tool" else "_default_tool_identity"
+        )
+        default_identity = getattr(entry, identity_attribute, None)
+        if not (
+            isinstance(default_identity, tuple)
+            and len(default_identity) == 2
+            and all(isinstance(value, str) for value in default_identity)
+        ):
+            continue
+        agent_name, derived_tool_name = default_identity
+        current_tool_name = (
+            get_function_tool_public_name(entry)
+            if entry_type == "tool"
+            else getattr(entry, "tool_name", None)
+        )
+        if current_tool_name == derived_tool_name:
+            override_parameter = "tool_name" if entry_type == "tool" else "tool_name_override"
+            derived_owners.setdefault(agent_name, override_parameter)
+
+    if len(entries) == 2 and len(derived_owners) == 2:
+        (
+            (prior_agent_name, prior_override_parameter),
+            (agent_name, override_parameter),
+        ) = list(derived_owners.items())[:2]
+        if override_parameter == prior_override_parameter == "tool_name":
+            configuration_type = "agent tool"
+            name_label = "tool name"
+            override_instruction = "`tool_name=`"
+        elif override_parameter == prior_override_parameter == "tool_name_override":
+            configuration_type = "handoff"
+            name_label = "handoff tool name"
+            override_instruction = "`tool_name_override=`"
+        else:
+            configuration_type = "agent routing"
+            name_label = "tool name"
+            override_instruction = "`tool_name=` or `tool_name_override=`"
+        return (
+            f"Ambiguous {configuration_type} configuration: agents "
+            f"{prior_agent_name!r} and {agent_name!r} both derive the {name_label} "
+            f"`{lookup_key[1]}`. Pass an explicit {override_instruction} to one of them."
+        )
+
+    entry_types = {entry_type for entry_type, _, _ in entries}
+    if entry_types == {"tool"}:
+        return (
+            "Ambiguous function tool configuration: the tool name "
+            f"`{lookup_key[1]}` is used by multiple tools. Assign a unique routed name "
+            "to every colliding function tool with `name_override=`, `tool_name=`, or "
+            "a namespace."
+        )
+    if entry_types == {"handoff"}:
+        return (
+            "Ambiguous handoff configuration: the handoff tool name "
+            f"`{lookup_key[1]}` is used by multiple handoffs. Pass a unique "
+            "`tool_name_override=` to each handoff."
+        )
+    return (
+        "Ambiguous tool routing configuration: the tool name "
+        f"`{lookup_key[1]}` is used by both a function tool and a handoff. "
+        "Assign a unique routed name to every colliding function tool and handoff "
+        "with `name_override=`, `tool_name=`, `tool_name_override=`, or a namespace."
+    )
+
+
+def resolve_tool_name_collisions(
+    tools: Sequence[Any],
+    handoffs: Sequence[Any] = (),
+    *,
+    collision_policy: Literal["warn", "error"],
+) -> tuple[list[Any], list[Any]]:
+    """Resolve bare function-tool and handoff name collisions before model exposure."""
+    validate_function_tool_lookup_configuration(tools)
+
+    owners: dict[BareFunctionToolLookupKey, list[tuple[str, int, Any]]] = {}
+    for index, tool in enumerate(tools):
+        lookup_key = get_function_tool_lookup_key_for_tool(tool)
+        if lookup_key is not None and lookup_key[0] == "bare":
+            owners.setdefault(lookup_key, []).append(("tool", index, tool))
+
+    for index, handoff in enumerate(handoffs):
+        tool_name = getattr(handoff, "tool_name", None)
+        if isinstance(tool_name, str) and tool_name:
+            owners.setdefault(("bare", tool_name), []).append(("handoff", index, handoff))
+
+    retained_tool_indices = set(range(len(tools)))
+    retained_handoff_indices = set(range(len(handoffs)))
+    for lookup_key, entries in owners.items():
+        if len(entries) < 2:
+            continue
+
+        if collision_policy == "error":
+            raise UserError(_format_tool_name_collision_message(lookup_key, entries))
+        if _debug.DONT_LOG_TOOL_DATA:
+            logger.warning(
+                "Tool name collision detected. Assign unique routed tool names or enable tool "
+                "data logging for details."
+            )
+        else:
+            logger.warning("%s", _format_tool_name_collision_message(lookup_key, entries))
+
+        handoff_entries = [entry for entry in entries if entry[0] == "handoff"]
+        winner = handoff_entries[-1] if handoff_entries else entries[-1]
+        for entry_type, index, _ in entries:
+            if (entry_type, index) == (winner[0], winner[1]):
+                continue
+            if entry_type == "tool":
+                retained_tool_indices.discard(index)
+            else:
+                retained_handoff_indices.discard(index)
+
+    return (
+        [tool for index, tool in enumerate(tools) if index in retained_tool_indices],
+        [handoff for index, handoff in enumerate(handoffs) if index in retained_handoff_indices],
     )
 
 

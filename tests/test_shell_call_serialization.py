@@ -6,8 +6,8 @@ from agents.agent import Agent
 from agents.exceptions import ModelBehaviorError
 from agents.items import ToolCallOutputItem
 from agents.run_internal import run_loop
+from agents.testing import ScriptedModel
 from agents.tool import ShellCallOutcome, ShellCommandOutput
-from tests.fake_model import FakeModel
 
 
 def test_coerce_shell_call_reads_max_output_length() -> None:
@@ -21,6 +21,51 @@ def test_coerce_shell_call_reads_max_output_length() -> None:
     }
     result = run_loop.coerce_shell_call(tool_call)
     assert result.action.max_output_length == 512
+
+
+@pytest.mark.parametrize("timeout_key", ["timeout_ms", "timeoutMs", "timeout"])
+@pytest.mark.parametrize("timeout_value", [0, 0.0])
+def test_coerce_shell_call_treats_zero_timeout_as_unspecified(
+    timeout_key: str,
+    timeout_value: float,
+) -> None:
+    tool_call = {
+        "call_id": "shell-zero-timeout",
+        "action": {"commands": ["ls"], timeout_key: timeout_value},
+    }
+
+    result = run_loop.coerce_shell_call(tool_call)
+
+    assert result.action.timeout_ms is None
+
+
+@pytest.mark.parametrize("timeout_key", ["timeout_ms", "timeoutMs", "timeout"])
+def test_coerce_shell_call_preserves_positive_timeout(timeout_key: str) -> None:
+    tool_call = {
+        "call_id": "shell-positive-timeout",
+        "action": {"commands": ["ls"], timeout_key: 250},
+    }
+
+    result = run_loop.coerce_shell_call(tool_call)
+
+    assert result.action.timeout_ms == 250
+
+
+@pytest.mark.parametrize(
+    "timeout_value",
+    [-1, 0.5, False, "250"],
+)
+def test_coerce_shell_call_rejects_unsupported_timeout_values(timeout_value: object) -> None:
+    tool_call = {
+        "call_id": "shell-invalid-timeout",
+        "action": {"commands": ["ls"], "timeout_ms": timeout_value},
+    }
+
+    with pytest.raises(
+        ModelBehaviorError,
+        match="Shell call action timeout must be a positive integer",
+    ):
+        run_loop.coerce_shell_call(tool_call)
 
 
 def test_coerce_shell_call_requires_commands() -> None:
@@ -77,7 +122,7 @@ def test_serialize_shell_output_emits_canonical_outcome() -> None:
 
 
 def test_shell_rejection_payload_preserves_missing_exit_code() -> None:
-    agent = Agent(name="tester", model=FakeModel())
+    agent = Agent(name="tester", model=ScriptedModel())
     raw_item = {
         "type": "shell_call_output",
         "call_id": "call-1",
@@ -103,7 +148,7 @@ def test_shell_rejection_payload_preserves_missing_exit_code() -> None:
 
 
 def test_shell_output_preserves_zero_exit_code() -> None:
-    agent = Agent(name="tester", model=FakeModel())
+    agent = Agent(name="tester", model=ScriptedModel())
     raw_item = {
         "type": "shell_call_output",
         "call_id": "call-2",

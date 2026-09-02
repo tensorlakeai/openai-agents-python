@@ -38,6 +38,8 @@ _INCLUDED_MEMORY_ITEM_TYPES = frozenset(
         "mcp_approval_request",
         "mcp_approval_response",
         "mcp_call",
+        "program",
+        "program_output",
         "shell_call",
         "shell_call_output",
         "tool_search_call",
@@ -196,6 +198,14 @@ def terminal_metadata_for_exception(exc: BaseException) -> RolloutTerminalMetada
     )
 
 
+def _serialize_interruption_raw_item(raw_item: Any) -> Any:
+    if isinstance(raw_item, BaseModel):
+        return _to_dump_compatible(raw_item.model_dump(exclude_unset=True))
+    if isinstance(raw_item, dict):
+        return dict(raw_item)
+    return _to_dump_compatible(raw_item)
+
+
 def build_rollout_payload(
     *,
     input: str | list[TResponseInputItem],
@@ -210,10 +220,7 @@ def build_rollout_payload(
     )
 
     serialized_interruptions = [
-        _to_dump_compatible(interruption.raw_item)
-        if not isinstance(interruption.raw_item, dict)
-        else dict(interruption.raw_item)
-        for interruption in interruptions
+        _serialize_interruption_raw_item(interruption.raw_item) for interruption in interruptions
     ]
 
     payload: dict[str, Any] = {

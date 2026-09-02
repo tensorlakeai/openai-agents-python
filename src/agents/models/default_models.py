@@ -62,6 +62,10 @@ _GPT_5_DEFAULT_REASONING_EFFORT_PATTERNS: tuple[
     (re.compile(r"^gpt-5\.4-mini(?:-\d{4}-\d{2}-\d{2})?$"), "none"),
     (re.compile(r"^gpt-5\.4-nano(?:-\d{4}-\d{2}-\d{2})?$"), "none"),
     (re.compile(r"^gpt-5\.5(?:-\d{4}-\d{2}-\d{2})?$"), "none"),
+    (re.compile(r"^gpt-5\.6(?:-\d{4}-\d{2}-\d{2})?$"), "none"),
+    (re.compile(r"^gpt-5\.6-sol(?:-\d{4}-\d{2}-\d{2})?$"), "none"),
+    (re.compile(r"^gpt-5\.6-terra(?:-\d{4}-\d{2}-\d{2})?$"), "none"),
+    (re.compile(r"^gpt-5\.6-luna(?:-\d{4}-\d{2}-\d{2})?$"), "none"),
 )
 
 
@@ -96,7 +100,7 @@ def get_default_model() -> str:
     """
     Returns the default model name.
     """
-    return os.getenv(OPENAI_DEFAULT_MODEL_ENV_VARIABLE_NAME, "gpt-5.4-mini").lower()
+    return os.getenv(OPENAI_DEFAULT_MODEL_ENV_VARIABLE_NAME, "gpt-5.6-luna").lower()
 
 
 def get_default_model_settings(model: str | None = None) -> ModelSettings:

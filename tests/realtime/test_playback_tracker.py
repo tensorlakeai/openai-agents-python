@@ -1,6 +1,7 @@
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
+from openai.types.realtime.realtime_audio_formats import AudioPCM, AudioPCMA, AudioPCMU
 
 from agents.realtime._default_tracker import ModelAudioTracker
 from agents.realtime.model import RealtimePlaybackTracker
@@ -96,7 +97,75 @@ class TestPlaybackTracker:
             if getattr(call.args[0], "type", None) == "conversation.item.truncate"
         ]
         assert truncate_events
-        assert truncate_events[0].audio_end_ms == 2000
+        # The truncation point stays within the audio the client actually received.
+        assert truncate_events[0].audio_end_ms == 1000
+
+    @pytest.mark.asyncio
+    async def test_interrupt_clamps_truncate_to_received_audio_while_response_ongoing(self, model):
+        """Default timing must not truncate past the audio the client received.
+
+        Without a custom playback tracker the elapsed time is wall clock since the first
+        audio delta, so it outgrows the received audio whenever the model pauses between
+        deltas. The Realtime API rejects a truncate whose ``audio_end_ms`` exceeds the
+        item's audio duration, so the value has to be clamped.
+        """
+        model._ongoing_response = True
+        model._send_raw_message = AsyncMock()
+        model._audio_state_tracker.set_audio_format("pcm16")
+
+        # 48_000 bytes of PCM16 at 24kHz equals ~1000ms of audio.
+        with patch("agents.realtime._default_tracker.time.monotonic", return_value=100.0):
+            model._audio_state_tracker.on_audio_delta("item_1", 0, b"a" * 48_000)
+
+        with patch("agents.realtime.openai_realtime.time.monotonic", return_value=105.0):
+            await model._send_interrupt(RealtimeModelSendInterrupt())
+
+        truncate_events = [
+            call.args[0]
+            for call in model._send_raw_message.await_args_list
+            if getattr(call.args[0], "type", None) == "conversation.item.truncate"
+        ]
+        assert truncate_events
+        assert truncate_events[0].audio_end_ms == 1000
+
+    @pytest.mark.asyncio
+    async def test_interrupt_matches_speech_started_truncation_point(self, model, monkeypatch):
+        """Explicit interrupts and VAD barge-in must truncate at the same point."""
+
+        async def truncate_ms_for(interrupt: bool) -> int:
+            fresh = OpenAIRealtimeWebSocketModel()
+            fresh._ongoing_response = True
+            send_raw = AsyncMock()
+            monkeypatch.setattr(fresh, "_send_raw_message", send_raw)
+            fresh._audio_state_tracker.set_audio_format("pcm16")
+
+            with patch("agents.realtime._default_tracker.time.monotonic", return_value=100.0):
+                fresh._audio_state_tracker.on_audio_delta("item_1", 0, b"a" * 48_000)
+
+            with patch("agents.realtime.openai_realtime.time.monotonic", return_value=105.0):
+                if interrupt:
+                    await fresh._send_interrupt(RealtimeModelSendInterrupt())
+                else:
+                    await fresh._handle_ws_event(
+                        {
+                            "type": "input_audio_buffer.speech_started",
+                            "event_id": "e1",
+                            "item_id": "item_1",
+                            "audio_start_ms": 0,
+                            "audio_end_ms": 0,
+                        }
+                    )
+
+            truncate_events = [
+                call.args[0]
+                for call in send_raw.await_args_list
+                if getattr(call.args[0], "type", None) == "conversation.item.truncate"
+            ]
+            assert truncate_events
+            audio_end_ms: int = truncate_events[0].audio_end_ms
+            return audio_end_ms
+
+        assert await truncate_ms_for(interrupt=True) == await truncate_ms_for(interrupt=False)
 
     def test_audio_delta_before_set_audio_format_does_not_raise(self):
         """ModelAudioTracker must tolerate audio deltas before a format is negotiated.
@@ -134,6 +203,19 @@ class TestPlaybackTracker:
         # Should accumulate: 8 bytes -> 4 samples -> (4 / 24000) * 1000 ≈ 0.167ms
         expected_length = (8 / (24_000 * 2)) * 1000
         assert state.audio_length_ms == pytest.approx(expected_length, rel=0, abs=1e-6)
+
+    def test_default_playback_timing_uses_monotonic_clock(self, model):
+        model._audio_state_tracker.set_audio_format("pcm16")
+
+        with patch("agents.realtime._default_tracker.time.monotonic", return_value=42.0):
+            model._audio_state_tracker.on_audio_delta("item_1", 0, b"test")
+
+        with patch("agents.realtime.openai_realtime.time.monotonic", return_value=42.25):
+            state = model._get_playback_state()
+
+        assert state["current_item_id"] == "item_1"
+        assert state["current_item_content_index"] == 0
+        assert state["elapsed_ms"] == pytest.approx(250.0)
 
     def test_state_cleanup_on_interruption(self):
         """Test both trackers properly reset state on interruption."""
@@ -178,3 +260,48 @@ class TestPlaybackTracker:
         # Test None format (defaults to PCM)
         none_length = calculate_audio_length_ms(None, pcm_bytes)
         assert none_length == pytest.approx(expected_pcm, rel=0, abs=1e-6)
+
+    @pytest.mark.parametrize(
+        "audio_format",
+        [
+            AudioPCMU(type="audio/pcmu"),
+            AudioPCMA(type="audio/pcma"),
+            {"type": "audio/pcmu"},
+            {"type": "audio/pcma"},
+            "audio/pcmu",
+            "audio/pcma",
+        ],
+        ids=["typed-ulaw", "typed-alaw", "mapping-ulaw", "mapping-alaw", "str-ulaw", "str-alaw"],
+    )
+    def test_g711_length_is_correct_for_every_format_spelling(self, audio_format):
+        """G.711 is one byte per sample at 8 kHz regardless of how the format is spelled.
+
+        Only the legacy `"g711_*"` strings were recognized, so the GA wire-format mapping and
+        the typed objects fell through to PCM16 math: 2 bytes per sample at 24 kHz, a 6x
+        shorter duration. That skews playback and interruption tracking for telephony
+        sessions, which are exactly the sessions that use G.711.
+        """
+        from agents.realtime._util import calculate_audio_length_ms
+
+        # 8000 bytes of G.711 is exactly one second of audio.
+        assert calculate_audio_length_ms(audio_format, b"\x00" * 8000) == 1000.0
+
+    @pytest.mark.parametrize(
+        "audio_format",
+        [AudioPCM(type="audio/pcm", rate=24000), {"type": "audio/pcm"}, "audio/pcm"],
+        ids=["typed", "mapping", "str"],
+    )
+    def test_pcm_spellings_keep_pcm16_math(self, audio_format):
+        from agents.realtime._util import calculate_audio_length_ms
+
+        # 48000 bytes of PCM16 at 24 kHz is exactly one second of audio.
+        assert calculate_audio_length_ms(audio_format, b"\x00" * 48000) == 1000.0
+
+    def test_playback_tracker_measures_g711_with_a_typed_format(self):
+        """End to end: a tracker configured with the GA typed format reports 8 kHz progress."""
+        playback_tracker = RealtimePlaybackTracker()
+        playback_tracker.set_audio_format(AudioPCMU(type="audio/pcmu"))
+
+        playback_tracker.on_play_bytes("item_1", 0, b"\x00" * 4000)
+
+        assert playback_tracker.get_state()["elapsed_ms"] == 500.0

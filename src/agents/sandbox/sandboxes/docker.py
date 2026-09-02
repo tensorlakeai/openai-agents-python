@@ -3,6 +3,7 @@ import errno
 import hashlib
 import io
 import logging
+import os
 import re
 import socket
 import tarfile
@@ -11,7 +12,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,7 +25,13 @@ from docker.api.container import DEFAULT_DATA_CHUNK_SIZE  # type: ignore[import-
 from docker.models.containers import Container  # type: ignore[import-untyped]
 from docker.types import DriverConfig, Mount as DockerSDKMount  # type: ignore[import-untyped]
 from docker.utils import parse_repository_tag
+from pydantic import Field, model_validator
+from typing_extensions import Self
 
+from .._mount_security import (
+    _manifest_has_configured_mount_authority,
+    redact_mount_error_data,
+)
 from ..entries import (
     Mount,
     resolve_workspace_path,
@@ -42,13 +49,13 @@ from ..errors import (
     ExposedPortUnavailableError,
     WorkspaceArchiveReadError,
     WorkspaceArchiveWriteError,
-    WorkspaceReadNotFoundError,
 )
 from ..manifest import Manifest
 from ..session import SandboxSession, SandboxSessionState
 from ..session.base_sandbox_session import BaseSandboxSession
 from ..session.dependencies import Dependencies
 from ..session.manager import Instrumentation
+from ..session.pty_output import collect_pty_output
 from ..session.pty_types import (
     PTY_PROCESSES_MAX,
     PTY_PROCESSES_WARNING,
@@ -57,7 +64,6 @@ from ..session.pty_types import (
     clamp_pty_yield_time_ms,
     process_id_to_prune_from_meta,
     resolve_pty_write_yield_time_ms,
-    truncate_text_by_tokens,
 )
 from ..session.runtime_helpers import RESOLVE_WORKSPACE_PATH_HELPER, RuntimeHelperScript
 from ..session.sandbox_client import BaseSandboxClient, BaseSandboxClientOptions
@@ -75,6 +81,7 @@ from ..workspace_paths import (
     coerce_posix_path,
     posix_path_as_path,
     posix_path_for_error,
+    sandbox_path_grant_host_path,
     sandbox_path_str,
 )
 
@@ -84,6 +91,73 @@ _DOCKER_EXECUTOR: Final = ThreadPoolExecutor(
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Non-seekable payloads are spooled to measure their length; keep small ones in
+# RAM and spill larger ones to a temp file so a big upload can't OOM the process.
+_STREAM_SPOOL_MAX_SIZE = 16 * 1024 * 1024
+_DEFERRED_CLEANUP_TIMEOUT_S = 30.0
+
+
+def _measure_stream(stream: io.IOBase) -> tuple[int, io.IOBase, io.IOBase | None]:
+    """Return ``(length, readable_stream, spool_to_close)`` for a length-framed write.
+
+    Seekable streams are measured in place (and rewound); ``spool_to_close`` is
+    ``None``. Non-seekable streams (e.g. an HTTP response body or pipe) are copied
+    into a ``SpooledTemporaryFile`` — kept in memory up to
+    ``_STREAM_SPOOL_MAX_SIZE``, spilled to disk beyond it — so the byte length can
+    be determined without buffering the whole payload in RAM; the spool is returned
+    so the caller can close it.
+
+    Callers run this on the executor thread, never the event loop.
+    """
+    try:
+        start = stream.tell()
+        stream.seek(0, io.SEEK_END)
+        end = stream.tell()
+        stream.seek(start)
+        # Clamp to 0: a stream positioned past its end has no readable bytes, and
+        # a negative count would become `head -c -N` ("all but the last N bytes"),
+        # which reads to EOF and re-hangs over a TLS stdin.
+        return max(0, end - start), stream, None
+    except (AttributeError, OSError, ValueError):
+        spool: Any = tempfile.SpooledTemporaryFile(max_size=_STREAM_SPOOL_MAX_SIZE)
+        try:
+            length = 0
+            while True:
+                chunk = stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                if isinstance(chunk, str):
+                    chunk = chunk.encode("utf-8")
+                length += len(chunk)
+                spool.write(chunk)
+            spool.seek(0)
+            return length, spool, spool
+        except BaseException:
+            # The caller only closes the spool once it is returned; on any error
+            # here it never receives it, so close it now to avoid a leaked temp
+            # file / buffer.
+            spool.close()
+            raise
+
+
+# POSIX sh that pipes exactly ``<n>`` bytes into the real command (``"$@"``).
+# ``head -c`` bounds the read so completion never depends on a stdin half-close
+# (unreliable over a TLS DOCKER_HOST). A bare ``head -c "$n" | "$@"`` pipeline
+# reports only the *consumer's* status, so if ``head`` can't produce the bytes —
+# missing entirely, or a POSIX-only ``head`` that rejects ``-c`` (POSIX specifies
+# only ``-n``) — the consumer (``cat``/``tar``) would see an empty pipe, exit 0,
+# and the write would "succeed" after creating/truncating an empty file. Preflight
+# ``head -c`` on known input and bail out (exit 98) unless it yields the expected
+# byte, so such writes surface as errors instead of silent data loss. The check
+# needs no writable path (avoiding a predictable /tmp status file that untrusted
+# container code could pre-seed as a symlink for the root exec to follow) and no
+# ``pipefail`` (not POSIX; dash lacks it).
+_LENGTH_FRAMED_STDIN_SCRIPT = (
+    'n=$1; shift; [ "$(printf ab | head -c 1 2>/dev/null)" = a ] || exit 98; head -c "$n" | "$@"'
+)
+
 
 _PREPARE_USER_PTY_PID_SCRIPT = (
     'pid_path="$1"\n'
@@ -97,16 +171,59 @@ _PREPARE_USER_PTY_PID_SCRIPT = (
 )
 
 
+def _validate_docker_network_configuration(
+    *,
+    network_mode: Literal["none"] | None,
+    exposed_ports: tuple[int, ...],
+) -> None:
+    if network_mode == "none" and exposed_ports:
+        raise ValueError("exposed_ports cannot be used when network_mode='none'")
+
+
 class DockerSandboxSessionState(SandboxSessionState):
     type: Literal["docker"] = "docker"
     image: str
     container_id: str
+    network_mode: Literal["none"] | None = None
+    labels: dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate_network_configuration(self) -> Self:
+        _validate_docker_network_configuration(
+            network_mode=self.network_mode,
+            exposed_ports=self.exposed_ports,
+        )
+        return self
+
+    def _sanitize_persisted_provider_identity(
+        self,
+        data: dict[str, Any],
+        *,
+        mount_authority_redacted: bool,
+    ) -> None:
+        if mount_authority_redacted:
+            data["container_id"] = ""
+            data["session_id"] = uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"openai-agents:mount-authority-redacted:{self.session_id}",
+            )
+            data["workspace_root_ready"] = False
 
 
 class DockerSandboxClientOptions(BaseSandboxClientOptions):
     type: Literal["docker"] = "docker"
     image: str
     exposed_ports: tuple[int, ...] = ()
+    network_mode: Literal["none"] | None = None
+    labels: dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate_network_configuration(self) -> Self:
+        _validate_docker_network_configuration(
+            network_mode=self.network_mode,
+            exposed_ports=self.exposed_ports,
+        )
+        return self
 
     def __init__(
         self,
@@ -114,11 +231,15 @@ class DockerSandboxClientOptions(BaseSandboxClientOptions):
         exposed_ports: tuple[int, ...] = (),
         *,
         type: Literal["docker"] = "docker",
+        network_mode: Literal["none"] | None = None,
+        labels: dict[str, str] | None = None,
     ) -> None:
         super().__init__(
             type=type,
             image=image,
             exposed_ports=exposed_ports,
+            network_mode=network_mode,
+            labels={} if labels is None else labels,
         )
 
 
@@ -164,6 +285,7 @@ class DockerSandboxSession(BaseSandboxSession):
     _pty_lock: asyncio.Lock
     _pty_processes: dict[int, _DockerPtyProcessEntry]
     _reserved_pty_process_ids: set[int]
+    _cleanup_tasks: set[asyncio.Task[None]]
 
     state: DockerSandboxSessionState
     _ARCHIVE_STAGING_DIR: Path = posix_path_as_path(
@@ -185,6 +307,7 @@ class DockerSandboxSession(BaseSandboxSession):
         self._pty_lock = asyncio.Lock()
         self._pty_processes = {}
         self._reserved_pty_process_ids = set()
+        self._cleanup_tasks = set()
 
     @classmethod
     def from_state(
@@ -410,6 +533,13 @@ class DockerSandboxSession(BaseSandboxSession):
         self._workspace_root_ready = True
         self._resume_workspace_probe_pending = False
 
+    async def _after_stop(self) -> None:
+        await self._wait_for_cleanup_tasks()
+
+    async def _before_shutdown(self) -> None:
+        await super()._before_shutdown()
+        await self._wait_for_cleanup_tasks()
+
     def _mark_workspace_root_ready_from_probe(self) -> None:
         super()._mark_workspace_root_ready_from_probe()
         self._workspace_root_ready = True
@@ -562,57 +692,103 @@ class DockerSandboxSession(BaseSandboxSession):
         error_path: Path,
         user: str | User | None = None,
     ) -> None:
+        # Frame the payload by length so the in-container reader terminates on a
+        # byte count rather than a stdin half-close. Docker's exec-attach stream
+        # does not carry a reliable stdin EOF over a TLS DOCKER_HOST: the
+        # ``shutdown(SHUT_WR)`` below is silently swallowed, so ``tar -x`` / ``cat``
+        # would block forever waiting for input that never ends (observed against
+        # Docker-in-Docker sidecars and remote daemons reached over TLS). Piping
+        # the real command through ``head -c <n>`` makes it stop after exactly
+        # ``<n>`` bytes, independent of transport, and keeps the deliberate
+        # avoidance of ``put_archive()`` (see ``write``) intact.
         def _write() -> int | None:
             container_client = self._container.client
             assert container_client is not None
             api = container_client.api
-            resp = api.exec_create(
-                self._container.id,
-                cmd,
-                stdin=True,
-                stdout=True,
-                stderr=True,
-                workdir=None,
-                user=self._coerce_exec_user(user) or "",
-            )
-            exec_socket = self._start_exec_socket(api=api, exec_id=cast(str, resp["Id"]))
-            sock = exec_socket.sock
-            raw_sock = exec_socket.raw_sock
+
+            # Measure/spool on this executor thread (never the event loop). A
+            # non-seekable stream is spooled to a SpooledTemporaryFile (bounded
+            # memory, then disk) rather than read whole into RAM.
+            payload_length, read_stream, spool = _measure_stream(stream)
             try:
-                while True:
-                    chunk = stream.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    if isinstance(chunk, str):
-                        chunk = chunk.encode("utf-8")
-                    elif not isinstance(chunk, bytes):
-                        chunk = bytes(chunk)
-                    if hasattr(raw_sock, "sendall"):
-                        raw_sock.sendall(chunk)
-                    else:
-                        cast(Any, sock).write(chunk)
-
+                framed_cmd = [
+                    "sh",
+                    "-c",
+                    _LENGTH_FRAMED_STDIN_SCRIPT,
+                    "sh",
+                    str(payload_length),
+                    *cmd,
+                ]
+                resp = api.exec_create(
+                    self._container.id,
+                    framed_cmd,
+                    stdin=True,
+                    stdout=True,
+                    stderr=True,
+                    workdir=None,
+                    user=self._coerce_exec_user(user) or "",
+                )
+                exec_socket = self._start_exec_socket(api=api, exec_id=cast(str, resp["Id"]))
+                sock = exec_socket.sock
+                raw_sock = exec_socket.raw_sock
                 try:
-                    if hasattr(raw_sock, "shutdown"):
-                        raw_sock.shutdown(socket.SHUT_WR)
-                    else:
-                        cast(Any, sock).flush()
-                except Exception:
-                    pass
+                    # Send exactly ``payload_length`` bytes — the count the exec
+                    # was framed with (``head -c "$n"``). Reading to EOF instead
+                    # would desync if the stream changed after _measure_stream:
+                    # extra bytes would pile up behind a ``head`` that already
+                    # stopped, and a short read would leave ``head`` blocked on a
+                    # TLS stdin that never EOFs (the original hang). If the stream
+                    # ends early we fail loudly rather than truncate silently.
+                    remaining = payload_length
+                    while remaining > 0:
+                        chunk = read_stream.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            raise WorkspaceArchiveWriteError(
+                                path=error_path,
+                                context={
+                                    "reason": "stream_shorter_than_measured",
+                                    "expected": str(payload_length),
+                                    "sent": str(payload_length - remaining),
+                                },
+                            )
+                        if isinstance(chunk, str):
+                            chunk = chunk.encode("utf-8")
+                        elif not isinstance(chunk, bytes):
+                            chunk = bytes(chunk)
+                        if len(chunk) > remaining:
+                            # Only reachable for multibyte text streams (never the
+                            # byte streams these writes use); cap to the framed count.
+                            chunk = chunk[:remaining]
+                        if hasattr(raw_sock, "sendall"):
+                            raw_sock.sendall(chunk)
+                        else:
+                            cast(Any, sock).write(chunk)
+                        remaining -= len(chunk)
 
-                try:
-                    if hasattr(raw_sock, "recv"):
-                        while raw_sock.recv(1024 * 1024):
-                            pass
-                    else:
-                        while cast(Any, sock).read(1024 * 1024):
-                            pass
-                except Exception:
-                    pass
+                    try:
+                        if hasattr(raw_sock, "shutdown"):
+                            raw_sock.shutdown(socket.SHUT_WR)
+                        else:
+                            cast(Any, sock).flush()
+                    except Exception:
+                        pass
+
+                    try:
+                        if hasattr(raw_sock, "recv"):
+                            while raw_sock.recv(1024 * 1024):
+                                pass
+                        else:
+                            while cast(Any, sock).read(1024 * 1024):
+                                pass
+                    except Exception:
+                        pass
+                finally:
+                    exec_socket.close()
+
+                return cast(int | None, api.exec_inspect(resp["Id"]).get("ExitCode"))
             finally:
-                exec_socket.close()
-
-            return cast(int | None, api.exec_inspect(resp["Id"]).get("ExitCode"))
+                if spool is not None:
+                    spool.close()
 
         loop = asyncio.get_running_loop()
         try:
@@ -666,13 +842,12 @@ class DockerSandboxSession(BaseSandboxSession):
         workspace_path_arg = sandbox_path_str(workspace_path)
         res = await self.exec("cat", "--", workspace_path_arg, shell=False, user=user)
         if not res.ok():
-            raise WorkspaceReadNotFoundError(
+            await self._raise_read_error_from_exec(
                 path=path,
-                context={
-                    "command": ["cat", "--", workspace_path_arg],
-                    "stdout": res.stdout.decode("utf-8", errors="replace"),
-                    "stderr": res.stderr.decode("utf-8", errors="replace"),
-                },
+                workspace_path=workspace_path,
+                command=("cat", "--", workspace_path_arg),
+                result=res,
+                user=user,
             )
         return io.BytesIO(res.stdout)
 
@@ -1068,36 +1243,14 @@ class DockerSandboxSession(BaseSandboxSession):
         yield_time_ms: int,
         max_output_tokens: int | None,
     ) -> tuple[bytes, int | None]:
-        deadline = time.monotonic() + (yield_time_ms / 1000)
-        output = bytearray()
-
-        while True:
-            async with entry.output_lock:
-                while entry.output_chunks:
-                    output.extend(entry.output_chunks.popleft())
-
-            if time.monotonic() >= deadline:
-                break
-
-            if entry.output_closed.is_set():
-                async with entry.output_lock:
-                    while entry.output_chunks:
-                        output.extend(entry.output_chunks.popleft())
-                break
-
-            remaining_s = deadline - time.monotonic()
-            if remaining_s <= 0:
-                break
-
-            try:
-                await asyncio.wait_for(entry.output_notify.wait(), timeout=remaining_s)
-            except asyncio.TimeoutError:
-                break
-            entry.output_notify.clear()
-
-        text = output.decode("utf-8", errors="replace")
-        truncated_text, original_token_count = truncate_text_by_tokens(text, max_output_tokens)
-        return truncated_text.encode("utf-8", errors="replace"), original_token_count
+        return await collect_pty_output(
+            output_chunks=entry.output_chunks,
+            output_lock=entry.output_lock,
+            output_notify=entry.output_notify,
+            is_done=entry.output_closed.is_set,
+            yield_time_ms=yield_time_ms,
+            max_output_tokens=max_output_tokens,
+        )
 
     async def _finalize_pty_update(
         self,
@@ -1202,6 +1355,7 @@ class DockerSandboxSession(BaseSandboxSession):
         except docker.errors.NotFound:
             return False
 
+    @redact_mount_error_data
     @retry_async(
         retry_if=lambda exc, self: exception_chain_has_status_code(exc, TRANSIENT_HTTP_STATUS_CODES)
     )
@@ -1219,10 +1373,21 @@ class DockerSandboxSession(BaseSandboxSession):
             )
             return strip_tar_member_prefix(root_prefixed_archive, prefix=staging_workspace.name)
         except docker.errors.NotFound as e:
-            raise WorkspaceArchiveReadError(path=error_root, cause=e) from e
+            raise WorkspaceArchiveReadError(path=error_root, cause=e, retryable=False) from e
         except docker.errors.APIError as e:
-            raise WorkspaceArchiveReadError(path=error_root, cause=e) from e
+            status_code = getattr(e, "status_code", None)
+            retryable = (
+                True
+                if isinstance(status_code, int) and status_code in TRANSIENT_HTTP_STATUS_CODES
+                else None
+            )
+            raise WorkspaceArchiveReadError(
+                path=error_root,
+                cause=e,
+                retryable=retryable,
+            ) from e
 
+    @redact_mount_error_data
     async def hydrate_workspace(self, data: io.IOBase) -> None:
         root = self._workspace_root_path()
         error_root = posix_path_for_error(root)
@@ -1266,13 +1431,30 @@ class DockerSandboxSession(BaseSandboxSession):
             archive.seek(0)
             await self._stream_into_exec(
                 cmd=["tar", "-x", "-C", root.as_posix()],
-                stream=archive,
+                stream=cast(io.IOBase, archive),
                 error_path=error_root,
             )
 
     def _schedule_rm_best_effort(self, path: Path) -> None:
         loop = asyncio.get_running_loop()
-        loop.create_task(self._rm_best_effort(path))
+        task = loop.create_task(self._rm_best_effort(path))
+        self._cleanup_tasks.add(task)
+        task.add_done_callback(self._cleanup_tasks.discard)
+
+    async def _wait_for_cleanup_tasks(self) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _DEFERRED_CLEANUP_TIMEOUT_S
+        while cleanup_tasks := tuple(self._cleanup_tasks):
+            remaining_s = deadline - loop.time()
+            if remaining_s <= 0:
+                break
+            done, pending = await asyncio.wait(cleanup_tasks, timeout=remaining_s)
+            self._cleanup_tasks.difference_update(done)
+            if pending:
+                break
+
+        for task in tuple(self._cleanup_tasks):
+            task.cancel()
 
     def _workspace_archive_stream(
         self,
@@ -1330,9 +1512,12 @@ class DockerSandboxClient(BaseSandboxClient[DockerSandboxClientOptions]):
     ) -> None:
         super().__init__()
         self.docker_client = docker_client
-        self._instrumentation = instrumentation or Instrumentation()
+        self._instrumentation = (
+            instrumentation if instrumentation is not None else Instrumentation()
+        )
         self._dependencies = dependencies
 
+    @redact_mount_error_data
     async def create(
         self,
         *,
@@ -1342,36 +1527,68 @@ class DockerSandboxClient(BaseSandboxClient[DockerSandboxClientOptions]):
     ) -> SandboxSession:
         image = options.image
         session_id = uuid.uuid4()
-        manifest = manifest or Manifest()
+        manifest = manifest if manifest is not None else Manifest()
+        self._validate_manifest_for_create(manifest)
+        _validate_docker_path_grants(manifest)
+        volume_names = _docker_volume_names_for_manifest(manifest, session_id=session_id)
+        container: Container | None = None
+        try:
+            container = await self._create_container(
+                image,
+                manifest=manifest,
+                exposed_ports=options.exposed_ports,
+                network_mode=options.network_mode,
+                session_id=session_id,
+                labels=options.labels,
+            )
+            container.start()
+            container_id = container.id
+            assert container_id is not None
+            snapshot_id = str(session_id)
+            snapshot_instance = resolve_snapshot(snapshot, snapshot_id)
+            state = DockerSandboxSessionState(
+                session_id=session_id,
+                manifest=manifest,
+                image=image,
+                snapshot=snapshot_instance,
+                container_id=container_id,
+                exposed_ports=options.exposed_ports,
+                network_mode=options.network_mode,
+                labels=options.labels,
+            )
+            inner = DockerSandboxSession(
+                docker_client=self.docker_client,
+                container=container,
+                state=state,
+            )
+            return self._wrap_session(inner, instrumentation=self._instrumentation)
+        except BaseException:
+            self._cleanup_failed_create_resources(
+                container=container,
+                volume_names=volume_names,
+            )
+            raise
 
-        container = await self._create_container(
-            image,
-            manifest=manifest,
-            exposed_ports=options.exposed_ports,
-            session_id=session_id,
-        )
-        container.start()
+    def _cleanup_failed_create_resources(
+        self,
+        *,
+        container: Container | None,
+        volume_names: Iterable[str],
+    ) -> None:
+        """Best-effort cleanup when Docker resource acquisition does not return a session."""
 
-        container_id = container.id
-        assert container_id is not None
-        snapshot_id = str(session_id)
-        snapshot_instance = resolve_snapshot(snapshot, snapshot_id)
-        state = DockerSandboxSessionState(
-            session_id=session_id,
-            manifest=manifest,
-            image=image,
-            snapshot=snapshot_instance,
-            container_id=container_id,
-            exposed_ports=options.exposed_ports,
-        )
+        if container is not None:
+            try:
+                container.remove(force=True)
+            except Exception:
+                pass
+        for volume_name in volume_names:
+            try:
+                self.docker_client.volumes.get(volume_name).remove()
+            except Exception:
+                pass
 
-        inner = DockerSandboxSession(
-            docker_client=self.docker_client,
-            container=container,
-            state=state,
-        )
-        return self._wrap_session(inner, instrumentation=self._instrumentation)
-
+    @redact_mount_error_data
     async def delete(self, session: SandboxSession) -> SandboxSession:
         inner = session._inner
         if not isinstance(inner, DockerSandboxSession):
@@ -1380,59 +1597,123 @@ class DockerSandboxClient(BaseSandboxClient[DockerSandboxClientOptions]):
             inner.state.manifest,
             session_id=inner.state.session_id,
         )
+        cleanup_error: BaseException | None = None
+        try:
+            await inner.shutdown()
+        except BaseException as exc:
+            cleanup_error = exc
+
         try:
             container = self.docker_client.containers.get(inner.state.container_id)
         except docker.errors.NotFound:
             container = None
+        except BaseException as exc:
+            container = None
+            if cleanup_error is None:
+                cleanup_error = exc
         else:
-            # Ensure teardown happens before removal.
-            try:
-                await inner.shutdown()
-            except Exception:
-                pass
             try:
                 container.remove()
             except docker.errors.NotFound:
                 pass
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
 
         for volume_name in volume_names:
             try:
                 volume = self.docker_client.volumes.get(volume_name)
             except docker.errors.NotFound:
                 continue
-            volume.remove()
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+                continue
+            try:
+                volume.remove()
+            except docker.errors.NotFound:
+                continue
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+        if cleanup_error is not None:
+            raise cleanup_error from None
         return session
 
+    @redact_mount_error_data
     async def resume(
         self,
         state: SandboxSessionState,
     ) -> SandboxSession:
         if not isinstance(state, DockerSandboxSessionState):
             raise TypeError("DockerSandboxClient.resume expects a DockerSandboxSessionState")
-        container = self.get_container(state.container_id)
+        state.assert_path_grants_rebound()
+        _validate_docker_path_grants(state.manifest)
+        configured_authority = _manifest_has_configured_mount_authority(state.manifest)
+        requires_fresh_resource = state.mount_authority_rebound or configured_authority
+        container = None if requires_fresh_resource else self.get_container(state.container_id)
         reused_existing_container = container is not None
-        if container is None:
-            container = await self._create_container(
-                state.image,
-                manifest=state.manifest,
-                exposed_ports=state.exposed_ports,
-                session_id=state.session_id,
+        if container is not None:
+            _assert_existing_container_path_grants_match(container, state.manifest)
+            _assert_existing_container_network_configuration_matches(
+                container,
+                state.network_mode,
             )
-            container_id = container.id
-            assert container_id is not None
-            state.container_id = container_id
-            state.workspace_root_ready = False
-
-        # Use the existing container (or the one we just created).
-        inner = DockerSandboxSession(
-            container=container, docker_client=self.docker_client, state=state
+            _assert_existing_container_labels_match(container, state.labels)
+        owns_replacement = container is None
+        replacement_session_id = (
+            uuid.uuid4()
+            if owns_replacement and (requires_fresh_resource or configured_authority)
+            else state.session_id
         )
-        inner._resume_workspace_probe_pending = True
-        inner._set_start_state_preserved(reused_existing_container)
-        return self._wrap_session(inner, instrumentation=self._instrumentation)
+        replacement_volume_names = (
+            _docker_volume_names_for_manifest(
+                state.manifest,
+                session_id=replacement_session_id,
+            )
+            if owns_replacement
+            else ()
+        )
+        replacement_volumes_prepared = False
+        original_container_id = state.container_id
+        original_session_id = state.session_id
+        original_workspace_root_ready = state.workspace_root_ready
+        try:
+            if container is None:
+                replacement_volumes_prepared = True
+                state.session_id = replacement_session_id
+                container = await self._create_container(
+                    state.image,
+                    manifest=state.manifest,
+                    exposed_ports=state.exposed_ports,
+                    network_mode=state.network_mode,
+                    session_id=replacement_session_id,
+                    labels=state.labels,
+                )
+                container_id = container.id
+                assert container_id is not None
+                state.container_id = container_id
+                state.workspace_root_ready = False
+
+            inner = DockerSandboxSession(
+                container=container, docker_client=self.docker_client, state=state
+            )
+            inner._resume_workspace_probe_pending = True
+            inner._set_start_state_preserved(reused_existing_container)
+            return self._wrap_session(inner, instrumentation=self._instrumentation)
+        except BaseException:
+            if owns_replacement:
+                state.container_id = original_container_id
+                state.session_id = original_session_id
+                state.workspace_root_ready = original_workspace_root_ready
+                self._cleanup_failed_create_resources(
+                    container=container,
+                    volume_names=(replacement_volume_names if replacement_volumes_prepared else ()),
+                )
+            raise
 
     def deserialize_session_state(self, payload: dict[str, object]) -> SandboxSessionState:
-        return DockerSandboxSessionState.model_validate(payload)
+        return self._deserialize_session_state_payload(payload, DockerSandboxSessionState)
 
     async def _create_container(
         self,
@@ -1440,8 +1721,12 @@ class DockerSandboxClient(BaseSandboxClient[DockerSandboxClientOptions]):
         *,
         manifest: Manifest | None = None,
         exposed_ports: tuple[int, ...] = (),
+        network_mode: Literal["none"] | None = None,
         session_id: uuid.UUID | None = None,
+        labels: dict[str, str] | None = None,
     ) -> Container:
+        if manifest is not None:
+            _validate_docker_path_grants(manifest)
         # create image if it does not exist
         if not self.image_exists(image):
             repo, tag = parse_repository_tag(image)
@@ -1449,7 +1734,7 @@ class DockerSandboxClient(BaseSandboxClient[DockerSandboxClientOptions]):
 
         assert self.image_exists(image)
         environment: dict[str, str] | None = None
-        if manifest:
+        if manifest is not None:
             environment = await manifest.environment.resolve()
         create_kwargs: dict[str, object] = {
             "entrypoint": ["tail"],
@@ -1458,6 +1743,10 @@ class DockerSandboxClient(BaseSandboxClient[DockerSandboxClientOptions]):
             "command": ["-f", "/dev/null"],
             "environment": environment,
         }
+        if network_mode is not None:
+            create_kwargs["network_mode"] = network_mode
+        if labels:
+            create_kwargs["labels"] = labels
         if manifest is not None:
             docker_mounts = _build_docker_volume_mounts(manifest, session_id=session_id)
             if docker_mounts:
@@ -1535,6 +1824,18 @@ def _build_docker_volume_mounts(
 ) -> list[DockerSDKMount]:
     mounts: list[DockerSDKMount] = []
 
+    for grant in manifest.extra_path_grants:
+        if grant.host_path is None:
+            continue
+        mounts.append(
+            DockerSDKMount(
+                target=grant.path,
+                source=str(sandbox_path_grant_host_path(grant)),
+                type="bind",
+                read_only=grant.read_only,
+            )
+        )
+
     for artifact, mount_path in _docker_volume_mounts_for_manifest(manifest):
         driver_config = artifact.mount_strategy.build_docker_volume_driver_config(artifact)
         assert driver_config is not None
@@ -1550,6 +1851,130 @@ def _build_docker_volume_mounts(
         )
 
     return mounts
+
+
+def _validate_docker_path_grants(manifest: Manifest) -> None:
+    root = coerce_posix_path(manifest.root)
+    seen_targets: set[str] = set()
+    explicit_targets: set[str] = set()
+    volume_targets = {
+        coerce_posix_path(mount_path).as_posix()
+        for _artifact, mount_path in _docker_volume_mounts_for_manifest(manifest)
+    }
+    for grant in manifest.extra_path_grants:
+        target = coerce_posix_path(grant.path)
+        target_str = target.as_posix()
+        if target_str in seen_targets and (
+            grant.host_path is not None or target_str in explicit_targets
+        ):
+            raise ValueError(f"duplicate Docker sandbox path grant target: {grant.path}")
+        seen_targets.add(target_str)
+        if grant.host_path is None:
+            continue
+        explicit_targets.add(target_str)
+        sandbox_path_grant_host_path(grant)
+        if target == root or root in target.parents or target in root.parents:
+            raise ValueError(
+                "Docker sandbox path grant host_path target must be outside "
+                f"the workspace root: {grant.path}"
+            )
+        if target_str in volume_targets:
+            raise ValueError(
+                f"Docker sandbox path grant target conflicts with a manifest mount: {grant.path}"
+            )
+
+
+def _assert_existing_container_network_configuration_matches(
+    container: Container,
+    network_mode: Literal["none"] | None,
+) -> None:
+    if network_mode is None:
+        return
+
+    container.reload()
+    attrs = getattr(container, "attrs", {}) or {}
+    host_config = attrs.get("HostConfig")
+    network_settings = attrs.get("NetworkSettings")
+    actual_network_mode = host_config.get("NetworkMode") if isinstance(host_config, dict) else None
+    networks = network_settings.get("Networks") if isinstance(network_settings, dict) else None
+    attached_networks = set(networks) if isinstance(networks, dict) else None
+
+    if actual_network_mode != "none" or attached_networks is None or attached_networks - {"none"}:
+        raise ValueError(
+            "Existing Docker sandbox network configuration does not match persisted "
+            "network_mode='none'; create a fresh sandbox session"
+        )
+
+
+def _assert_existing_container_labels_match(
+    container: Container,
+    labels: dict[str, str],
+) -> None:
+    if not labels:
+        return
+
+    container.reload()
+    attrs = getattr(container, "attrs", {}) or {}
+    config = attrs.get("Config")
+    actual_labels = config.get("Labels") if isinstance(config, dict) else None
+    actual_labels = actual_labels if isinstance(actual_labels, dict) else {}
+    if any(actual_labels.get(key) != value for key, value in labels.items()):
+        raise ValueError(
+            "Existing Docker sandbox labels do not match persisted labels; "
+            "create a fresh sandbox session"
+        )
+
+
+def _assert_existing_container_path_grants_match(
+    container: Container,
+    manifest: Manifest,
+) -> None:
+    container.reload()
+    raw_mounts = container.attrs.get("Mounts")
+    mounts = raw_mounts if isinstance(raw_mounts, list) else []
+    expected_grants = {
+        grant.path: grant for grant in manifest.extra_path_grants if grant.host_path is not None
+    }
+    actual_bind_mounts: dict[str, list[dict[object, object]]] = {}
+    for mount in mounts:
+        if not isinstance(mount, dict) or mount.get("Type") != "bind":
+            continue
+        destination = mount.get("Destination")
+        if not isinstance(destination, str):
+            raise ValueError(
+                "Existing Docker sandbox has a bind mount without a valid destination; "
+                "create a fresh sandbox session"
+            )
+        actual_bind_mounts.setdefault(destination, []).append(mount)
+
+    unexpected_targets = sorted(set(actual_bind_mounts) - set(expected_grants))
+    if unexpected_targets:
+        raise ValueError(
+            "Existing Docker sandbox has bind mounts that are not present in the current "
+            f"trusted manifest: {', '.join(unexpected_targets)}; create a fresh sandbox session"
+        )
+
+    for grant in expected_grants.values():
+        target_mounts = actual_bind_mounts.get(grant.path, [])
+        if len(target_mounts) != 1:
+            raise ValueError(
+                "Existing Docker sandbox path grant mount does not match the current trusted "
+                f"manifest for {grant.path!r}; create a fresh sandbox session"
+            )
+        expected_source = os.path.normcase(
+            os.path.normpath(str(sandbox_path_grant_host_path(grant)))
+        )
+        mount = target_mounts[0]
+        raw_source = mount.get("Source")
+        source = (
+            os.path.normcase(os.path.normpath(raw_source)) if isinstance(raw_source, str) else None
+        )
+        read_only = mount.get("RW") is False
+        if source != expected_source or read_only != grant.read_only:
+            raise ValueError(
+                "Existing Docker sandbox path grant mount does not match the current trusted "
+                f"manifest for {grant.path!r}; create a fresh sandbox session"
+            )
 
 
 def _docker_volume_names_for_manifest(

@@ -10,6 +10,7 @@ from typing import Any
 
 from ...exceptions import UserError
 from ...items import TResponseInputItem
+from ...logger import log_model_and_tool_action_error
 from ...run_config import RunConfig, SandboxRunConfig
 from ..capabilities.memory import Memory
 from ..config import MemoryGenerateConfig
@@ -130,11 +131,15 @@ class SandboxMemoryGenerationManager:
                 self._ensure_worker()
                 for rollout_file in rollout_files:
                     self._queue.put_nowait(rollout_file)
-                await self._queue.join()
                 if self._worker_task is not None:
                     self._queue.put_nowait(_STOP)
-                    await self._worker_task
-                    self._worker_task = None
+                    worker_task = self._worker_task
+                    try:
+                        # The stop marker follows every rollout, so worker completion implies
+                        # that all preceding rollout files were processed.
+                        await worker_task
+                    finally:
+                        self._worker_task = None
                 await self._run_phase_two()
             finally:
                 _unregister_memory_generation_manager(session=self._session, manager=self)
@@ -150,8 +155,8 @@ class SandboxMemoryGenerationManager:
                 if queue_item is _STOP:
                     return
                 await self._process_rollout_file(str(queue_item))
-            except Exception:
-                logger.exception("Sandbox memory worker failed")
+            except Exception as exc:
+                log_model_and_tool_action_error(logger, "Sandbox memory worker failed", exc)
             finally:
                 self._queue.task_done()
 
@@ -227,8 +232,8 @@ class SandboxMemoryGenerationManager:
                 selection=selection,
                 run_config=self._memory_run_config(),
             )
-        except Exception:
-            logger.exception("Sandbox memory phase 2 failed")
+        except Exception as exc:
+            log_model_and_tool_action_error(logger, "Sandbox memory phase 2 failed", exc)
             return
         await self._storage.write_phase_two_selection(selected_items=selection.selected)
         self._pending_phase_two_rollout_ids = [

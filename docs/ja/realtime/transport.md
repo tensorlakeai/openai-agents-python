@@ -2,75 +2,107 @@
 search:
   exclude: true
 ---
-# Realtime トランスポート
+# リアルタイムトランスポート
 
-このページは、realtime エージェントを Python アプリケーションにどのように組み込むかを判断するために使用してください。
+リアルタイムエージェントを Python アプリケーションにどのように組み込むかを判断する際は、このページを参照してください。
 
 !!! note "Python SDK の境界"
 
-    Python SDK には、ブラウザー WebRTC トランスポートは含まれて **いません**。このページは、Python SDK のトランスポート選択肢であるサーバー側 WebSocket と SIP アタッチフローのみを扱います。ブラウザー WebRTC は別のプラットフォームトピックであり、公式の [WebRTC による Realtime API](https://developers.openai.com/api/docs/guides/realtime-webrtc/) ガイドに記載されています。
+    Python SDK には、ブラウザー向け WebRTC トランスポートは **含まれていません** 。このページでは、Python SDK のトランスポートの選択肢である、サーバー側 WebSocket と SIP 接続フローのみを扱います。ブラウザー WebRTC は別のプラットフォームトピックであり、公式の [WebRTC を使用する Realtime API](https://developers.openai.com/api/docs/guides/realtime-webrtc/) ガイドに記載されています。
 
-## 判断ガイド
+## 選択ガイド {#decision-guide}
 
-| 目的 | はじめに | 理由 |
+| 目的 | 最初に参照するもの | 理由 |
 | --- | --- | --- |
-| サーバー管理の realtime アプリを構築する | [クイックスタート](quickstart.md) | デフォルトの Python パスは、`RealtimeRunner` によって管理されるサーバー側 WebSocket セッションです。 |
-| 選択すべきトランスポートとデプロイ形態を理解する | このページ | トランスポートやデプロイ形態を決定する前に使用してください。 |
-| エージェントを電話または SIP 通話にアタッチする | [Realtime ガイド](guide.md) と [`examples/realtime/twilio_sip`](https://github.com/openai/openai-agents-python/tree/main/examples/realtime/twilio_sip) | このリポジトリには、`call_id` によって駆動される SIP アタッチフローが含まれています。 |
+| サーバー管理型のリアルタイムアプリを構築する | [クイックスタート](quickstart.md) | Python のデフォルトパスは、`RealtimeRunner` によって管理されるサーバー側 WebSocket セッションです。 |
+| 選択すべきトランスポートとデプロイ構成を理解する | このページ | トランスポートまたはデプロイ構成を決定する前に、このページを参照してください。 |
+| エージェントを電話または SIP 通話に接続する | [リアルタイムガイド](guide.md)および [`examples/realtime/twilio_sip`](https://github.com/openai/openai-agents-python/tree/main/examples/realtime/twilio_sip) | このリポジトリには、`call_id` によって駆動される SIP 接続フローが含まれています。 |
 
-## デフォルトの Python パスであるサーバー側 WebSocket
+## Python のデフォルトパスとなるサーバー側 WebSocket {#server-side-websocket-is-the-default-python-path}
 
-カスタム `RealtimeModel` を渡さない限り、`RealtimeRunner` は `OpenAIRealtimeWebSocketModel` を使用します。
+カスタムの `RealtimeModel` を渡さない限り、`RealtimeRunner` は `OpenAIRealtimeWebSocketModel` を使用します。
 
-つまり、標準的な Python トポロジーは次のようになります。
+したがって、標準的な Python トポロジーは次のようになります。
 
 1. Python サービスが `RealtimeRunner` を作成します。
 2. `await runner.run()` が `RealtimeSession` を返します。
-3. セッションに入り、テキスト、構造化メッセージ、または音声を送信します。
-4. `RealtimeSessionEvent` 項目を消費し、音声またはトランスクリプトをアプリケーションに転送します。
+3. `RealtimeSession` を非同期コンテキストマネージャーとして開始し、テキスト、構造化メッセージ、または音声を送信します。
+4. `RealtimeSessionEvent` の項目を処理し、音声または文字起こしをアプリケーションに転送します。
 
-これは、コアデモアプリ、CLI の例、Twilio Media Streams の例で使用されているトポロジーです。
+これは、コアデモアプリ、CLI のコード例、および Twilio Media Streams のコード例で使用されているトポロジーです。
 
 -   [`examples/realtime/app`](https://github.com/openai/openai-agents-python/tree/main/examples/realtime/app)
 -   [`examples/realtime/cli`](https://github.com/openai/openai-agents-python/tree/main/examples/realtime/cli)
 -   [`examples/realtime/twilio`](https://github.com/openai/openai-agents-python/tree/main/examples/realtime/twilio)
 
-サーバーが音声パイプライン、ツール実行、承認フロー、履歴処理を管理する場合は、このパスを使用してください。
+サーバーが音声パイプライン、ツール実行、承認フロー、および履歴処理を担う場合は、このパスを使用してください。
 
-## テレフォニー向けパスとしての SIP アタッチ
+### 低レベル WebSocket の調整 {#low-level-websocket-tuning}
 
-このリポジトリで説明されているテレフォニーフローでは、Python SDK は `call_id` を介して既存の realtime 通話にアタッチします。
+基盤となるサーバー側 WebSocket 接続を調整する必要がある場合は、`OpenAIRealtimeWebSocketModel` に `transport_config` を渡します。
+
+```python
+from agents.realtime import (
+    OpenAIRealtimeWebSocketModel,
+    RealtimeAgent,
+    RealtimeRunner,
+)
+
+agent = RealtimeAgent(name="Assistant")
+model = OpenAIRealtimeWebSocketModel(
+    transport_config={
+        "ping_interval": 20.0,
+        "ping_timeout": 60.0,
+        "handshake_timeout": 30.0,
+        "max_size": 8 * 1024 * 1024,
+    }
+)
+runner = RealtimeRunner(starting_agent=agent, model=model)
+```
+
+サポートされているオプションは次のとおりです。
+
+-   `ping_interval`: クライアントのキープアライブ ping 間隔（秒）です。ping を無効にするには、`None` に設定します。
+-   `ping_timeout`: 切断するまで pong を待機する秒数です。ハートビートのタイムアウトを発生させずに pong の遅延を許容するには、`None` に設定します。
+-   `handshake_timeout`: 最初の接続ハンドシェイクを待機する秒数です。
+-   `max_size`: 受信 WebSocket メッセージの最大サイズ（バイト）です。SDK のデフォルトは `None` で、受信メッセージのサイズは無制限になります。メッセージごとのメモリ使用量を制限する必要がある場合は、明示的な上限を設定してください。
+
+これらの設定は Realtime APIセッションではなく、クライアント接続を構成します。エンドポイント、認証、通話への接続、および再生設定には、引き続き `RealtimeModelConfig` を使用してください。
+
+## 電話通信向けの SIP 接続 {#sip-attach-is-the-telephony-path}
+
+このリポジトリに記載されている電話通信フローでは、Python SDK は `call_id` を介して既存のリアルタイム通話に接続します。
 
 このトポロジーは次のようになります。
 
-1. OpenAI が `realtime.call.incoming` などの webhook をサービスに送信します。
-2. サービスが Realtime Calls API を通じて通話を受け入れます。
+1. OpenAIが `realtime.call.incoming` などの Webhook をサービスに送信します。
+2. サービスが Realtime Calls API を介して通話を受け付けます。
 3. Python サービスが `RealtimeRunner(..., model=OpenAIRealtimeSIPModel())` を開始します。
-4. セッションは `model_config={"call_id": ...}` で接続し、その後は他の realtime セッションと同様にイベントを処理します。
+4. セッションが `model_config={"call_id": ...}` を使用して接続し、その後は他のリアルタイムセッションと同様にイベントを処理します。
 
-これは [`examples/realtime/twilio_sip`](https://github.com/openai/openai-agents-python/tree/main/examples/realtime/twilio_sip) に示されているトポロジーです。
+これは、[`examples/realtime/twilio_sip`](https://github.com/openai/openai-agents-python/tree/main/examples/realtime/twilio_sip) に示されているトポロジーです。
 
-より広範な Realtime API でも、一部のサーバー側制御パターンで `call_id` を使用しますが、このリポジトリに含まれるアタッチ例は SIP です。
+より広範な Realtime APIでは、一部のサーバー側制御パターンに `call_id` も使用しますが、このリポジトリに含まれる接続のコード例では SIP を使用しています。
 
-## この SDK の範囲外であるブラウザー WebRTC
+## SDK の対象外となるブラウザー WebRTC {#browser-webrtc-is-outside-this-sdk}
 
-アプリの主なクライアントが Realtime WebRTC を使用するブラウザーである場合:
+アプリの主要クライアントが Realtime WebRTC を使用するブラウザーである場合は、次の点に注意してください。
 
--   このリポジトリの Python SDK ドキュメントの範囲外として扱ってください。
--   クライアント側のフローとイベントモデルについては、公式の [WebRTC による Realtime API](https://developers.openai.com/api/docs/guides/realtime-webrtc/) および [Realtime conversations](https://developers.openai.com/api/docs/guides/realtime-conversations/) ドキュメントを使用してください。
--   ブラウザー WebRTC クライアントの上にサイドバンドのサーバー接続が必要な場合は、公式の [Realtime server-side controls](https://developers.openai.com/api/docs/guides/realtime-server-controls/) ガイドを使用してください。
--   このリポジトリが、ブラウザー側の `RTCPeerConnection` 抽象化や、すぐに使えるブラウザー WebRTC サンプルを提供することは期待しないでください。
+-   このリポジトリの Python SDK ドキュメントの対象外として扱ってください。
+-   クライアント側のフローとイベントモデルについては、公式の [WebRTC を使用する Realtime API](https://developers.openai.com/api/docs/guides/realtime-webrtc/)および[リアルタイム会話](https://developers.openai.com/api/docs/guides/realtime-conversations/)のドキュメントを参照してください。
+-   ブラウザー WebRTC クライアントに加えてサイドバンドサーバー接続が必要な場合は、公式の [Realtime のサーバー側制御](https://developers.openai.com/api/docs/guides/realtime-server-controls/)ガイドを参照してください。
+-   このリポジトリでは、ブラウザー側の `RTCPeerConnection` 抽象化や、すぐに利用できるブラウザー WebRTC のコード例は提供されていません。
 
-このリポジトリには、現在、ブラウザー WebRTC と Python サイドバンドを組み合わせた例も含まれていません。
+また、このリポジトリには現在、ブラウザー WebRTC と Python サイドバンドを組み合わせたコード例も含まれていません。
 
-## カスタムエンドポイントとアタッチポイント
+## カスタムエンドポイントと接続ポイント {#custom-endpoints-and-attach-points}
 
-[`RealtimeModelConfig`][agents.realtime.model.RealtimeModelConfig] のトランスポート設定サーフェスを使用すると、デフォルトのパスを調整できます。
+[`RealtimeModelConfig`][agents.realtime.model.RealtimeModelConfig] のトランスポート設定インターフェースを使用すると、デフォルトのトランスポート動作をカスタマイズできます。
 
 -   `url`: WebSocket エンドポイントを上書きします
 -   `headers`: Azure 認証ヘッダーなどの明示的なヘッダーを指定します
 -   `api_key`: API キーを直接、またはコールバック経由で渡します
--   `call_id`: 既存の realtime 通話にアタッチします。このリポジトリで記載されている例は SIP です。
--   `playback_tracker`: 割り込み処理のために実際の再生進捗を報告します
+-   `call_id`: 既存のリアルタイム通話に接続します。このリポジトリに記載されているコード例では SIP を使用します。
+-   `playback_tracker`: 割り込み処理のために実際の再生進行状況を報告します
 
-トポロジーを選択した後の詳細なライフサイクルと機能サーフェスについては、[Realtime エージェントガイド](guide.md) を参照してください。
+トポロジーを選択した後の詳細なライフサイクルと機能範囲については、[リアルタイムエージェントガイド](guide.md)を参照してください。

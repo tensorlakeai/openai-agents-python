@@ -34,6 +34,8 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field
 
+from ....logger import log_tool_action_warning
+from ....sandbox._mount_security import redact_mount_error_data
 from ....sandbox.entries import Mount
 from ....sandbox.errors import (
     ExecNonZeroError,
@@ -87,12 +89,34 @@ _E2B_SANDBOX_SNAPSHOT_MAGIC = b"E2B_SANDBOX_SNAPSHOT_V1\n"
 logger = logging.getLogger(__name__)
 
 
+# E2B documents SDK exception classes at:
+# https://e2b.dev/docs/sdk-reference/python-sdk/v1.0.0/exceptions
+def _e2b_provider_retryability(error: BaseException) -> tuple[bool | None, str | None]:
+    non_retryable_types = _e2b_non_retryable_error_types()
+    retryable_types = _e2b_retryable_error_types()
+
+    for candidate in iter_exception_chain(error):
+        if non_retryable_types and isinstance(candidate, non_retryable_types):
+            return False, type(candidate).__name__
+
+        if retryable_types and isinstance(candidate, retryable_types):
+            return True, type(candidate).__name__
+
+        status = getattr(candidate, "status_code", None) or getattr(candidate, "status", None)
+        if isinstance(status, int) and status in TRANSIENT_HTTP_STATUS_CODES:
+            return True, "transient_http_status"
+
+    if exception_chain_contains_type(error, _retryable_persist_workspace_error_types()):
+        return True, "provider_timeout"
+    return None, None
+
+
 def _raise_e2b_exec_error(
     exc: BaseException,
     *,
     command: Sequence[str | Path],
     timeout: float | None,
-    timeout_exc: type[BaseException] | None,
+    timeout_error_types: tuple[type[BaseException], ...],
 ) -> NoReturn:
     """Classify an E2B exception and raise the appropriate ExecFailureError."""
     # Build context from the exception chain.
@@ -113,13 +137,21 @@ def _raise_e2b_exec_error(
 
     chain = list(iter_exception_chain(exc))
 
-    # Sandbox gone — always a transport error.
-    if any("sandbox" in str(c).lower() and "not found" in str(c).lower() for c in chain):
-        ctx.setdefault("reason", "sandbox_not_found")
-        raise ExecTransportError(command=command, context=ctx, cause=exc) from exc
+    retryable, reason = _e2b_provider_retryability(exc)
+    if reason is not None:
+        ctx.setdefault("reason", reason)
+
+    # Terminal provider errors are transport failures, not command timeouts.
+    if retryable is False:
+        raise ExecTransportError(
+            command=command,
+            context=ctx,
+            cause=exc,
+            retryable=False,
+        ) from exc
 
     # E2B timeout or httpcore read timeout.
-    is_timeout = timeout_exc is not None and exception_chain_contains_type(exc, (timeout_exc,))
+    is_timeout = exception_chain_contains_type(exc, timeout_error_types)
     if not is_timeout and any(
         type(c).__name__ == "ReadTimeout" and type(c).__module__.startswith("httpcore")
         for c in chain
@@ -135,7 +167,7 @@ def _raise_e2b_exec_error(
             cause=exc,
         ) from exc
 
-    raise ExecTransportError(command=command, context=ctx, cause=exc) from exc
+    raise ExecTransportError(command=command, context=ctx, cause=exc, retryable=retryable) from exc
 
 
 def _encode_e2b_snapshot_ref(*, snapshot_id: str) -> bytes:
@@ -491,23 +523,48 @@ async def _sandbox_connect(
     return await sandbox_class._cls_connect(sandbox_id=sandbox_id, timeout=timeout)
 
 
-def _import_e2b_exceptions() -> Mapping[str, type[BaseException]]:
-    """Best-effort import of E2B exception classes for classification."""
-
+def _e2b_exception_types(*names: str) -> tuple[type[BaseException], ...]:
+    """Best-effort import of E2B exception classes by name."""
     try:
-        from e2b.exceptions import (
-            NotFoundException,
-            SandboxException,
-            TimeoutException,
-        )
+        from e2b import exceptions as e2b_exceptions
     except Exception:  # pragma: no cover - handled by fallbacks
-        return {}
+        return ()
 
-    return {
-        "not_found": cast(type[BaseException], NotFoundException),
-        "sandbox": cast(type[BaseException], SandboxException),
-        "timeout": cast(type[BaseException], TimeoutException),
-    }
+    exceptions: list[type[BaseException]] = []
+    for name in names:
+        value = getattr(e2b_exceptions, name, None)
+        if isinstance(value, type) and issubclass(value, BaseException):
+            exceptions.append(value)
+    return tuple(exceptions)
+
+
+def _e2b_retryable_error_types() -> tuple[type[BaseException], ...]:
+    return _e2b_exception_types(
+        "RateLimitException",
+        "TimeoutException",
+    )
+
+
+def _e2b_timeout_error_types() -> tuple[type[BaseException], ...]:
+    return _e2b_exception_types("TimeoutException")
+
+
+def _e2b_non_retryable_error_types() -> tuple[type[BaseException], ...]:
+    return _e2b_exception_types(
+        "AuthenticationException",
+        "FileNotFoundException",
+        "GitAuthException",
+        "GitUpstreamException",
+        "InvalidArgumentException",
+        "NotEnoughSpaceException",
+        "NotFoundException",
+        "SandboxNotFoundException",
+        "TemplateException",
+    )
+
+
+def _e2b_not_found_error_types() -> tuple[type[BaseException], ...]:
+    return _e2b_exception_types("NotFoundException")
 
 
 def _import_command_exit_exception() -> type[BaseException] | None:
@@ -521,12 +578,7 @@ def _import_command_exit_exception() -> type[BaseException] | None:
 
 
 def _retryable_persist_workspace_error_types() -> tuple[type[BaseException], ...]:
-    excs = _import_e2b_exceptions()
-    retryable: list[type[BaseException]] = []
-    timeout_exc = excs.get("timeout")
-    if timeout_exc is not None:
-        retryable.append(timeout_exc)
-    return tuple(retryable)
+    return _e2b_timeout_error_types()
 
 
 class E2BSandboxTimeouts(BaseModel):
@@ -636,6 +688,8 @@ class _E2BPtyProcessEntry:
     output_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     output_notify: asyncio.Event = field(default_factory=asyncio.Event)
     last_used: float = field(default_factory=time.monotonic)
+    exit_code: int | None = None
+    wait_task: asyncio.Task[None] | None = None
 
 
 @dataclass(frozen=True)
@@ -650,6 +704,7 @@ class E2BSandboxSession(BaseSandboxSession):
     state: E2BSandboxSessionState
     _sandbox: _E2BSandboxAPI
     _workspace_root_ready: bool
+    _skip_next_workspace_root_mkdir: bool
     _pty_lock: asyncio.Lock
     _pty_processes: dict[int, _E2BPtyProcessEntry]
     _reserved_pty_process_ids: set[int]
@@ -663,6 +718,7 @@ class E2BSandboxSession(BaseSandboxSession):
         self.state = state
         self._sandbox = _as_sandbox_api(sandbox)
         self._workspace_root_ready = state.workspace_root_ready
+        self._skip_next_workspace_root_mkdir = False
         self._pty_lock = asyncio.Lock()
         self._pty_processes = {}
         self._reserved_pty_process_ids = set()
@@ -764,22 +820,30 @@ class E2BSandboxSession(BaseSandboxSession):
             )
         self._workspace_root_ready = True
 
+    async def _workspace_root_exists(self) -> bool:
+        result = await self._exec_internal(
+            "test",
+            "-d",
+            sandbox_path_str(self._workspace_root_path()),
+            timeout=self.state.timeouts.fast_op_s,
+        )
+        return result.ok()
+
     def _mark_workspace_root_ready_from_probe(self) -> None:
         super()._mark_workspace_root_ready_from_probe()
         self._workspace_root_ready = True
 
     async def _prepare_backend_workspace(self) -> None:
         try:
-            if self._workspace_state_preserved_on_start():
-                # Reconnected sandboxes may have durable workspace contents; the base start flow
-                # probes before this provider creates the root for future exec calls.
-                if not self._workspace_root_ready:
-                    await self._prepare_workspace_root_for_exec()
-            else:
-                # Fresh or recreated sandboxes need the workspace root created before snapshot
-                # hydration or full manifest materialization can write into it.
+            preserved = self._workspace_state_preserved_on_start()
+            if not preserved and not await self._workspace_root_exists():
+                # The Files API can create roots that the sandbox command user cannot create.
                 await self._ensure_workspace_root()
+            if not preserved or not self._workspace_root_ready:
                 await self._prepare_workspace_root_for_exec()
+                # The manifest applier always creates its root first. The command above has
+                # already done that, so let that one startup-only mkdir avoid the Files API.
+                self._skip_next_workspace_root_mkdir = True
         except WorkspaceStartError:
             raise
         except Exception as e:
@@ -791,8 +855,17 @@ class E2BSandboxSession(BaseSandboxSession):
         if self._runtime_helper_cache_key != self._current_runtime_helper_cache_key():
             await self._ensure_runtime_helpers()
 
+    async def _after_start_failed(self) -> None:
+        self._skip_next_workspace_root_mkdir = False
+
     async def _shutdown_backend(self) -> None:
         # Best-effort kill of the remote sandbox.
+        def diagnostic_extra() -> dict[str, object]:
+            return {
+                "sandbox_id": self.state.sandbox_id,
+                "pause_on_exit": self.state.pause_on_exit,
+            }
+
         try:
             if self.state.pause_on_exit:
                 await _sandbox_pause(self._sandbox)
@@ -800,33 +873,27 @@ class E2BSandboxSession(BaseSandboxSession):
                 await _sandbox_kill(self._sandbox)
         except Exception as e:
             if self.state.pause_on_exit:
-                logger.warning(
+                log_tool_action_warning(
+                    logger,
                     "Failed to pause E2B sandbox on shutdown; falling back to kill.",
-                    extra={
-                        "sandbox_id": self.state.sandbox_id,
-                        "pause_on_exit": self.state.pause_on_exit,
-                    },
-                    exc_info=e,
+                    e,
+                    diagnostic_extra=diagnostic_extra,
                 )
                 try:
                     await _sandbox_kill(self._sandbox)
                 except Exception as kill_exc:
-                    logger.warning(
+                    log_tool_action_warning(
+                        logger,
                         "Failed to kill E2B sandbox after pause fallback failure.",
-                        extra={
-                            "sandbox_id": self.state.sandbox_id,
-                            "pause_on_exit": self.state.pause_on_exit,
-                        },
-                        exc_info=kill_exc,
+                        kill_exc,
+                        diagnostic_extra=diagnostic_extra,
                     )
             else:
-                logger.warning(
+                log_tool_action_warning(
+                    logger,
                     "Failed to kill E2B sandbox on shutdown.",
-                    extra={
-                        "sandbox_id": self.state.sandbox_id,
-                        "pause_on_exit": self.state.pause_on_exit,
-                    },
-                    exc_info=e,
+                    e,
+                    diagnostic_extra=diagnostic_extra,
                 )
 
     async def _exec_internal(
@@ -847,8 +914,7 @@ class E2BSandboxSession(BaseSandboxSession):
         cmd_str = shlex.join(command_list)
         exec_timeout = self._coerce_exec_timeout(timeout)
 
-        e2b_exc = _import_e2b_exceptions()
-        timeout_exc = e2b_exc.get("timeout")
+        timeout_error_types = _e2b_timeout_error_types()
         command_exit_exc = _import_command_exit_exception()
 
         try:
@@ -880,7 +946,7 @@ class E2BSandboxSession(BaseSandboxSession):
                 e,
                 command=command,
                 timeout=timeout,
-                timeout_exc=timeout_exc,
+                timeout_error_types=timeout_error_types,
             )
 
     def supports_pty(self) -> bool:
@@ -901,8 +967,7 @@ class E2BSandboxSession(BaseSandboxSession):
         envs = await self._resolved_envs()
         cwd = self.state.manifest.root if self._workspace_root_ready else None
         exec_timeout = self._coerce_exec_timeout(timeout)
-        e2b_exc = _import_e2b_exceptions()
-        timeout_exc = e2b_exc.get("timeout")
+        timeout_error_types = _e2b_timeout_error_types()
 
         entry = _E2BPtyProcessEntry(handle=None, tty=tty)
 
@@ -951,6 +1016,7 @@ class E2BSandboxSession(BaseSandboxSession):
                     on_stderr=_append_output,
                 )
                 entry.handle = handle
+            entry.wait_task = asyncio.create_task(self._run_pty_waiter(entry))
             async with self._pty_lock:
                 process_id = allocate_pty_process_id(self._reserved_pty_process_ids)
                 self._reserved_pty_process_ids.add(process_id)
@@ -971,7 +1037,7 @@ class E2BSandboxSession(BaseSandboxSession):
                 e,
                 command=command,
                 timeout=timeout,
-                timeout_exc=timeout_exc,
+                timeout_error_types=timeout_error_types,
             )
 
         if pruned_entry is not None:
@@ -1051,8 +1117,7 @@ class E2BSandboxSession(BaseSandboxSession):
 
         workspace_path = await self._validate_path_access(path)
 
-        e2b_exc = _import_e2b_exceptions()
-        not_found_exc = e2b_exc.get("not_found")
+        not_found_error_types = _e2b_not_found_error_types()
 
         try:
             content = await _sandbox_read_file(
@@ -1066,7 +1131,7 @@ class E2BSandboxSession(BaseSandboxSession):
                 data = str(content).encode("utf-8", errors="replace")
             return io.BytesIO(data)
         except Exception as e:  # pragma: no cover - exercised via unit tests with fakes
-            if not_found_exc is not None and isinstance(e, not_found_exc):
+            if not_found_error_types and isinstance(e, not_found_error_types):
                 raise WorkspaceReadNotFoundError(path=path, cause=e) from e
             raise WorkspaceArchiveReadError(path=path, cause=e) from e
 
@@ -1118,6 +1183,16 @@ class E2BSandboxSession(BaseSandboxSession):
         parents: bool = False,
         user: str | User | None = None,
     ) -> None:
+        workspace_root = self._workspace_root_path()
+        if user is None and self.normalize_path(path, for_write=True) == workspace_root:
+            if self._skip_next_workspace_root_mkdir:
+                self._skip_next_workspace_root_mkdir = False
+                return
+            # Keep the public root mkdir usable when the remote root disappeared. Remote path
+            # validation cannot run then because its helper command uses the workspace as `cwd`.
+            await self._ensure_dir(workspace_root, reason="mkdir_failed")
+            return
+
         if user is not None:
             path = await self._check_mkdir_with_exec(path, parents=parents, user=user)
         else:
@@ -1168,6 +1243,24 @@ class E2BSandboxSession(BaseSandboxSession):
         truncated_text, original_token_count = truncate_text_by_tokens(text, max_output_tokens)
         return truncated_text.encode("utf-8", errors="replace"), original_token_count
 
+    async def _run_pty_waiter(self, entry: _E2BPtyProcessEntry) -> None:
+        try:
+            result = await cast(Any, entry.handle).wait()
+            entry.exit_code = int(result.exit_code)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # E2B raises CommandExitException, which carries the exit code, when a
+            # command exits nonzero.
+            value = getattr(e, "exit_code", None)
+            if value is not None:
+                try:
+                    entry.exit_code = int(value)
+                except (TypeError, ValueError):
+                    pass
+        finally:
+            entry.output_notify.set()
+
     async def _finalize_pty_update(
         self,
         *,
@@ -1212,6 +1305,8 @@ class E2BSandboxSession(BaseSandboxSession):
     def _entry_exit_code(self, entry: _E2BPtyProcessEntry) -> int | None:
         value = getattr(entry.handle, "exit_code", None)
         if value is None:
+            value = entry.exit_code
+        if value is None:
             return None
         try:
             return int(value)
@@ -1219,12 +1314,22 @@ class E2BSandboxSession(BaseSandboxSession):
             return None
 
     async def _terminate_pty_entry(self, entry: _E2BPtyProcessEntry) -> None:
+        if self._entry_exit_code(entry) is not None:
+            return
+
+        wait_task = entry.wait_task
+
         kill = getattr(entry.handle, "kill", None)
         if callable(kill):
             try:
                 await kill()
             except Exception:
                 pass
+
+        if wait_task is not None:
+            if not wait_task.done():
+                wait_task.cancel()
+            await asyncio.gather(wait_task, return_exceptions=True)
 
     def _tar_exclude_args(self) -> list[str]:
         return shell_tar_exclude_args(self._persist_workspace_skip_relpaths())
@@ -1255,12 +1360,22 @@ class E2BSandboxSession(BaseSandboxSession):
                         "exit_code": exit_code,
                         "stderr": str(getattr(result, "stderr", "") or ""),
                     },
+                    retryable=False,
                 )
             return str(getattr(result, "stdout", "") or "")
         except WorkspaceArchiveReadError:
             raise
         except Exception as e:  # pragma: no cover - exercised via unit tests with fakes
-            raise WorkspaceArchiveReadError(path=error_root, cause=e) from e
+            retryable, reason = _e2b_provider_retryability(e)
+            context: dict[str, object] = {"backend": "e2b"}
+            if reason is not None:
+                context["reason"] = reason
+            raise WorkspaceArchiveReadError(
+                path=error_root,
+                context=context,
+                cause=e,
+                retryable=retryable,
+            ) from e
 
     async def persist_workspace(self) -> io.IOBase:
         if self.state.workspace_persistence == _WORKSPACE_PERSISTENCE_SNAPSHOT:
@@ -1566,9 +1681,12 @@ class E2BSandboxClient(BaseSandboxClient[E2BSandboxClientOptions]):
         instrumentation: Instrumentation | None = None,
         dependencies: Dependencies | None = None,
     ) -> None:
-        self._instrumentation = instrumentation or Instrumentation()
+        self._instrumentation = (
+            instrumentation if instrumentation is not None else Instrumentation()
+        )
         self._dependencies = dependencies
 
+    @redact_mount_error_data
     async def create(
         self,
         *,
@@ -1578,7 +1696,8 @@ class E2BSandboxClient(BaseSandboxClient[E2BSandboxClientOptions]):
     ) -> SandboxSession:
         if options is None:
             raise ValueError("E2BSandboxClient.create requires options")
-        manifest = manifest or Manifest()
+        manifest = manifest if manifest is not None else Manifest()
+        self._validate_manifest_for_create(manifest)
 
         sandbox_type = _coerce_sandbox_type(options.sandbox_type)
 
@@ -1650,12 +1769,14 @@ class E2BSandboxClient(BaseSandboxClient[E2BSandboxClientOptions]):
             raise TypeError("E2BSandboxClient.delete expects an E2BSandboxSession")
         return session
 
+    @redact_mount_error_data
     async def resume(
         self,
         state: SandboxSessionState,
     ) -> SandboxSession:
         if not isinstance(state, E2BSandboxSessionState):
             raise TypeError("E2BSandboxClient.resume expects an E2BSandboxSessionState")
+        state.assert_path_grants_rebound()
 
         sandbox_type = _coerce_sandbox_type(state.sandbox_type)
         SandboxClass = _import_sandbox_class(sandbox_type)
@@ -1695,6 +1816,7 @@ class E2BSandboxClient(BaseSandboxClient[E2BSandboxClientOptions]):
                 lifecycle=_e2b_lifecycle(state.on_timeout, auto_resume=state.auto_resume),
                 mcp=state.mcp,
             )
+        if not reconnected:
             state.sandbox_id = str(_sandbox_id(sandbox))
             state.workspace_root_ready = False
 
@@ -1703,7 +1825,7 @@ class E2BSandboxClient(BaseSandboxClient[E2BSandboxClientOptions]):
         return self._wrap_session(inner, instrumentation=self._instrumentation)
 
     def deserialize_session_state(self, payload: dict[str, object]) -> SandboxSessionState:
-        return E2BSandboxSessionState.model_validate(payload)
+        return self._deserialize_session_state_payload(payload, E2BSandboxSessionState)
 
 
 __all__ = [

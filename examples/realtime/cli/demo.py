@@ -2,12 +2,13 @@ import asyncio
 import queue
 import sys
 import threading
+from contextlib import suppress
 from typing import Any
 
 import numpy as np
 import sounddevice as sd
 
-from agents import function_tool
+from agents.decorators import tool
 from agents.realtime import (
     RealtimeAgent,
     RealtimePlaybackTracker,
@@ -34,7 +35,7 @@ PLAYBACK_ECHO_MARGIN = 0.002  # extra energy above playback echo required to cou
 # logger.logger.setLevel(logging.ERROR)
 
 
-@function_tool
+@tool
 def get_weather(city: str) -> str:
     """Get the weather in a city."""
     return f"The weather in {city} is sunny."
@@ -59,6 +60,7 @@ class NoUIDemo:
         self.audio_stream: sd.InputStream | None = None
         self.audio_player: sd.OutputStream | None = None
         self.recording = False
+        self.audio_capture_task: asyncio.Task[None] | None = None
 
         # Playback tracker lets the model know our real playback progress
         self.playback_tracker = RealtimePlaybackTracker()
@@ -225,7 +227,7 @@ class NoUIDemo:
             model_config: RealtimeModelConfig = {
                 "playback_tracker": self.playback_tracker,
                 "initial_model_settings": {
-                    "model_name": "gpt-realtime-2",
+                    "model_name": "gpt-realtime-2.1",
                     "turn_detection": {
                         "type": "semantic_vad",
                         "interrupt_response": True,
@@ -246,6 +248,7 @@ class NoUIDemo:
                     await self._on_event(event)
 
         finally:
+            await self.stop_audio_recording()
             # Clean up audio player
             if self.audio_player and self.audio_player.active:
                 self.audio_player.stop()
@@ -267,7 +270,20 @@ class NoUIDemo:
         self.recording = True
 
         # Start audio capture task
-        asyncio.create_task(self.capture_audio())
+        self.audio_capture_task = asyncio.create_task(
+            self.capture_audio(),
+            name="realtime-audio-capture",
+        )
+
+    async def stop_audio_recording(self) -> None:
+        """Stop recording and wait for the audio capture task to release the input stream."""
+        self.recording = False
+        if self.audio_capture_task is None:
+            return
+        self.audio_capture_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await self.audio_capture_task
+        self.audio_capture_task = None
 
     async def capture_audio(self) -> None:
         """Capture audio from the microphone and send to the session."""

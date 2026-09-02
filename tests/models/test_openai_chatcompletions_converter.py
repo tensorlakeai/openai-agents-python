@@ -24,11 +24,12 @@ These tests exercise both conversion directions:
 from __future__ import annotations
 
 import logging
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 import pytest
 from openai import omit
 from openai.types.chat import ChatCompletionMessage, ChatCompletionMessageFunctionToolCall
+from openai.types.chat.chat_completion_message import Annotation, AnnotationURLCitation
 from openai.types.chat.chat_completion_message_custom_tool_call import (
     ChatCompletionMessageCustomToolCall,
     Custom,
@@ -46,7 +47,7 @@ from openai.types.responses import (
 from openai.types.responses.response_input_item_param import FunctionCallOutput
 
 from agents.agent_output import AgentOutputSchema
-from agents.exceptions import UserError
+from agents.exceptions import AgentsException, UserError
 from agents.items import TResponseInputItem
 from agents.models.chatcmpl_converter import Converter
 from agents.models.fake_id import FAKE_RESPONSES_ID
@@ -71,6 +72,61 @@ def test_message_to_output_items_with_text_only():
     text_part = cast(ResponseOutputText, message_item.content[0])
     assert text_part.type == "output_text"
     assert text_part.text == "Hello"
+
+
+def test_message_to_output_items_rejects_audio():
+    """
+    Audio output is unsupported by the Chat Completions converter, and the failure
+    must be loud so callers do not receive a silently truncated message.
+    """
+    msg = ChatCompletionMessage.model_validate(
+        {
+            "role": "assistant",
+            "content": None,
+            "audio": {
+                "id": "audio-1",
+                "data": "AAA=",
+                "expires_at": 1,
+                "transcript": "hi",
+            },
+        }
+    )
+    with pytest.raises(AgentsException, match="Audio is not currently supported"):
+        Converter.message_to_output_items(msg)
+
+
+def test_message_to_output_items_keeps_url_citation_annotations():
+    """
+    URL citations reported on the Chat Completions message should survive as
+    output text annotations, the same way the Responses API reports them.
+    """
+    msg = ChatCompletionMessage(
+        role="assistant",
+        content="It will rain tomorrow.",
+        annotations=[
+            Annotation(
+                type="url_citation",
+                url_citation=AnnotationURLCitation(
+                    start_index=0,
+                    end_index=22,
+                    url="https://example.com/weather",
+                    title="Weather",
+                ),
+            )
+        ],
+    )
+    items = Converter.message_to_output_items(msg)
+    message_item = cast(ResponseOutputMessage, items[0])
+    text_part = cast(ResponseOutputText, message_item.content[0])
+    assert [annotation.model_dump() for annotation in text_part.annotations] == [
+        {
+            "end_index": 22,
+            "start_index": 0,
+            "title": "Weather",
+            "type": "url_citation",
+            "url": "https://example.com/weather",
+        }
+    ]
 
 
 def test_message_to_output_items_with_refusal():
@@ -191,6 +247,37 @@ def test_items_to_messages_with_easy_input_message():
     assert out["content"] == "How are you?"
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        "hello",
+        "",
+        [],
+        [{"type": "input_text", "text": "hello"}],
+    ],
+)
+@pytest.mark.parametrize(
+    "optional_keys",
+    [
+        {"type": "message"},
+        {"phase": "commentary"},
+        {"type": "message", "phase": "final_answer"},
+    ],
+)
+def test_easy_input_assistant_optional_keys_match_bare_shape(
+    content: Any,
+    optional_keys: dict[str, Any],
+):
+    """Optional message fields must not change easy-input conversion."""
+    untyped = cast(TResponseInputItem, {"role": "assistant", "content": content})
+    extended = cast(
+        TResponseInputItem,
+        {"role": "assistant", "content": content, **optional_keys},
+    )
+
+    assert Converter.items_to_messages([extended]) == Converter.items_to_messages([untyped])
+
+
 def test_items_to_messages_accepts_raw_chat_completions_user_content_parts():
     """
     Raw Chat Completions content parts should be accepted as aliases for the SDK's
@@ -290,6 +377,142 @@ def test_items_to_messages_with_output_message_and_function_call():
     assert tool_call["type"] == "function"
     assert tool_call["function"]["name"] == "math"
     assert tool_call["function"]["arguments"] == "{}"
+
+
+def _turn_items_function_call_first() -> list[TResponseInputItem]:
+    """One completed tool turn in the order the streaming handler emits it.
+
+    A provider that streams tool-call deltas before the same turn's text yields
+    response outputs ordered [function_call, message]; the runner then appends
+    the function_call_output.
+    """
+    func_item: ResponseFunctionToolCallParam = {
+        "id": "99",
+        "call_id": "abc",
+        "name": "math",
+        "arguments": "{}",
+        "type": "function_call",
+    }
+    resp_msg = ResponseOutputMessage(
+        id="42",
+        type="message",
+        role="assistant",
+        status="completed",
+        content=[ResponseOutputText(text="Let me calculate.", type="output_text", annotations=[])],
+    )
+    return [
+        cast(TResponseInputItem, func_item),
+        cast(TResponseInputItem, resp_msg.model_dump()),
+        cast(
+            TResponseInputItem,
+            {"type": "function_call_output", "call_id": "abc", "output": "4"},
+        ),
+    ]
+
+
+def test_items_to_messages_merges_function_call_before_output_message():
+    """A streamed turn ordered [function_call, message] must convert to one
+    assistant message; an assistant message with tool_calls followed by another
+    assistant message is rejected by the Chat Completions API."""
+    messages = Converter.items_to_messages(_turn_items_function_call_first())
+
+    assert len(messages) == 2
+    assistant = messages[0]
+    assert assistant["role"] == "assistant"
+    assert assistant["content"] == "Let me calculate."
+    tool_calls = assistant.get("tool_calls")
+    assert isinstance(tool_calls, list)
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["function"]["name"] == "math"
+    assert messages[1]["role"] == "tool"
+    assert messages[1]["tool_call_id"] == "abc"
+
+
+def test_items_to_messages_streamed_and_nonstreamed_turn_order_converge():
+    """[function_call, message] and [message, function_call] describe the same
+    turn and must produce identical Chat Completions messages."""
+    streamed = _turn_items_function_call_first()
+    non_streamed = [streamed[1], streamed[0], streamed[2]]
+
+    assert Converter.items_to_messages(streamed) == Converter.items_to_messages(non_streamed)
+
+
+def test_items_to_messages_does_not_merge_a_later_turn_into_a_tool_turn():
+    """A plain assistant turn after a completed tool turn stays a separate
+    message; only the same turn's text merges into the tool_calls message."""
+    items = _turn_items_function_call_first()
+    later_turn = cast(
+        TResponseInputItem,
+        ResponseOutputMessage(
+            id="43",
+            type="message",
+            role="assistant",
+            status="completed",
+            content=[ResponseOutputText(text="Done.", type="output_text", annotations=[])],
+        ).model_dump(),
+    )
+    messages = Converter.items_to_messages([*items, later_turn])
+
+    assert len(messages) == 3
+    assert messages[0]["role"] == "assistant"
+    assert messages[0].get("tool_calls")
+    assert messages[1]["role"] == "tool"
+    assert messages[2]["role"] == "assistant"
+    assert messages[2]["content"] == "Done."
+    assert not messages[2].get("tool_calls")
+
+
+def test_items_to_messages_merges_refusal_into_pending_tool_call_message():
+    """A refusal-bearing message after its turn's function call merges into the
+    same assistant message instead of opening an invalid second one."""
+    func_item: ResponseFunctionToolCallParam = {
+        "id": "99",
+        "call_id": "abc",
+        "name": "math",
+        "arguments": "{}",
+        "type": "function_call",
+    }
+    resp_msg = ResponseOutputMessage(
+        id="42",
+        type="message",
+        role="assistant",
+        status="completed",
+        content=[ResponseOutputRefusal(refusal="won't do that", type="refusal")],
+    )
+    messages = Converter.items_to_messages(
+        [
+            cast(TResponseInputItem, func_item),
+            cast(TResponseInputItem, resp_msg.model_dump()),
+        ]
+    )
+
+    assert len(messages) == 1
+    assistant = messages[0]
+    assert assistant["refusal"] == "won't do that"
+    assert assistant.get("tool_calls")
+
+
+def test_items_to_messages_accepts_statusless_output_message():
+    """Output messages remain recognizable after replay normalization removes null status."""
+    statusless_message = cast(
+        TResponseInputItem,
+        {
+            "id": "msg_123",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": "hello",
+                    "annotations": [],
+                }
+            ],
+        },
+    )
+
+    assert Converter.items_to_messages([statusless_message]) == [
+        {"role": "assistant", "content": "hello"}
+    ]
 
 
 def test_convert_tool_choice_handles_standard_and_named_options() -> None:
@@ -534,6 +757,59 @@ def test_extract_all_content_handles_input_audio():
     ]
 
 
+def test_extract_all_content_preserves_prompt_cache_breakpoints() -> None:
+    breakpoint = {"mode": "explicit"}
+    content: list[dict[str, Any]] = [
+        {
+            "type": "input_text",
+            "text": "one",
+            "prompt_cache_breakpoint": breakpoint,
+        },
+        {
+            "type": "input_image",
+            "image_url": "https://example.com/image.png",
+            "prompt_cache_breakpoint": breakpoint,
+        },
+        {
+            "type": "input_audio",
+            "input_audio": {"data": "AAA=", "format": "wav"},
+            "prompt_cache_breakpoint": breakpoint,
+        },
+        {
+            "type": "input_file",
+            "file_data": "data:text/plain;base64,SGVsbG8=",
+            "filename": "hello.txt",
+            "prompt_cache_breakpoint": breakpoint,
+        },
+    ]
+
+    parts = Converter.extract_all_content(content)
+
+    assert isinstance(parts, list)
+    assert [part["prompt_cache_breakpoint"] for part in parts] == [breakpoint] * 4
+
+
+def test_raw_chat_content_aliases_preserve_prompt_cache_breakpoints() -> None:
+    breakpoint = {"mode": "explicit"}
+
+    parts = Converter.extract_all_content(
+        cast(
+            list[dict[str, Any]],
+            [
+                {"type": "text", "text": "one", "prompt_cache_breakpoint": breakpoint},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://example.com/image.png"},
+                    "prompt_cache_breakpoint": breakpoint,
+                },
+            ],
+        )
+    )
+
+    assert isinstance(parts, list)
+    assert [part["prompt_cache_breakpoint"] for part in parts] == [breakpoint, breakpoint]
+
+
 def test_extract_all_content_rejects_invalid_input_audio():
     """
     input_audio requires both data and format fields to be present.
@@ -547,6 +823,56 @@ def test_extract_all_content_rejects_invalid_input_audio():
     )
     with pytest.raises(UserError):
         Converter.extract_all_content([audio_missing_data])
+
+
+def test_extract_all_content_supports_input_file_file_id():
+    """
+    An input_file that references an uploaded file by id is representable by the
+    Chat Completions ``file`` content part, so it must convert rather than raise.
+    """
+    content: list[dict[str, Any]] = [
+        {
+            "type": "input_file",
+            "file_id": "file-abc123",
+            "filename": "hello.txt",
+        }
+    ]
+
+    parts = Converter.extract_all_content(content)
+
+    assert parts == [
+        {
+            "type": "file",
+            "file": {"file_id": "file-abc123", "filename": "hello.txt"},
+        }
+    ]
+
+
+def test_extract_all_content_prefers_input_file_data_over_file_id():
+    """When both file_data and file_id are present, file_data is used (prior behavior)."""
+    content: list[dict[str, Any]] = [
+        {
+            "type": "input_file",
+            "file_data": "data:text/plain;base64,SGVsbG8=",
+            "file_id": "file-abc123",
+        }
+    ]
+
+    parts = Converter.extract_all_content(content)
+
+    assert parts == [
+        {
+            "type": "file",
+            "file": {"file_data": "data:text/plain;base64,SGVsbG8="},
+        }
+    ]
+
+
+def test_extract_all_content_rejects_input_file_without_data_or_id():
+    """An input_file that carries neither file_data nor file_id cannot be represented."""
+    content: list[dict[str, Any]] = [{"type": "input_file", "filename": "hello.txt"}]
+    with pytest.raises(UserError):
+        Converter.extract_all_content(content)
 
 
 def test_items_to_messages_handles_system_and_developer_roles():

@@ -21,6 +21,8 @@ RealtimeModelName: TypeAlias = (
         "gpt-realtime",
         "gpt-realtime-1.5",
         "gpt-realtime-2",
+        "gpt-realtime-2.1",
+        "gpt-realtime-2.1-mini",
         "gpt-realtime-2025-08-28",
         "gpt-4o-realtime-preview",
         "gpt-4o-realtime-preview-2024-10-01",
@@ -77,11 +79,32 @@ class RealtimeInputAudioTranscriptionConfig(TypedDict):
     language: NotRequired[str]
     """The language code for transcription."""
 
-    model: NotRequired[Literal["gpt-4o-transcribe", "gpt-4o-mini-transcribe", "whisper-1"] | str]
+    model: NotRequired[
+        Literal[
+            "gpt-transcribe",
+            "gpt-live-transcribe",
+            "gpt-4o-transcribe",
+            "gpt-4o-mini-transcribe",
+            "gpt-4o-mini-transcribe-2025-12-15",
+            "gpt-4o-transcribe-diarize",
+            "gpt-realtime-whisper",
+            "whisper-1",
+        ]
+        | str
+    ]
     """The transcription model to use."""
 
     prompt: NotRequired[str]
     """An optional prompt to guide transcription."""
+
+    keywords: NotRequired[list[str]]
+    """Literal terms that may appear in the audio."""
+
+    languages: NotRequired[list[str]]
+    """Expected input languages for transcription."""
+
+    delay: NotRequired[Literal["minimal", "low", "medium", "high", "xhigh"]]
+    """The latency and accuracy tradeoff for streaming transcription."""
 
 
 class RealtimeInputAudioNoiseReductionConfig(TypedDict):
@@ -128,7 +151,8 @@ class RealtimeAudioInputConfig(TypedDict, total=False):
     format: RealtimeAudioFormat | OpenAIRealtimeAudioFormats
     noise_reduction: RealtimeInputAudioNoiseReductionConfig | None
     transcription: RealtimeInputAudioTranscriptionConfig
-    turn_detection: RealtimeTurnDetectionConfig
+    turn_detection: RealtimeTurnDetectionConfig | None
+    """Configuration for detecting conversation turns, or ``None`` to disable detection."""
 
 
 class RealtimeAudioOutputConfig(TypedDict, total=False):
@@ -199,8 +223,8 @@ class RealtimeSessionModelSettings(TypedDict):
     input_audio_noise_reduction: NotRequired[RealtimeInputAudioNoiseReductionConfig | None]
     """Noise reduction configuration for input audio."""
 
-    turn_detection: NotRequired[RealtimeTurnDetectionConfig]
-    """Configuration for detecting conversation turns."""
+    turn_detection: NotRequired[RealtimeTurnDetectionConfig | None]
+    """Configuration for detecting conversation turns, or ``None`` to disable detection."""
 
     tool_choice: NotRequired[ToolChoice]
     """How the model should choose which tools to call."""
@@ -226,9 +250,19 @@ class RealtimeGuardrailsSettings(TypedDict):
 
     debounce_text_length: NotRequired[int]
     """
-    The minimum number of characters to accumulate before running guardrails on transcript
-    deltas. Defaults to 100. Guardrails run every time the accumulated text reaches
+    The minimum number of characters to accumulate before running guardrails on output text or
+    transcript deltas. Defaults to 100. Guardrails run every time the accumulated text reaches
     1x, 2x, 3x, etc. times this threshold.
+    """
+
+
+class RealtimeToolExecutionConfig(TypedDict):
+    """SDK-side execution settings for local realtime tool calls."""
+
+    pre_approval_tool_input_guardrails: NotRequired[bool]
+    """Run function tool input guardrails before emitting a pending approval event.
+
+    The same guardrails still run again immediately before tool execution after approval.
     """
 
 
@@ -262,6 +296,9 @@ class RealtimeRunConfig(TypedDict):
 
     async_tool_calls: NotRequired[bool]
     """Whether function tool calls should run asynchronously. Defaults to True."""
+
+    tool_execution: NotRequired[RealtimeToolExecutionConfig]
+    """SDK-side execution settings for local realtime tool calls."""
 
     tool_error_formatter: NotRequired[ToolErrorFormatter]
     """Optional callback that formats tool error messages returned to the model."""

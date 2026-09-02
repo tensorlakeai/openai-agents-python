@@ -80,6 +80,7 @@ try:
         DEFAULT_RUNLOOP_WORKSPACE_ROOT as DEFAULT_RUNLOOP_WORKSPACE_ROOT,
         RunloopAfterIdle as RunloopAfterIdle,
         RunloopCloudBucketMountStrategy as RunloopCloudBucketMountStrategy,
+        RunloopExistingSecret as RunloopExistingSecret,
         RunloopGatewaySpec as RunloopGatewaySpec,
         RunloopLaunchParameters as RunloopLaunchParameters,
         RunloopMcpSpec as RunloopMcpSpec,
@@ -113,6 +114,7 @@ except Exception:  # pragma: no cover
 
 try:
     from .vercel import (
+        VercelCloudBucketMountStrategy as VercelCloudBucketMountStrategy,
         VercelSandboxClient as VercelSandboxClient,
         VercelSandboxClientOptions as VercelSandboxClientOptions,
         VercelSandboxSession as VercelSandboxSession,
@@ -206,6 +208,7 @@ if _HAS_TENSORLAKE:
 if _HAS_VERCEL:
     __all__.extend(
         [
+            "VercelCloudBucketMountStrategy",
             "VercelSandboxClient",
             "VercelSandboxClientOptions",
             "VercelSandboxSession",
@@ -219,6 +222,7 @@ if _HAS_RUNLOOP:
             "DEFAULT_RUNLOOP_WORKSPACE_ROOT",
             "DEFAULT_RUNLOOP_ROOT_WORKSPACE_ROOT",
             "RunloopAfterIdle",
+            "RunloopExistingSecret",
             "RunloopGatewaySpec",
             "RunloopLaunchParameters",
             "RunloopMcpSpec",

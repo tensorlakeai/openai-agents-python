@@ -1,6 +1,6 @@
 # Agent visualization
 
-Agent visualization allows you to generate a structured graphical representation of agents and their relationships using **Graphviz**. This is useful for understanding how agents, tools, and handoffs interact within an application.
+Agent visualization allows you to generate a structured graphical representation of agents and their connections to other agents, tools, and MCP servers using **Graphviz**. This is useful for understanding how agents, tools, and handoffs interact within an application.
 
 ## Installation
 
@@ -24,11 +24,12 @@ You can generate an agent visualization using the `draw_graph` function. This fu
 ```python
 import os
 
-from agents import Agent, function_tool
+from agents import Agent, handoff
+from agents.decorators import tool
 from agents.mcp.server import MCPServerStdio
 from agents.extensions.visualization import draw_graph
 
-@function_tool
+@tool
 def get_weather(city: str) -> str:
     return f"The weather in {city} is sunny."
 
@@ -55,7 +56,7 @@ mcp_server = MCPServerStdio(
 triage_agent = Agent(
     name="Triage agent",
     instructions="Handoff to the appropriate agent based on the language of the request.",
-    handoffs=[spanish_agent, english_agent],
+    handoffs=[handoff(spanish_agent), handoff(english_agent)],
     tools=[get_weather],
     mcp_servers=[mcp_server],
 )
@@ -66,6 +67,8 @@ draw_graph(triage_agent)
 ![Agent Graph](./assets/images/graph.png)
 
 This generates a graph that visually represents the structure of the **triage agent** and its connections to sub-agents and tools.
+
+`draw_graph()` recursively expands target agents supplied directly in `handoffs` or registered through `handoff(agent)`. In both forms, the graph includes each target's tools, MCP servers, and downstream handoffs. A custom `Handoff` without an available target `Agent` is rendered as a named destination only, so the graph cannot expand resources behind that destination.
 
 
 ## Understanding the visualization
@@ -82,9 +85,7 @@ The generated graph includes:
   - **Dashed arrows** for MCP server invocations.
 - An **end node** (`__end__`) indicating where execution terminates.
 
-**Note:** MCP servers are rendered in recent versions of the
-`agents` package (verified in **v0.2.8**). If you don’t see MCP boxes
-in your visualization, upgrade to the latest release.
+**Note:** MCP servers are rendered in recent versions of the `agents` package, including **v0.2.8**, where this behavior was verified. If you don’t see MCP boxes in your visualization, upgrade to the latest release.
 
 ## Customizing the graph
 

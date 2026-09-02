@@ -2,22 +2,40 @@ from __future__ import annotations
 
 import io
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePath, PureWindowsPath
 from typing import cast
 
 import pytest
 
 from agents.sandbox import Manifest, SandboxPathGrant
-from agents.sandbox.capabilities import LocalDirLazySkillSource, Skill, Skills
+from agents.sandbox.capabilities import (
+    LazySkillSource,
+    LocalDirLazySkillSource,
+    Skill,
+    SkillMetadata,
+    Skills,
+)
 from agents.sandbox.entries import Dir, File, LocalDir
-from agents.sandbox.errors import SkillsConfigError
+from agents.sandbox.errors import (
+    SkillsConfigError,
+    WorkspaceArchiveReadError,
+    WorkspaceReadNotFoundError,
+)
 from agents.sandbox.files import EntryKind, FileEntry
 from agents.sandbox.session.base_sandbox_session import BaseSandboxSession
+from agents.sandbox.session.sandbox_session import SandboxSession
 from agents.sandbox.snapshot import NoopSnapshot
-from agents.sandbox.types import ExecResult, Permissions, User
-from agents.sandbox.workspace_paths import coerce_posix_path
+from agents.sandbox.types import ExecResult, FileMode, Group, Permissions, User
+from agents.sandbox.workspace_paths import (
+    SandboxWorkspaceScope,
+    coerce_posix_path,
+    sandbox_path_str,
+)
+from agents.testing import scripted_sandbox_session
 from agents.tool import FunctionTool
 from agents.tool_context import ToolContext
+from agents.tracing import trace
+from tests.testing_processor import fetch_ordered_spans
 from tests.utils.factories import TestSessionState
 
 
@@ -37,6 +55,39 @@ def _user_name(user: object) -> str | None:
     if isinstance(user, str):
         return user
     return str(user)
+
+
+class _StaticResultLazySkillSource(LazySkillSource):
+    result: dict[str, str]
+    metadata_path: PurePath | None = None
+
+    def list_skill_metadata(
+        self,
+        *,
+        skills_path: str,
+        source_grants: tuple[SandboxPathGrant, ...] = (),
+    ) -> list[SkillMetadata]:
+        _ = (skills_path, source_grants)
+        if self.metadata_path is None:
+            return []
+        return [
+            SkillMetadata(
+                name="dynamic-skill",
+                description="dynamic description",
+                path=self.metadata_path,
+            )
+        ]
+
+    async def load_skill(
+        self,
+        *,
+        skill_name: str,
+        session: BaseSandboxSession,
+        skills_path: str,
+        user: str | User | None = None,
+    ) -> dict[str, str]:
+        _ = (skill_name, session, skills_path, user)
+        return dict(self.result)
 
 
 class _SkillsSession(BaseSandboxSession):
@@ -125,6 +176,37 @@ class _SkillsSession(BaseSandboxSession):
                 )
             )
         return entries
+
+
+class _WorkspaceNotFoundSkillsSession(_SkillsSession):
+    async def read(self, path: Path, *, user: object = None) -> io.BytesIO:
+        try:
+            return await super().read(path, user=user)
+        except FileNotFoundError as exc:
+            raise WorkspaceReadNotFoundError(path=path, cause=exc) from exc
+
+
+class _ExecRecordingSkillsSession(_SkillsSession):
+    def __init__(self, manifest: Manifest) -> None:
+        super().__init__(manifest)
+        self.commands: list[tuple[str, ...]] = []
+
+    async def _exec_internal(
+        self,
+        *command: str | Path,
+        timeout: float | None = None,
+    ) -> ExecResult:
+        self.commands.append(tuple(str(part) for part in command))
+        return await super()._exec_internal(*command, timeout=timeout)
+
+
+class _ArchiveReadErrorSkillsSession(_SkillsSession):
+    async def read(self, path: Path, *, user: object = None) -> io.BytesIO:
+        self.read_users.append(_user_name(user))
+        raise WorkspaceArchiveReadError(
+            path=path,
+            cause=PermissionError("simulated permission failure"),
+        )
 
 
 class TestSkillValidation:
@@ -353,6 +435,7 @@ class TestSkillsInstructions:
         assert "### How to use skills" in instructions
         assert "- a-skill: a description (file: .agents/a-skill)" in instructions
         assert "- z-skill: z description (file: .agents/z-skill)" in instructions
+        assert "### Run-scoped skill paths" not in instructions
         assert instructions.index(
             "- a-skill: a description (file: .agents/a-skill)"
         ) < instructions.index("- z-skill: z description (file: .agents/z-skill)")
@@ -368,6 +451,20 @@ class TestSkillsInstructions:
 
         assert instructions is not None
         assert "- my-skill: desc (file: .sandbox/skills/my-skill)" in instructions
+
+    @pytest.mark.asyncio
+    async def test_instructions_render_session_owned_paths_as_absolute_with_run_cwd(self) -> None:
+        capability = Skills(
+            skills=[Skill(name="my-skill", description="desc", content="literal")],
+        )
+        capability.bind_workspace_scope(SandboxWorkspaceScope.from_cwd("tasks/task-a"))
+
+        instructions = await capability.instructions(Manifest(root="/workspace"))
+
+        assert instructions is not None
+        assert "- my-skill: desc (file: /workspace/.agents/my-skill)" in instructions
+        assert "Treat each listed path as the skill root" in instructions
+        assert "write task inputs, outputs, caches, and temporary files" in instructions
 
     @pytest.mark.asyncio
     async def test_instructions_return_none_when_metadata_is_empty(self) -> None:
@@ -418,12 +515,14 @@ class TestSkillsInstructions:
         session = _SkillsSession(manifest)
         await session.apply_manifest()
         capability.bind(session)
+        capability.bind_workspace_scope(SandboxWorkspaceScope.from_cwd("tasks/task-a"))
 
         instructions = await capability.instructions(session.state.manifest)
 
         assert instructions is not None
         assert (
-            "- discovered-skill: loaded from runtime frontmatter (file: .agents/dynamic-skill)"
+            "- discovered-skill: loaded from runtime frontmatter "
+            f"(file: {workspace_root.as_posix()}/.agents/dynamic-skill)"
         ) in instructions
 
     @pytest.mark.asyncio
@@ -518,8 +617,169 @@ class TestSkillsInstructions:
         loaded_skill = workspace_root / ".agents" / "dynamic-skill" / "SKILL.md"
         assert loaded_skill.read_text(encoding="utf-8") == "# dynamic skill\n"
 
+    @pytest.mark.asyncio
+    async def test_lazy_load_reports_absolute_path_without_relocating_skill(
+        self, tmp_path: Path
+    ) -> None:
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        src_root = tmp_path / "skills"
+        skill_dir = src_root / "dynamic-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("# dynamic skill\n", encoding="utf-8")
+        capability = Skills(
+            lazy_from=LocalDirLazySkillSource(source=LocalDir(src=src_root)),
+        )
+        session = _SkillsSession(
+            capability.process_manifest(_source_granted_manifest(workspace_root, source=src_root))
+        )
+        capability.bind(session)
+        capability.bind_workspace_scope(SandboxWorkspaceScope.from_cwd("tasks/task-a"))
+
+        output = await capability.load_skill("dynamic-skill")
+
+        assert output == {
+            "status": "loaded",
+            "skill_name": "dynamic-skill",
+            "path": f"{workspace_root.as_posix()}/.agents/dynamic-skill",
+        }
+        assert (workspace_root / ".agents" / "dynamic-skill" / "SKILL.md").is_file()
+        assert not (workspace_root / "tasks" / "task-a" / ".agents").exists()
+
+    @pytest.mark.asyncio
+    async def test_lazy_local_dir_load_skill_applies_source_metadata(self, tmp_path: Path) -> None:
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        src_root = tmp_path / "skills"
+        skill_dir = src_root / "dynamic-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("# dynamic skill\n", encoding="utf-8")
+
+        source = LocalDir(
+            src=src_root,
+            permissions=Permissions(owner=FileMode.ALL, group=0, other=0),
+            group=Group(name="staff", users=[]),
+        )
+        capability = Skills(lazy_from=LocalDirLazySkillSource(source=source))
+        manifest = capability.process_manifest(
+            _source_granted_manifest(workspace_root, source=src_root)
+        )
+        session = _ExecRecordingSkillsSession(manifest)
+        capability.bind(session)
+        tool = cast(FunctionTool, capability.tools()[0])
+
+        await tool.on_invoke_tool(
+            cast(ToolContext[object], None),
+            '{"skill_name":"dynamic-skill"}',
+        )
+
+        skill_dest = sandbox_path_str(workspace_root / ".agents" / "dynamic-skill")
+        assert ("chmod", "0700", skill_dest) in session.commands
+        assert ("chgrp", "staff", skill_dest) in session.commands
+        # The configured source entry must not be repointed at the loaded skill.
+        assert source.src == src_root
+
+    @pytest.mark.asyncio
+    async def test_lazy_local_dir_load_skill_keeps_default_permissions(
+        self, tmp_path: Path
+    ) -> None:
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        src_root = tmp_path / "skills"
+        skill_dir = src_root / "dynamic-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("# dynamic skill\n", encoding="utf-8")
+
+        capability = Skills(
+            lazy_from=LocalDirLazySkillSource(source=LocalDir(src=src_root)),
+        )
+        manifest = capability.process_manifest(
+            _source_granted_manifest(workspace_root, source=src_root)
+        )
+        session = _ExecRecordingSkillsSession(manifest)
+        capability.bind(session)
+        tool = cast(FunctionTool, capability.tools()[0])
+
+        await tool.on_invoke_tool(
+            cast(ToolContext[object], None),
+            '{"skill_name":"dynamic-skill"}',
+        )
+
+        skill_dest = sandbox_path_str(workspace_root / ".agents" / "dynamic-skill")
+        assert ("chmod", "0755", skill_dest) in session.commands
+        assert not any(command[:1] == ("chgrp",) for command in session.commands)
+
 
 class TestSkillsLazyLoading:
+    @pytest.mark.asyncio
+    async def test_custom_lazy_result_is_unchanged_without_run_cwd(self) -> None:
+        expected = {"status": "loaded", "detail": "opaque"}
+        capability = Skills(lazy_from=_StaticResultLazySkillSource(result=expected))
+        capability.bind(scripted_sandbox_session(manifest=Manifest(root="/workspace")))
+
+        output = await capability.load_skill("dynamic-skill")
+
+        assert output == expected
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("result", "reason"),
+        [
+            ({"status": "loaded"}, "missing"),
+            ({"status": "loaded", "path": "../escape"}, "invalid"),
+            ({"status": "loaded", "path": r".agents\dynamic-skill"}, "invalid"),
+        ],
+    )
+    async def test_custom_lazy_result_requires_valid_path_with_run_cwd(
+        self,
+        result: dict[str, str],
+        reason: str,
+    ) -> None:
+        capability = Skills(lazy_from=_StaticResultLazySkillSource(result=result))
+        capability.bind(scripted_sandbox_session(manifest=Manifest(root="/workspace")))
+        capability.bind_workspace_scope(SandboxWorkspaceScope.from_cwd("tasks/task-a"))
+
+        with pytest.raises(SkillsConfigError) as exc_info:
+            await capability.load_skill("dynamic-skill")
+
+        assert exc_info.value.message == (
+            "skill path must be non-empty and workspace-relative when sandbox.cwd is configured"
+        )
+        assert exc_info.value.context["skill_name"] == "dynamic-skill"
+        assert exc_info.value.context["field"] == "path"
+        assert exc_info.value.context["reason"] == reason
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "metadata_path",
+        [Path("../outside"), PureWindowsPath("../outside")],
+    )
+    async def test_custom_lazy_metadata_reports_invalid_scoped_path_as_config_error(
+        self,
+        metadata_path: PurePath,
+    ) -> None:
+        capability = Skills(
+            lazy_from=_StaticResultLazySkillSource(
+                result={"status": "loaded", "path": ".agents/dynamic-skill"},
+                metadata_path=metadata_path,
+            )
+        )
+        capability.bind_workspace_scope(SandboxWorkspaceScope.from_cwd("tasks/task-a"))
+
+        with pytest.raises(SkillsConfigError) as exc_info:
+            await capability.instructions(Manifest(root="/workspace"))
+
+        assert exc_info.value.message == (
+            "skill path must be non-empty and workspace-relative when sandbox.cwd is configured"
+        )
+        assert exc_info.value.context == {
+            "skill_name": "dynamic-skill",
+            "field": "path",
+            "path": "../outside",
+            "reason": "invalid",
+        }
+        assert isinstance(exc_info.value.cause, ValueError)
+
     def test_tools_returns_empty_without_lazy_source(self) -> None:
         capability = Skills(skills=[Skill(name="my-skill", description="desc", content="literal")])
 
@@ -543,7 +803,11 @@ class TestSkillsLazyLoading:
         skill_dir.mkdir(parents=True)
         (skill_dir / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
         capability = Skills(lazy_from=LocalDirLazySkillSource(source=LocalDir(src=src_root)))
-        capability.bind(_SkillsSession(_source_granted_manifest(workspace_root, source=src_root)))
+        capability.bind(
+            scripted_sandbox_session(
+                manifest=_source_granted_manifest(workspace_root, source=src_root)
+            )
+        )
 
         tools = capability.tools()
 
@@ -611,6 +875,72 @@ class TestSkillsLazyLoading:
         assert set(session.mkdir_users) == {"sandbox-user"}
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "session_type",
+        [_SkillsSession, _WorkspaceNotFoundSkillsSession],
+    )
+    async def test_first_load_omits_only_expected_probe_span_error(
+        self,
+        tmp_path: Path,
+        session_type: type[_SkillsSession],
+    ) -> None:
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        src_root = tmp_path / "skills"
+        skill_dir = src_root / "dynamic-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("# dynamic skill\n", encoding="utf-8")
+        capability = Skills(lazy_from=LocalDirLazySkillSource(source=LocalDir(src=src_root)))
+        inner = session_type(_source_granted_manifest(workspace_root, source=src_root))
+
+        async with SandboxSession(inner) as session:
+            capability.bind(session)
+            with trace("lazy_skill_expected_probe_test"):
+                output = await capability.load_skill("dynamic-skill")
+
+        assert output == {
+            "status": "loaded",
+            "skill_name": "dynamic-skill",
+            "path": ".agents/dynamic-skill",
+        }
+        read_spans = [
+            span
+            for span in fetch_ordered_spans()
+            if span.span_data.export().get("name") == "sandbox.read"
+        ]
+        assert len(read_spans) == 1
+        assert read_spans[0].error is None
+
+    @pytest.mark.asyncio
+    async def test_load_skill_propagates_non_not_found_read_error(self, tmp_path: Path) -> None:
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        src_root = tmp_path / "skills"
+        skill_dir = src_root / "dynamic-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("# dynamic skill\n", encoding="utf-8")
+        capability = Skills(lazy_from=LocalDirLazySkillSource(source=LocalDir(src=src_root)))
+        inner = _ArchiveReadErrorSkillsSession(
+            _source_granted_manifest(workspace_root, source=src_root)
+        )
+
+        async with SandboxSession(inner) as session:
+            capability.bind(session)
+            with trace("lazy_skill_unexpected_probe_error_test"):
+                with pytest.raises(WorkspaceArchiveReadError):
+                    await capability.load_skill("dynamic-skill")
+
+        assert inner.write_users == []
+        assert inner.mkdir_users == []
+        read_spans = [
+            span
+            for span in fetch_ordered_spans()
+            if span.span_data.export().get("name") == "sandbox.read"
+        ]
+        assert len(read_spans) == 1
+        assert read_spans[0].error is not None
+
+    @pytest.mark.asyncio
     async def test_load_skill_rejects_missing_lazy_source_directory(self, tmp_path: Path) -> None:
         workspace_root = tmp_path / "workspace"
         workspace_root.mkdir()
@@ -618,8 +948,10 @@ class TestSkillsLazyLoading:
             lazy_from=LocalDirLazySkillSource(source=LocalDir(src=tmp_path / "missing-skills"))
         )
         capability.bind(
-            _SkillsSession(
-                _source_granted_manifest(workspace_root, source=tmp_path / "missing-skills")
+            scripted_sandbox_session(
+                manifest=_source_granted_manifest(
+                    workspace_root, source=tmp_path / "missing-skills"
+                )
             )
         )
 
@@ -644,7 +976,11 @@ class TestSkillsLazyLoading:
             encoding="utf-8",
         )
         capability = Skills(lazy_from=LocalDirLazySkillSource(source=LocalDir(src=src_root)))
-        capability.bind(_SkillsSession(_source_granted_manifest(workspace_root, source=src_root)))
+        capability.bind(
+            scripted_sandbox_session(
+                manifest=_source_granted_manifest(workspace_root, source=src_root)
+            )
+        )
 
         with pytest.raises(SkillsConfigError):
             await capability.load_skill("shared-skill")
@@ -673,7 +1009,11 @@ class TestSkillsLazyLoading:
         second_instructions = await capability.instructions(
             _source_granted_manifest(workspace_root, source=src_root)
         )
-        capability.bind(_SkillsSession(_source_granted_manifest(workspace_root, source=src_root)))
+        capability.bind(
+            scripted_sandbox_session(
+                manifest=_source_granted_manifest(workspace_root, source=src_root)
+            )
+        )
         third_instructions = await capability.instructions(
             _source_granted_manifest(workspace_root, source=src_root)
         )
@@ -686,3 +1026,48 @@ class TestSkillsLazyLoading:
             "- cached-skill: old description (file: .agents/dynamic-skill)" in second_instructions
         )
         assert "- cached-skill: new description (file: .agents/dynamic-skill)" in third_instructions
+
+    @pytest.mark.asyncio
+    async def test_lazy_metadata_cache_is_invalidated_when_host_path_changes(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        src_root = tmp_path / "skills"
+        skill_dir = src_root / "dynamic-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: cached-skill\ndescription: cached description\n---\n# Skill\n",
+            encoding="utf-8",
+        )
+        other_root = tmp_path / "other-skills"
+        other_root.mkdir()
+        capability = Skills(lazy_from=LocalDirLazySkillSource(source=LocalDir(src=src_root)))
+
+        first_instructions = await capability.instructions(
+            Manifest(
+                root="/workspace",
+                extra_path_grants=(
+                    SandboxPathGrant(
+                        path="/mnt/skills",
+                        host_path=str(src_root),
+                    ),
+                ),
+            )
+        )
+        second_instructions = await capability.instructions(
+            Manifest(
+                root="/workspace",
+                extra_path_grants=(
+                    SandboxPathGrant(
+                        path="/mnt/skills",
+                        host_path=str(other_root),
+                    ),
+                ),
+            )
+        )
+
+        assert first_instructions is not None
+        assert (
+            "- cached-skill: cached description (file: .agents/dynamic-skill)" in first_instructions
+        )
+        assert second_instructions is None

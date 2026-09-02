@@ -1,5 +1,8 @@
 import logging
 
+import pytest
+
+import agents._debug as _debug
 from agents.tracing.provider import DefaultTraceProvider
 from agents.tracing.scope import Scope
 from agents.tracing.span_data import AgentSpanData
@@ -13,6 +16,38 @@ def test_env_read_on_first_use(monkeypatch):
     provider = DefaultTraceProvider()
 
     trace = provider.create_trace("demo")
+
+    assert isinstance(trace, NoOpTrace)
+
+
+@pytest.mark.parametrize("redacted", [True, False])
+def test_disabled_span_logging_respects_data_policy(monkeypatch, caplog, redacted: bool):
+    class SensitiveAgentSpanData(AgentSpanData):
+        def __repr__(self) -> str:
+            return "SECRET_SPAN_NAME"
+
+    monkeypatch.setenv("OPENAI_AGENTS_DISABLE_TRACING", "1")
+    monkeypatch.setattr(_debug, "DONT_LOG_MODEL_DATA", redacted)
+    monkeypatch.setattr(_debug, "DONT_LOG_TOOL_DATA", redacted)
+    provider = DefaultTraceProvider()
+
+    with caplog.at_level(logging.DEBUG, logger="openai.agents"):
+        span = provider.create_span(SensitiveAgentSpanData(name="agent"))
+
+    assert isinstance(span, NoOpSpan)
+    assert ("SECRET_SPAN_NAME" not in caplog.text) is redacted
+    assert "Tracing is disabled. Not creating span" in caplog.text
+
+
+def test_force_flush_initializes_env_disable_cache(monkeypatch):
+    """Force flush preserves the first-use timing for the env disable flag."""
+    monkeypatch.setenv("OPENAI_AGENTS_DISABLE_TRACING", "1")
+    provider = DefaultTraceProvider()
+
+    provider.force_flush()
+
+    monkeypatch.setenv("OPENAI_AGENTS_DISABLE_TRACING", "0")
+    trace = provider.create_trace("still-disabled")
 
     assert isinstance(trace, NoOpTrace)
 
@@ -110,3 +145,32 @@ def test_noop_current_span_id_does_not_become_parent_id():
         Scope.reset_current_trace(trace_token)
 
     assert isinstance(span, NoOpSpan)
+
+
+def test_falsy_current_span_becomes_parent() -> None:
+    class FalsySpan(SpanImpl[AgentSpanData]):
+        def __bool__(self) -> bool:
+            return False
+
+    Scope.set_current_trace(None)
+    Scope.set_current_span(None)
+    provider = DefaultTraceProvider()
+    trace = provider.create_trace("active", trace_id="trace_123")
+    parent = FalsySpan(
+        trace_id="trace_123",
+        span_id="span_parent",
+        parent_id=None,
+        processor=provider._multi_processor,
+        span_data=AgentSpanData(name="parent"),
+        tracing_api_key=None,
+    )
+    trace_token = Scope.set_current_trace(trace)
+    span_token = Scope.set_current_span(parent)
+    try:
+        child = provider.create_span(AgentSpanData(name="child"))
+    finally:
+        Scope.reset_current_span(span_token)
+        Scope.reset_current_trace(trace_token)
+
+    assert isinstance(child, SpanImpl)
+    assert child.parent_id == "span_parent"

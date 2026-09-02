@@ -15,7 +15,7 @@ Identify doc coverage gaps and inaccuracies by comparing main branch features an
    - Identify the current branch and default branch (usually `main`).
    - Prefer analyzing the current branch to keep work aligned with in-flight changes.
    - If the current branch is not `main`, analyze only the diff vs `main` to scope doc updates.
-   - Avoid switching branches if it would disrupt local changes; use `git show main:<path>` or `git worktree add` when needed.
+   - Avoid switching branches if it would disrupt local changes. Prefer read-only inspection such as `git show main:<path>`. If a separate checkout is genuinely required, stop and obtain the explicit approval required by `AGENTS.md` before creating or switching a worktree.
 
 2. Build a feature inventory from the selected scope
    - If on `main`: inventory the full surface area and review docs comprehensively.
@@ -51,7 +51,8 @@ Identify doc coverage gaps and inaccuracies by comparing main branch features an
    - Do **not** edit `docs/ja`, `docs/ko`, or `docs/zh`.
    - Keep changes aligned with the existing docs style and navigation.
    - Update `mkdocs.yml` when adding or renaming pages.
-   - Build docs with `make build-docs` after edits to verify the docs site still builds.
+   - Classify the complete diff with the Documentation Verification Tiers in `AGENTS.md` and run only the checks required by that tier.
+   - For content or structural changes, run `make build-docs` once after the edits and required review are stable. Do not run it for editorial-only changes.
 
 ## Output format
 

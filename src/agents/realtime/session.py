@@ -4,27 +4,48 @@ import asyncio
 import dataclasses
 import inspect
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
+from functools import partial
 from typing import Any, cast
 
 from pydantic import BaseModel
 from typing_extensions import assert_never
 
+from .. import _debug
 from .._tool_identity import (
     FunctionToolLookupKey,
+    get_function_tool_lookup_key,
     get_function_tool_lookup_key_for_tool,
     get_function_tool_namespace,
 )
+from .._tool_invocation import tool_invocation_identity
 from ..agent import Agent
-from ..exceptions import UserError
+from ..exceptions import (
+    ModelBehaviorError,
+    ToolInputGuardrailTripwireTriggered,
+    UserError,
+    _clear_data_redacted_error_traceback,
+    _detach_data_redacted_error_traceback,
+    _is_error_data_redacted,
+    _raise_data_redacted_error,
+)
 from ..handoffs import Handoff
 from ..items import ToolApprovalItem
-from ..logger import logger
+from ..logger import (
+    log_model_action_error,
+    log_model_and_tool_action_warning,
+    log_tool_action_error,
+    logger,
+)
 from ..run_config import ToolErrorFormatterArgs
 from ..run_context import RunContextWrapper, TContext
-from ..tool import DEFAULT_APPROVAL_REJECTION_MESSAGE, FunctionTool, invoke_function_tool
+from ..tool import DEFAULT_APPROVAL_REJECTION_MESSAGE, FunctionTool, Tool, invoke_function_tool
 from ..tool_context import ToolContext
-from ..util._approvals import evaluate_needs_approval_setting
+from ..tool_guardrails import ToolInputGuardrailData
+from ..util._approvals import evaluate_needs_approval_setting, parse_function_tool_arguments
+from ..util._asyncio_tasks import gather_with_cancel
+from ._tool_filtering import filter_enabled_tools
+from ._tool_validation import validate_realtime_tool_names
 from .agent import RealtimeAgent
 from .config import RealtimeRunConfig, RealtimeSessionModelSettings, RealtimeUserInput
 from .events import (
@@ -46,7 +67,7 @@ from .events import (
     RealtimeToolEnd,
     RealtimeToolStart,
 )
-from .handoffs import realtime_handoff
+from .handoffs import collect_enabled_handoffs, filter_enabled_handoffs
 from .items import (
     AssistantAudio,
     AssistantMessageItem,
@@ -59,9 +80,12 @@ from .items import (
 )
 from .model import RealtimeModel, RealtimeModelConfig, RealtimeModelListener
 from .model_events import (
+    RealtimeModelEndOfStreamEvent,
     RealtimeModelEvent,
     RealtimeModelInputAudioTranscriptionCompletedEvent,
+    RealtimeModelOutputTextDeltaEvent,
     RealtimeModelToolCallEvent,
+    RealtimeModelUsageEvent,
 )
 from .model_inputs import (
     RealtimeModelSendAudio,
@@ -79,6 +103,19 @@ class _RealtimeSessionClosedSentinel:
 
 
 _REALTIME_SESSION_CLOSED_SENTINEL = _RealtimeSessionClosedSentinel()
+_BACKGROUND_TASK_CANCEL_GRACE_SECONDS = 1.0
+
+
+def _guardrail_diagnostic_extra(guardrail: Any) -> dict[str, object]:
+    try:
+        return {"guardrail_name": guardrail.get_name()}
+    except Exception:
+        try:
+            guardrail_type = type(guardrail.guardrail_function)
+            type_name = f"{guardrail_type.__module__}.{guardrail_type.__qualname__}"
+        except Exception:
+            type_name = "unknown"
+        return {"guardrail_type": type_name}
 
 
 def _serialize_tool_output(output: Any) -> str:
@@ -111,6 +148,22 @@ class _PendingToolOutput:
     start_response: bool
     tool_end_event: RealtimeToolEnd | None = None
     session_update: RealtimeModelSendSessionUpdate | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class _RealtimeDispatchSnapshot:
+    agent: RealtimeAgent[Any]
+    tools: tuple[Tool, ...]
+    handoffs: tuple[Handoff[Any, RealtimeAgent[Any]], ...]
+
+
+@dataclasses.dataclass
+class _PendingToolCall:
+    tool_call: RealtimeModelToolCallEvent
+    agent: RealtimeAgent[Any]
+    dispatch_snapshot: _RealtimeDispatchSnapshot
+    function_tool: FunctionTool
+    approval_item: ToolApprovalItem
 
 
 class _PendingToolOutputSendError(RuntimeError):
@@ -173,24 +226,35 @@ class RealtimeSession(RealtimeModelListener):
             asyncio.Queue()
         )
         self._event_iterator_waiters = 0
+        self._closing = False
         self._closed = False
+        self._model_stream_ended = False
+        self._cleanup_task: asyncio.Task[None] | None = None
         self._stored_exception: BaseException | None = None
-        self._pending_tool_calls: dict[
-            str, tuple[RealtimeModelToolCallEvent, RealtimeAgent, FunctionTool, ToolApprovalItem]
+        self._pending_tool_calls: dict[str, _PendingToolCall] = {}
+        self._tool_invocation_routes: dict[
+            str,
+            tuple[FunctionToolLookupKey | None, str | None],
         ] = {}
-        self._active_tool_call_ids: set[str] = set()
-        self._completed_tool_call_ids: set[str] = set()
+        self._active_tool_invocations: dict[str, tuple[str, str, str]] = {}
         self._pending_tool_outputs: dict[str, _PendingToolOutput] = {}
+        self._current_dispatch_snapshot: _RealtimeDispatchSnapshot | None = None
 
         # Guardrails state tracking
         self._interrupted_response_ids: set[str] = set()
         self._item_transcripts: dict[str, str] = {}  # item_id -> accumulated transcript
         self._item_guardrail_run_counts: dict[str, int] = {}  # item_id -> run count
+        self._latest_output_response_generation = 0
+        self._active_output_response_generation: int | None = None
+        self._active_output_response_id: str | None = None
+        self._active_output_response_agent: RealtimeAgent[Any] | None = None
         self._debounce_text_length = self._run_config.get("guardrails_settings", {}).get(
             "debounce_text_length", 100
         )
 
         self._guardrail_tasks: set[asyncio.Task[Any]] = set()
+        self._guardrail_tasks_by_response_id: dict[str, set[asyncio.Task[Any]]] = {}
+        self._responses_awaiting_guardrail_cleanup: set[str] = set()
         self._tool_call_tasks: set[asyncio.Task[Any]] = set()
         self._async_tool_calls: bool = bool(self._run_config.get("async_tool_calls", True))
 
@@ -203,17 +267,26 @@ class RealtimeSession(RealtimeModelListener):
         """Start the session by connecting to the model. After this, you will be able to stream
         events from the model and send messages and audio to the model.
         """
-        # Add ourselves as a listener
-        self._model.add_listener(self)
-
         model_config = self._model_config.copy()
-        model_config["initial_model_settings"] = await self._get_updated_model_settings_from_agent(
+        initial_model_settings = await self._get_updated_model_settings_from_agent(
             starting_settings=self._model_config.get("initial_model_settings", None),
             agent=self._current_agent,
         )
+        model_config["initial_model_settings"] = initial_model_settings
+        self._current_dispatch_snapshot = self._dispatch_snapshot_from_settings(
+            self._current_agent,
+            initial_model_settings,
+        )
 
-        # Connect to the model
-        await self._model.connect(model_config)
+        # Add ourselves as a listener only after initial settings have been validated.
+        self._model.add_listener(self)
+
+        try:
+            # Connect to the model.
+            await self._model.connect(model_config)
+        except BaseException:
+            self._model.remove_listener(self)
+            raise
 
         # Emit initial history update
         await self._put_event(
@@ -239,30 +312,57 @@ class RealtimeSession(RealtimeModelListener):
     async def __aiter__(self) -> AsyncIterator[RealtimeSessionEvent]:
         """Iterate over events from the session."""
         while True:
-            if self._closed and self._event_queue.empty():
+            if (self._closed or self._model_stream_ended) and self._event_queue.empty():
                 return
 
-            try:
-                # Check if there's a stored exception to raise
-                if self._stored_exception is not None:
-                    # Clean up resources before raising
-                    await self._cleanup()
-                    raise self._stored_exception
+            # Check if there's a stored exception to raise
+            if self._stored_exception is not None:
+                # Clean up resources before raising
+                await self.close()
+                stored_exception = self._stored_exception
+                if isinstance(stored_exception, Exception) and _is_error_data_redacted(
+                    stored_exception
+                ):
+                    _detach_data_redacted_error_traceback(stored_exception)
+                    # Do not retain the session or the previously yielded raw event in the
+                    # traceback frame that exposes a redacted error to the caller.
+                    self = cast(Any, None)
+                    event = cast(Any, None)
+                raise stored_exception
 
-                self._event_iterator_waiters += 1
-                try:
-                    event = await self._event_queue.get()
-                finally:
-                    self._event_iterator_waiters -= 1
-                if event is _REALTIME_SESSION_CLOSED_SENTINEL:
-                    return
-                yield cast(RealtimeSessionEvent, event)
-            except asyncio.CancelledError:
-                break
+            self._event_iterator_waiters += 1
+            try:
+                event = await self._event_queue.get()
+            finally:
+                self._event_iterator_waiters -= 1
+            if event is _REALTIME_SESSION_CLOSED_SENTINEL:
+                return
+            yield cast(RealtimeSessionEvent, event)
 
     async def close(self) -> None:
         """Close the session."""
-        await self._cleanup()
+        if self._closed:
+            self._wake_event_iterators()
+            return
+
+        cleanup_task = self._cleanup_task
+        current_task = asyncio.current_task()
+        if cleanup_task is not None and (
+            current_task in self._guardrail_tasks or current_task in self._tool_call_tasks
+        ):
+            # Cleanup is already waiting for this tracked task, so waiting here would form a cycle.
+            raise asyncio.CancelledError
+
+        if cleanup_task is None:
+            self._closing = True
+            cleanup_task = asyncio.create_task(
+                self._cleanup(),
+                name="agents-realtime-session-cleanup",
+            )
+            self._cleanup_task = cleanup_task
+            cleanup_task.add_done_callback(self._on_cleanup_task_done)
+
+        await asyncio.shield(cleanup_task)
 
     async def send_message(self, message: RealtimeUserInput) -> None:
         """Send a message to the model."""
@@ -278,37 +378,76 @@ class RealtimeSession(RealtimeModelListener):
 
     async def update_agent(self, agent: RealtimeAgent) -> None:
         """Update the active agent for this session and apply its settings to the model."""
-        self._current_agent = agent
-
         updated_settings = await self._get_updated_model_settings_from_agent(
             starting_settings=None,
-            agent=self._current_agent,
+            agent=agent,
         )
+        updated_snapshot = self._dispatch_snapshot_from_settings(agent, updated_settings)
+
+        self._current_agent = agent
+        self._current_dispatch_snapshot = updated_snapshot
 
         await self._model.send_event(
             RealtimeModelSendSessionUpdate(session_settings=updated_settings)
         )
 
+    def _reconcile_output_response(self, response_id: str) -> None:
+        if self._active_output_response_generation is None:
+            self._latest_output_response_generation += 1
+            self._active_output_response_generation = self._latest_output_response_generation
+            self._active_output_response_id = response_id
+            self._active_output_response_agent = self._current_agent
+        elif self._active_output_response_id is None:
+            self._active_output_response_id = response_id
+
     async def on_event(self, event: RealtimeModelEvent) -> None:
-        await self._put_event(RealtimeRawModelEvent(data=event, info=self._event_info))
+        if self._closing or self._closed:
+            return
+
+        if not await self._put_event(RealtimeRawModelEvent(data=event, info=self._event_info)):
+            return
+        if self._closing or self._closed:
+            return
 
         if event.type == "error":
             await self._put_event(RealtimeError(info=self._event_info, error=event.error))
         elif event.type == "function_call":
             agent_snapshot = self._current_agent
+            dispatch_snapshot = self._current_dispatch_snapshot
+            if dispatch_snapshot is not None and dispatch_snapshot.agent is not agent_snapshot:
+                dispatch_snapshot = None
             if self._async_tool_calls:
-                self._enqueue_tool_call_task(event, agent_snapshot)
+                self._enqueue_tool_call_task(event, agent_snapshot, dispatch_snapshot)
             else:
-                await self._handle_tool_call(event, agent_snapshot=agent_snapshot)
+                handle_kwargs: dict[str, Any] = {"agent_snapshot": agent_snapshot}
+                if dispatch_snapshot is not None:
+                    handle_kwargs["dispatch_snapshot"] = dispatch_snapshot
+                redacted_error: ModelBehaviorError | None = None
+                try:
+                    await self._handle_tool_call(event, **handle_kwargs)
+                except ModelBehaviorError as error:
+                    if not _is_error_data_redacted(error):
+                        raise
+                    _detach_data_redacted_error_traceback(error)
+                    redacted_error = error
+
+                if redacted_error is not None:
+                    self = cast(Any, None)
+                    event = cast(Any, None)
+                    agent_snapshot = cast(Any, None)
+                    dispatch_snapshot = cast(Any, None)
+                    handle_kwargs = {}
+                    _raise_data_redacted_error(redacted_error)
         elif event.type == "audio":
-            await self._put_event(
-                RealtimeAudio(
-                    info=self._event_info,
-                    audio=event,
-                    item_id=event.item_id,
-                    content_index=event.content_index,
+            if event.response_id not in self._interrupted_response_ids:
+                await self._put_event(
+                    RealtimeAudio(
+                        info=self._event_info,
+                        audio=event,
+                        item_id=event.item_id,
+                        content_index=event.content_index,
+                    )
                 )
-            )
         elif event.type == "audio_interrupted":
             await self._put_event(
                 RealtimeAudioInterrupted(
@@ -340,13 +479,16 @@ class RealtimeSession(RealtimeModelListener):
                 )
             )
         elif event.type == "transcript_delta":
-            # Accumulate transcript text for guardrail debouncing per item_id
             item_id = event.item_id
-            if item_id not in self._item_transcripts:
-                self._item_transcripts[item_id] = ""
-                self._item_guardrail_run_counts[item_id] = 0
-
-            self._item_transcripts[item_id] += event.delta
+            self._reconcile_output_response(event.response_id)
+            self._record_output_guardrail_delta(
+                item_id,
+                event.delta,
+                event.response_id,
+                agent_snapshot=self._active_output_response_agent,
+                output_response_generation=self._active_output_response_generation,
+                is_audio_output=True,
+            )
             self._history = self._get_new_history(
                 self._history,
                 AssistantMessageItem(
@@ -354,16 +496,17 @@ class RealtimeSession(RealtimeModelListener):
                     content=[AssistantAudio(transcript=self._item_transcripts[item_id])],
                 ),
             )
-
-            # Check if we should run guardrails based on debounce threshold
-            current_length = len(self._item_transcripts[item_id])
-            threshold = self._debounce_text_length
-            next_run_threshold = (self._item_guardrail_run_counts[item_id] + 1) * threshold
-
-            if current_length >= next_run_threshold:
-                self._item_guardrail_run_counts[item_id] += 1
-                # Pass response_id so we can ensure only a single interrupt per response
-                self._enqueue_guardrail_task(self._item_transcripts[item_id], event.response_id)
+        elif event.type == "output_text_delta":
+            assert isinstance(event, RealtimeModelOutputTextDeltaEvent)
+            self._reconcile_output_response(event.response_id)
+            self._record_output_guardrail_delta(
+                event.item_id,
+                event.delta,
+                event.response_id,
+                agent_snapshot=self._active_output_response_agent,
+                output_response_generation=self._active_output_response_generation,
+                is_audio_output=False,
+            )
         elif event.type == "item_updated":
             is_new = not any(item.item_id == event.item.item_id for item in self._history)
 
@@ -413,8 +556,8 @@ class RealtimeSession(RealtimeModelListener):
 
                     if new_content:
                         incoming_item = incoming_item.model_copy(update={"content": new_content})
-                except Exception:
-                    logger.error("Error merging transcripts", exc_info=True)
+                except Exception as exc:
+                    log_model_action_error(logger, "Error merging transcripts", exc)
                     pass
 
             self._history = self._get_new_history(self._history, incoming_item)
@@ -435,24 +578,52 @@ class RealtimeSession(RealtimeModelListener):
             )
         elif event.type == "connection_status":
             pass
+        elif event.type == "end_of_stream":
+            assert isinstance(event, RealtimeModelEndOfStreamEvent)
+            self._model_stream_ended = True
+            self._wake_event_iterators()
         elif event.type == "turn_started":
+            is_late_start_for_active_response = (
+                event.response_id is not None
+                and event.response_id == self._active_output_response_id
+                and self._active_output_response_generation is not None
+            )
+            if not is_late_start_for_active_response:
+                self._latest_output_response_generation += 1
+                self._active_output_response_generation = self._latest_output_response_generation
+                self._active_output_response_id = event.response_id
+                self._active_output_response_agent = self._current_agent
             await self._put_event(
                 RealtimeAgentStartEvent(
                     agent=self._current_agent,
                     info=self._event_info,
                 )
             )
+        elif event.type == "usage":
+            assert isinstance(event, RealtimeModelUsageEvent)
+            self._context_wrapper.usage.add(event.usage)
         elif event.type == "turn_ended":
-            # Clear guardrail state for next turn
-            self._item_transcripts.clear()
-            self._item_guardrail_run_counts.clear()
+            response_id = event.response_id or self._active_output_response_id
+            if response_id is not None:
+                self._finish_response_guardrail_lifecycle(response_id)
 
-            await self._put_event(
-                RealtimeAgentEndEvent(
-                    agent=self._current_agent,
-                    info=self._event_info,
-                )
+            is_active_response_ended = (
+                event.response_id is None or event.response_id == self._active_output_response_id
             )
+            if is_active_response_ended:
+                # Clear guardrail state for next turn.
+                self._item_transcripts.clear()
+                self._item_guardrail_run_counts.clear()
+                self._active_output_response_generation = None
+                self._active_output_response_id = None
+                self._active_output_response_agent = None
+
+                await self._put_event(
+                    RealtimeAgentEndEvent(
+                        agent=self._current_agent,
+                        info=self._event_info,
+                    )
+                )
         elif event.type == "exception":
             # Store the exception to be raised in __aiter__
             self._stored_exception = event.exception
@@ -463,9 +634,19 @@ class RealtimeSession(RealtimeModelListener):
         else:
             assert_never(event)
 
-    async def _put_event(self, event: RealtimeSessionEvent) -> None:
+    async def _put_event(self, event: RealtimeSessionEvent) -> bool:
         """Put an event into the queue."""
+        if self._closing or self._closed:
+            return False
         await self._event_queue.put(event)
+        return True
+
+    def _put_event_nowait(self, event: RealtimeSessionEvent) -> bool:
+        """Put an event into the unbounded queue from a synchronous callback."""
+        if self._closing or self._closed:
+            return False
+        self._event_queue.put_nowait(event)
+        return True
 
     async def _function_needs_approval(
         self, function_tool: FunctionTool, tool_call: RealtimeModelToolCallEvent
@@ -474,10 +655,10 @@ class RealtimeSession(RealtimeModelListener):
         needs_setting = getattr(function_tool, "needs_approval", False)
         parsed_args: dict[str, Any] = {}
         if callable(needs_setting):
-            try:
-                parsed_args = json.loads(tool_call.arguments or "{}")
-            except json.JSONDecodeError:
-                parsed_args = {}
+            parsed_args_result = parse_function_tool_arguments(tool_call.arguments)
+            if parsed_args_result is None:
+                return True
+            parsed_args = parsed_args_result
         return await evaluate_needs_approval_setting(
             needs_setting,
             self._context_wrapper,
@@ -520,8 +701,9 @@ class RealtimeSession(RealtimeModelListener):
         *,
         function_tool: FunctionTool,
         agent: RealtimeAgent,
-    ) -> bool | None:
-        """Return True/False when approved/rejected, or None when awaiting approval."""
+        dispatch_snapshot: _RealtimeDispatchSnapshot,
+    ) -> bool | None | _PendingToolOutput:
+        """Return approval status, pending output for guardrail rejection, or None when awaiting."""
         tool_lookup_key = get_function_tool_lookup_key_for_tool(function_tool)
         approval_item = self._build_tool_approval_item(
             function_tool,
@@ -529,27 +711,65 @@ class RealtimeSession(RealtimeModelListener):
             agent,
             tool_lookup_key=tool_lookup_key,
         )
-
-        needs_approval = await self._function_needs_approval(function_tool, tool_call)
-        if not needs_approval:
-            return True
-
         approval_status = self._context_wrapper.get_approval_status(
             function_tool.name,
             tool_call.call_id,
             existing_pending=approval_item,
             tool_lookup_key=tool_lookup_key,
         )
+        if approval_status is None:
+            needs_approval = await self._function_needs_approval(function_tool, tool_call)
+            if self._closing or self._closed:
+                return None
+            approval_status = self._context_wrapper.get_approval_status(
+                function_tool.name,
+                tool_call.call_id,
+                existing_pending=approval_item,
+                tool_lookup_key=tool_lookup_key,
+            )
+            if approval_status is None and not needs_approval:
+                return True
+
         if approval_status is True:
             return True
         if approval_status is False:
             return False
 
-        self._pending_tool_calls[tool_call.call_id] = (
-            tool_call,
-            agent,
-            function_tool,
-            approval_item,
+        if self._pre_approval_tool_input_guardrails_enabled():
+            rejected_message = await self._run_tool_input_guardrails(
+                tool=function_tool,
+                tool_call=tool_call,
+                agent=agent,
+            )
+            if self._closing or self._closed:
+                return None
+            approval_status = self._context_wrapper.get_approval_status(
+                function_tool.name,
+                tool_call.call_id,
+                existing_pending=approval_item,
+                tool_lookup_key=tool_lookup_key,
+            )
+            if approval_status is True:
+                return True
+            if approval_status is False:
+                return False
+            if rejected_message is not None:
+                return self._build_realtime_tool_output(
+                    tool=function_tool,
+                    tool_call=tool_call,
+                    agent=agent,
+                    output=rejected_message,
+                )
+
+        if self._closing or self._closed:
+            return None
+
+        self._pending_tool_calls[tool_call.call_id] = _PendingToolCall(
+            tool_call=tool_call,
+            agent=agent,
+            dispatch_snapshot=dispatch_snapshot,
+            function_tool=function_tool,
+            approval_item=approval_item,
         )
         await self._put_event(
             RealtimeToolApprovalRequired(
@@ -562,6 +782,66 @@ class RealtimeSession(RealtimeModelListener):
         )
         return None
 
+    def _pre_approval_tool_input_guardrails_enabled(self) -> bool:
+        return (
+            self._run_config.get("tool_execution", {}).get(
+                "pre_approval_tool_input_guardrails", False
+            )
+            is True
+        )
+
+    async def _run_tool_input_guardrails(
+        self,
+        *,
+        tool: FunctionTool,
+        tool_call: RealtimeModelToolCallEvent,
+        agent: RealtimeAgent,
+    ) -> str | None:
+        """Run function tool input guardrails and return rejection output when blocked."""
+        guardrails = tool.tool_input_guardrails
+        if isinstance(guardrails, str | bytes) or not isinstance(guardrails, Sequence):
+            return None
+        if not guardrails:
+            return None
+
+        tool_context = ToolContext.from_agent_context(
+            self._context_wrapper,
+            tool_name=tool_call.name,
+            tool_call_id=tool_call.call_id,
+            tool_arguments=tool_call.arguments,
+            agent=agent,
+        )
+        for guardrail in guardrails:
+            gr_out = await guardrail.run(
+                ToolInputGuardrailData(context=tool_context, agent=cast(Agent[Any], agent))
+            )
+            if gr_out.behavior["type"] == "raise_exception":
+                raise ToolInputGuardrailTripwireTriggered(guardrail=guardrail, output=gr_out)
+            if gr_out.behavior["type"] == "reject_content":
+                return gr_out.behavior["message"]
+        return None
+
+    def _build_realtime_tool_output(
+        self,
+        *,
+        tool: FunctionTool,
+        tool_call: RealtimeModelToolCallEvent,
+        agent: RealtimeAgent,
+        output: str,
+    ) -> _PendingToolOutput:
+        return _PendingToolOutput(
+            tool_call=tool_call,
+            output=output,
+            start_response=True,
+            tool_end_event=RealtimeToolEnd(
+                info=self._event_info,
+                tool=tool,
+                output=output,
+                agent=agent,
+                arguments=tool_call.arguments,
+            ),
+        )
+
     async def _send_tool_rejection(
         self,
         event: RealtimeModelToolCallEvent,
@@ -573,6 +853,7 @@ class RealtimeSession(RealtimeModelListener):
         rejection_message = await self._resolve_approval_rejection_message(
             tool=tool,
             call_id=event.call_id,
+            tool_call=self._build_tool_approval_item(tool, event, agent).raw_item,
         )
         await self._send_tool_output_completion(
             _PendingToolOutput(
@@ -590,17 +871,35 @@ class RealtimeSession(RealtimeModelListener):
         )
 
     async def _send_tool_output_completion(self, pending_output: _PendingToolOutput) -> None:
+        if self._closing or self._closed:
+            return
+
         call_id = pending_output.tool_call.call_id
         self._pending_tool_outputs[call_id] = pending_output
         try:
-            await self._send_pending_tool_output(pending_output)
+            output_sent = await self._send_pending_tool_output(pending_output)
         except Exception as exc:
+            if self._closing or self._closed:
+                self._pending_tool_outputs.pop(call_id, None)
+                return
             raise _PendingToolOutputSendError(call_id, exc) from exc
+        if not output_sent:
+            self._pending_tool_outputs.pop(call_id, None)
+            return
+        self._context_wrapper._mark_tool_call_completed(
+            {"type": "function_call_output", "call_id": call_id},
+        )
         self._pending_tool_outputs.pop(call_id, None)
+        if pending_output.tool_end_event is not None:
+            self._put_event_nowait(pending_output.tool_end_event)
 
-    async def _send_pending_tool_output(self, pending_output: _PendingToolOutput) -> None:
+    async def _send_pending_tool_output(self, pending_output: _PendingToolOutput) -> bool:
+        if self._closing or self._closed:
+            return False
         if pending_output.session_update is not None:
             await self._model.send_event(pending_output.session_update)
+        if self._closing or self._closed:
+            return False
         await self._model.send_event(
             RealtimeModelSendToolOutput(
                 tool_call=pending_output.tool_call,
@@ -608,10 +907,15 @@ class RealtimeSession(RealtimeModelListener):
                 start_response=pending_output.start_response,
             )
         )
-        if pending_output.tool_end_event is not None:
-            await self._put_event(pending_output.tool_end_event)
+        return True
 
-    async def _resolve_approval_rejection_message(self, *, tool: FunctionTool, call_id: str) -> str:
+    async def _resolve_approval_rejection_message(
+        self,
+        *,
+        tool: FunctionTool,
+        call_id: str,
+        tool_call: Any | None = None,
+    ) -> str:
         """Resolve model-visible output text for approval rejections."""
         explicit_message = self._context_wrapper.get_rejection_message(
             tool.name,
@@ -625,6 +929,11 @@ class RealtimeSession(RealtimeModelListener):
         if formatter is None:
             return REJECTION_MESSAGE
 
+        if tool_call is not None:
+            self._context_wrapper._mark_tool_invocation_executed(
+                tool_call,
+                tool_lookup_key=get_function_tool_lookup_key_for_tool(tool),
+            )
         try:
             maybe_message = formatter(
                 ToolErrorFormatterArgs(
@@ -638,51 +947,68 @@ class RealtimeSession(RealtimeModelListener):
             )
             message = await maybe_message if inspect.isawaitable(maybe_message) else maybe_message
         except Exception as exc:
-            logger.error("Tool error formatter failed for %s: %s", tool.name, exc)
+            log_tool_action_error(logger, "Tool error formatter failed", exc)
             return REJECTION_MESSAGE
 
         if message is None:
             return REJECTION_MESSAGE
 
         if not isinstance(message, str):
-            logger.error(
-                "Tool error formatter returned non-string for %s: %s",
-                tool.name,
-                type(message).__name__,
-            )
+            if _debug.DONT_LOG_TOOL_DATA:
+                logger.error("Tool error formatter returned a non-string value")
+            else:
+                logger.error(
+                    "Tool error formatter returned non-string for %s: %s",
+                    tool.name,
+                    type(message).__name__,
+                )
             return REJECTION_MESSAGE
 
         return message
 
     async def approve_tool_call(self, call_id: str, *, always: bool = False) -> None:
         """Approve a pending tool call and resume execution."""
+        if self._closing or self._closed:
+            return
+
         pending = self._pending_tool_calls.pop(call_id, None)
         if pending is None:
             return
 
-        tool_call, agent_snapshot, function_tool, approval_item = pending
-        if not self._begin_tool_call(call_id, from_pending_approval=True):
+        pending_identity = tool_invocation_identity(
+            pending.approval_item.raw_item,
+            tool_lookup_key=pending.approval_item.tool_lookup_key,
+        )
+        if pending_identity is None:
+            raise ModelBehaviorError("Realtime tool calls require a canonical invocation identity.")
+        if not self._begin_tool_call(
+            call_id,
+            pending_identity,
+            from_pending_approval=True,
+        ):
             return
 
         try:
-            self._context_wrapper.approve_tool(approval_item, always_approve=always)
+            self._context_wrapper.approve_tool(pending.approval_item, always_approve=always)
 
             if self._async_tool_calls:
                 self._enqueue_tool_call_task(
-                    tool_call,
-                    agent_snapshot,
+                    pending.tool_call,
+                    pending.agent,
+                    pending.dispatch_snapshot,
                     from_pending_approval=True,
                     call_id_reserved=True,
                 )
             else:
                 await self._handle_tool_call(
-                    tool_call,
-                    agent_snapshot=agent_snapshot,
+                    pending.tool_call,
+                    agent_snapshot=pending.agent,
+                    dispatch_snapshot=pending.dispatch_snapshot,
                     from_pending_approval=True,
                     call_id_reserved=True,
                 )
         except Exception:
-            if call_id in self._active_tool_call_ids:
+            if call_id in self._active_tool_invocations:
                 self._finish_tool_call(call_id, mark_completed=False)
             raise
 
@@ -694,22 +1020,38 @@ class RealtimeSession(RealtimeModelListener):
         rejection_message: str | None = None,
     ) -> None:
         """Reject a pending tool call and notify the model."""
+        if self._closing or self._closed:
+            return
+
         pending = self._pending_tool_calls.pop(call_id, None)
         if pending is None:
             return
 
-        if not self._begin_tool_call(call_id, from_pending_approval=True):
+        pending_identity = tool_invocation_identity(
+            pending.approval_item.raw_item,
+            tool_lookup_key=pending.approval_item.tool_lookup_key,
+        )
+        if pending_identity is None:
+            raise ModelBehaviorError("Realtime tool calls require a canonical invocation identity.")
+        if not self._begin_tool_call(
+            call_id,
+            pending_identity,
+            from_pending_approval=True,
+        ):
             return
 
         mark_completed = False
-        tool_call, agent_snapshot, function_tool, approval_item = pending
         try:
             self._context_wrapper.reject_tool(
-                approval_item,
+                pending.approval_item,
                 always_reject=always,
                 rejection_message=rejection_message,
             )
-            await self._send_tool_rejection(tool_call, tool=function_tool, agent=agent_snapshot)
+            await self._send_tool_rejection(
+                pending.tool_call,
+                tool=pending.function_tool,
+                agent=pending.agent,
+            )
             mark_completed = True
         finally:
             self._finish_tool_call(call_id, mark_completed=mark_completed)
@@ -719,41 +1061,162 @@ class RealtimeSession(RealtimeModelListener):
         event: RealtimeModelToolCallEvent,
         *,
         agent_snapshot: RealtimeAgent | None = None,
+        dispatch_snapshot: _RealtimeDispatchSnapshot | None = None,
         from_pending_approval: bool = False,
         call_id_reserved: bool = False,
     ) -> None:
         """Handle a tool call event."""
         mark_completed = False
+        agent = dispatch_snapshot.agent if dispatch_snapshot is not None else agent_snapshot
+        agent = agent if agent is not None else self._current_agent
+        recorded_route = self._tool_invocation_routes.get(event.call_id)
+        recorded_role = recorded_route[1] if recorded_route is not None else None
+        if (
+            recorded_route is not None
+            and recorded_route[0] is not None
+            and recorded_route[0][-1] != event.name
+        ):
+            raise ModelBehaviorError(
+                "Model reused a Realtime tool call ID for a different invocation. "
+                "Use a unique call ID for each tool invocation."
+            )
+        dispatch_role = self._resolve_tool_dispatch_role(
+            event.name,
+            agent=agent,
+            dispatch_snapshot=dispatch_snapshot,
+        )
+        if (
+            recorded_route is not None
+            and dispatch_role is not None
+            and recorded_role != dispatch_role
+        ):
+            raise ModelBehaviorError(
+                "Model reused a Realtime tool call ID for a different invocation. "
+                "Use a unique call ID for each tool invocation."
+            )
+        identity_role = (
+            recorded_role if dispatch_role is None and recorded_route is not None else dispatch_role
+        )
+        current_raw_item = {
+            "type": "function_call",
+            "name": event.name,
+            "call_id": event.call_id,
+            "arguments": event.arguments,
+        }
+        current_lookup_key = (
+            recorded_route[0]
+            if recorded_route is not None
+            else get_function_tool_lookup_key(event.name, None)
+        )
+        current_identity = tool_invocation_identity(
+            current_raw_item,
+            tool_lookup_key=current_lookup_key,
+            invocation_role="handoff" if identity_role == "handoff" else None,
+        )
+        if current_identity is None:
+            raise ModelBehaviorError("Realtime tool calls require a non-empty string call ID.")
+        active_identity = self._active_tool_invocations.get(event.call_id)
+        if active_identity is not None and active_identity != current_identity:
+            raise ModelBehaviorError(
+                "Model reused a Realtime tool call ID for a different invocation. "
+                "Use a unique call ID for each tool invocation."
+            )
+        invocation_status = self._context_wrapper._tool_invocation_status(
+            current_raw_item,
+            tool_lookup_key=current_lookup_key,
+            invocation_role="handoff" if identity_role == "handoff" else None,
+        )
+        if invocation_status is None:
+            raise ModelBehaviorError("Realtime tool calls require a non-empty string call ID.")
+
+        pending_output = self._pending_tool_outputs.get(event.call_id)
+        has_pending_output = pending_output is not None
+        is_duplicate_call = (
+            active_identity is not None
+            or event.call_id in self._pending_tool_calls
+            or invocation_status[1]
+        )
+        if not call_id_reserved:
+            if is_duplicate_call:
+                return
+            if invocation_status[2] and not invocation_status[1] and not has_pending_output:
+                raise ModelBehaviorError(
+                    "A Realtime tool call already executed, but its output was not committed. "
+                    "Start a new call instead of retrying the invocation."
+                )
         if not call_id_reserved and not self._begin_tool_call(
-            event.call_id, from_pending_approval=from_pending_approval
+            event.call_id,
+            current_identity,
+            from_pending_approval=from_pending_approval,
         ):
             return
 
-        agent = agent_snapshot or self._current_agent
         try:
-            pending_output = self._pending_tool_outputs.get(event.call_id)
             if pending_output is not None:
                 await self._send_tool_output_completion(pending_output)
                 mark_completed = True
                 return
 
-            tools, handoffs = await asyncio.gather(
-                agent.get_all_tools(self._context_wrapper),
-                self._get_handoffs(agent, self._context_wrapper),
-            )
+            snapshot = await self._resolve_dispatch_snapshot(agent, dispatch_snapshot)
+            snapshot = await self._filter_enabled_dispatch_snapshot(snapshot)
+            if self._closing or self._closed:
+                return
+            tools = snapshot.tools
+            handoffs = snapshot.handoffs
+            validate_realtime_tool_names(tools, handoffs)
             function_map = {tool.name: tool for tool in tools if isinstance(tool, FunctionTool)}
             handoff_map = {handoff.tool_name: handoff for handoff in handoffs}
 
             if event.name in function_map:
                 func_tool = function_map[event.name]
-                approval_status = await self._maybe_request_tool_approval(
-                    event, function_tool=func_tool, agent=agent
+                approval_item = self._build_tool_approval_item(func_tool, event, agent)
+                self._bind_resolved_tool_invocation(
+                    event.call_id,
+                    approval_item.raw_item,
+                    preliminary_identity=current_identity,
+                    tool_lookup_key=approval_item.tool_lookup_key,
+                    route_role="function",
                 )
+                approval_status = await self._maybe_request_tool_approval(
+                    event,
+                    function_tool=func_tool,
+                    agent=agent,
+                    dispatch_snapshot=snapshot,
+                )
+                if self._closing or self._closed:
+                    return
+                if isinstance(approval_status, _PendingToolOutput):
+                    await self._send_tool_output_completion(approval_status)
+                    mark_completed = True
+                    return
                 if approval_status is False:
                     await self._send_tool_rejection(event, tool=func_tool, agent=agent)
                     mark_completed = True
                     return
                 if approval_status is None:
+                    return
+
+                self._context_wrapper._mark_tool_invocation_executed(
+                    approval_item.raw_item,
+                    tool_lookup_key=approval_item.tool_lookup_key,
+                )
+                rejected_message = await self._run_tool_input_guardrails(
+                    tool=func_tool,
+                    tool_call=event,
+                    agent=agent,
+                )
+                if self._closing or self._closed:
+                    return
+                if rejected_message is not None:
+                    await self._send_tool_output_completion(
+                        self._build_realtime_tool_output(
+                            tool=func_tool,
+                            tool_call=event,
+                            agent=agent,
+                            output=rejected_message,
+                        )
+                    )
+                    mark_completed = True
                     return
 
                 await self._put_event(
@@ -764,10 +1227,11 @@ class RealtimeSession(RealtimeModelListener):
                         arguments=event.arguments,
                     )
                 )
+                if self._closing or self._closed:
+                    return
 
-                tool_context = ToolContext(
-                    context=self._context_wrapper.context,
-                    usage=self._context_wrapper.usage,
+                tool_context = ToolContext.from_agent_context(
+                    self._context_wrapper,
                     tool_name=event.name,
                     tool_call_id=event.call_id,
                     tool_arguments=event.arguments,
@@ -778,6 +1242,8 @@ class RealtimeSession(RealtimeModelListener):
                     context=tool_context,
                     arguments=event.arguments,
                 )
+                if self._closing or self._closed:
+                    return
 
                 await self._send_tool_output_completion(
                     _PendingToolOutput(
@@ -796,9 +1262,15 @@ class RealtimeSession(RealtimeModelListener):
                 mark_completed = True
             elif event.name in handoff_map:
                 handoff = handoff_map[event.name]
-                tool_context = ToolContext(
-                    context=self._context_wrapper.context,
-                    usage=self._context_wrapper.usage,
+                self._bind_resolved_tool_invocation(
+                    event.call_id,
+                    current_raw_item,
+                    preliminary_identity=current_identity,
+                    tool_lookup_key=get_function_tool_lookup_key(event.name, None),
+                    route_role="handoff",
+                )
+                tool_context = ToolContext.from_agent_context(
+                    self._context_wrapper,
                     tool_name=event.name,
                     tool_call_id=event.call_id,
                     tool_arguments=event.arguments,
@@ -806,7 +1278,14 @@ class RealtimeSession(RealtimeModelListener):
                 )
 
                 # Execute the handoff to get the new agent
+                self._context_wrapper._mark_tool_invocation_executed(
+                    current_raw_item,
+                    tool_lookup_key=get_function_tool_lookup_key(event.name, None),
+                    invocation_role="handoff",
+                )
                 result = await handoff.on_invoke_handoff(self._context_wrapper, event.arguments)
+                if self._closing or self._closed:
+                    return
                 if not isinstance(result, RealtimeAgent):
                     raise UserError(
                         f"Handoff {handoff.tool_name} returned invalid result: {type(result)}"
@@ -815,14 +1294,18 @@ class RealtimeSession(RealtimeModelListener):
                 # Store previous agent for event
                 previous_agent = agent
 
-                # Update current agent
-                self._current_agent = result
-
                 # Get updated model settings from new agent
                 updated_settings = await self._get_updated_model_settings_from_agent(
                     starting_settings=None,
-                    agent=self._current_agent,
+                    agent=result,
                 )
+                if self._closing or self._closed:
+                    return
+                updated_snapshot = self._dispatch_snapshot_from_settings(result, updated_settings)
+
+                # Update current agent
+                self._current_agent = result
+                self._current_dispatch_snapshot = updated_snapshot
 
                 # Send handoff event
                 await self._put_event(
@@ -847,6 +1330,14 @@ class RealtimeSession(RealtimeModelListener):
                 )
                 mark_completed = True
             else:
+                fallback_role = "handoff" if identity_role == "handoff" else None
+                self._bind_resolved_tool_invocation(
+                    event.call_id,
+                    current_raw_item,
+                    preliminary_identity=current_identity,
+                    tool_lookup_key=get_function_tool_lookup_key(event.name, None),
+                    route_role=fallback_role,
+                )
                 error_message = f"Tool {event.name} not found"
                 await self._send_tool_output_completion(
                     _PendingToolOutput(
@@ -865,18 +1356,101 @@ class RealtimeSession(RealtimeModelListener):
         finally:
             self._finish_tool_call(event.call_id, mark_completed=mark_completed)
 
-    def _begin_tool_call(self, call_id: str, *, from_pending_approval: bool) -> bool:
-        if call_id in self._active_tool_call_ids or call_id in self._completed_tool_call_ids:
+    def _begin_tool_call(
+        self,
+        call_id: str,
+        identity: tuple[str, str, str],
+        *,
+        from_pending_approval: bool,
+    ) -> bool:
+        if self._closing or self._closed:
+            return False
+        active_identity = self._active_tool_invocations.get(call_id)
+        if active_identity is not None:
+            if active_identity != identity:
+                raise ModelBehaviorError(
+                    "Model reused a Realtime tool call ID for a different invocation. "
+                    "Use a unique call ID for each tool invocation."
+                )
             return False
         if not from_pending_approval and call_id in self._pending_tool_calls:
             return False
-        self._active_tool_call_ids.add(call_id)
+        self._active_tool_invocations[call_id] = identity
         return True
 
+    def _bind_resolved_tool_invocation(
+        self,
+        call_id: str,
+        raw_item: Any,
+        *,
+        preliminary_identity: tuple[str, str, str],
+        tool_lookup_key: FunctionToolLookupKey | None,
+        route_role: str | None,
+    ) -> None:
+        """Atomically replace a provisional Realtime identity with its resolved identity."""
+        resolved_identity = tool_invocation_identity(
+            raw_item,
+            tool_lookup_key=tool_lookup_key,
+            invocation_role="handoff" if route_role == "handoff" else None,
+        )
+        if resolved_identity is None:
+            raise ModelBehaviorError("Realtime tool calls require a canonical invocation identity.")
+
+        active_identity = self._active_tool_invocations.get(call_id)
+        if active_identity not in {None, preliminary_identity, resolved_identity}:
+            raise ModelBehaviorError(
+                "Model reused a Realtime tool call ID for a different invocation. "
+                "Use a unique call ID for each tool invocation."
+            )
+        self._context_wrapper._rebind_tool_invocation(
+            raw_item,
+            previous_identity=preliminary_identity,
+            tool_lookup_key=tool_lookup_key,
+            invocation_role="handoff" if route_role == "handoff" else None,
+        )
+        if active_identity is not None:
+            self._active_tool_invocations[call_id] = resolved_identity
+        self._tool_invocation_routes[call_id] = (tool_lookup_key, route_role)
+
+    def _resolve_tool_dispatch_role(
+        self,
+        tool_name: str,
+        *,
+        agent: RealtimeAgent[Any],
+        dispatch_snapshot: _RealtimeDispatchSnapshot | None,
+    ) -> str | None:
+        """Return the known dispatch role without invoking dynamic tool resolvers."""
+        snapshot = dispatch_snapshot
+        if snapshot is None and self._current_dispatch_snapshot is not None:
+            if self._current_dispatch_snapshot.agent is agent:
+                snapshot = self._current_dispatch_snapshot
+
+        tools: Sequence[Any]
+        handoffs: Sequence[Any]
+        if snapshot is not None:
+            tools = snapshot.tools
+            handoffs = snapshot.handoffs
+        else:
+            raw_tools = getattr(agent, "tools", ())
+            raw_handoffs = getattr(agent, "handoffs", ())
+            tools = raw_tools if isinstance(raw_tools, Sequence) else ()
+            handoffs = raw_handoffs if isinstance(raw_handoffs, Sequence) else ()
+
+        if any(
+            (isinstance(handoff, Handoff) and handoff.tool_name == tool_name)
+            or (
+                isinstance(handoff, RealtimeAgent)
+                and Handoff.default_tool_name(handoff) == tool_name
+            )
+            for handoff in handoffs
+        ):
+            return "handoff"
+        if any(isinstance(tool, FunctionTool) and tool.name == tool_name for tool in tools):
+            return "function"
+        return None
+
     def _finish_tool_call(self, call_id: str, *, mark_completed: bool) -> None:
-        self._active_tool_call_ids.discard(call_id)
-        if mark_completed:
-            self._completed_tool_call_ids.add(call_id)
+        self._active_tool_invocations.pop(call_id, None)
 
     @classmethod
     def _get_new_history(
@@ -919,7 +1493,12 @@ class RealtimeSession(RealtimeModelListener):
         )
         if existing_index is not None:
             new_history = old_history.copy()
-            if event.type == "message" and event.content is not None and len(event.content) > 0:
+            if event.type != "message":
+                # Tool calls reuse a single item for the call and its output, so the transport
+                # re-sends the same item_id with status "completed" once the output is known.
+                # Only message items carry content worth merging, so replace anything else.
+                new_history[existing_index] = event
+            elif event.content is not None and len(event.content) > 0:
                 existing_item = old_history[existing_index]
                 if existing_item.type == "message":
                     # Merge content preserving existing transcript/text when incoming entry is empty
@@ -1050,9 +1629,21 @@ class RealtimeSession(RealtimeModelListener):
         # Otherwise, add it to the end
         return old_history + [event]
 
-    async def _run_output_guardrails(self, text: str, response_id: str) -> bool:
+    async def _run_output_guardrails(
+        self,
+        text: str,
+        response_id: str,
+        *,
+        agent_snapshot: RealtimeAgent[Any] | None = None,
+        output_response_generation: int | None = None,
+        is_audio_output: bool = True,
+    ) -> bool:
         """Run output guardrails on the given text. Returns True if any guardrail was triggered."""
-        combined_guardrails = self._current_agent.output_guardrails + self._run_config.get(
+        if self._closing or self._closed:
+            return False
+
+        source_agent = agent_snapshot if agent_snapshot is not None else self._current_agent
+        combined_guardrails = source_agent.output_guardrails + self._run_config.get(
             "output_guardrails", []
         )
         seen_ids: set[int] = set()
@@ -1074,97 +1665,228 @@ class RealtimeSession(RealtimeModelListener):
                 result = await guardrail.run(
                     # TODO (rm) Remove this cast, it's wrong
                     self._context_wrapper,
-                    cast(Agent[Any], self._current_agent),
+                    cast(Agent[Any], source_agent),
                     text,
                 )
+                if self._closing or self._closed:
+                    return False
                 if result.output.tripwire_triggered:
                     triggered_results.append(result)
             except Exception as exc:
-                logger.warning(
-                    "Output guardrail %r raised %s: %s; skipping it.",
-                    guardrail.get_name(),
-                    type(exc).__name__,
+                log_model_and_tool_action_warning(
+                    logger,
+                    "Output guardrail raised an exception; skipping it",
                     exc,
+                    diagnostic_extra=partial(_guardrail_diagnostic_extra, guardrail),
                 )
-                logger.debug("Output guardrail failure details.", exc_info=True)
                 continue
 
         if triggered_results:
             # Double-check: bail if already interrupted for this response
-            if response_id in self._interrupted_response_ids:
+            if response_id in self._interrupted_response_ids or self._closing or self._closed:
                 return False
 
             # Mark as interrupted immediately (before any awaits) to minimize race window
             self._interrupted_response_ids.add(response_id)
 
             # Emit guardrail tripped event
-            await self._put_event(
+            if not await self._put_event(
                 RealtimeGuardrailTripped(
                     guardrail_results=triggered_results,
                     message=text,
                     info=self._event_info,
                 )
-            )
+            ):
+                return False
 
             # Interrupt the model
-            await self._model.send_event(RealtimeModelSendInterrupt(force_response_cancel=True))
+            if self._closing or self._closed:
+                return False
+            if output_response_generation is None:
+                await self._model.send_event(RealtimeModelSendInterrupt(force_response_cancel=True))
+            else:
+                if output_response_generation != self._latest_output_response_generation:
+                    if is_audio_output:
+                        await self._model.send_event(
+                            RealtimeModelSendInterrupt(
+                                response_id=response_id,
+                                playback_only=True,
+                            )
+                        )
+                    return True
+                if output_response_generation == self._active_output_response_generation:
+                    await self._model.send_event(
+                        RealtimeModelSendInterrupt(
+                            force_response_cancel=True,
+                            response_id=response_id,
+                            cancel_response_only=not is_audio_output,
+                        )
+                    )
+                elif is_audio_output:
+                    await self._model.send_event(
+                        RealtimeModelSendInterrupt(
+                            response_id=response_id,
+                            playback_only=True,
+                        )
+                    )
 
             # Send guardrail triggered message
+            if self._closing or self._closed:
+                return False
+            if (
+                output_response_generation is not None
+                and output_response_generation != self._latest_output_response_generation
+            ):
+                return True
             guardrail_names = [result.guardrail.get_name() for result in triggered_results]
-            await self._model.send_event(
-                RealtimeModelSendUserInput(
-                    user_input=f"guardrail triggered: {', '.join(guardrail_names)}"
-                )
+            feedback_event = RealtimeModelSendUserInput(
+                user_input=f"guardrail triggered: {', '.join(guardrail_names)}"
             )
+            if output_response_generation is None:
+                await self._model.send_event(feedback_event)
+            else:
+                await self._model.send_event_if(
+                    feedback_event,
+                    lambda: (output_response_generation == self._latest_output_response_generation),
+                )
 
             return True
 
         return False
 
-    def _enqueue_guardrail_task(self, text: str, response_id: str) -> None:
-        # Runs the guardrails in a separate task to avoid blocking the main loop
+    def _record_output_guardrail_delta(
+        self,
+        item_id: str,
+        delta: str,
+        response_id: str,
+        *,
+        agent_snapshot: RealtimeAgent[Any] | None = None,
+        output_response_generation: int | None = None,
+        is_audio_output: bool = True,
+    ) -> None:
+        if item_id not in self._item_transcripts:
+            self._item_transcripts[item_id] = ""
+            self._item_guardrail_run_counts[item_id] = 0
 
-        task = asyncio.create_task(self._run_output_guardrails(text, response_id))
+        self._item_transcripts[item_id] += delta
+        current_length = len(self._item_transcripts[item_id])
+        threshold = self._debounce_text_length
+        next_run_threshold = (self._item_guardrail_run_counts[item_id] + 1) * threshold
+
+        if current_length >= next_run_threshold:
+            crossed_thresholds = current_length // threshold if threshold > 0 else 1
+            self._item_guardrail_run_counts[item_id] = max(
+                self._item_guardrail_run_counts[item_id] + 1, crossed_thresholds
+            )
+            self._enqueue_guardrail_task(
+                self._item_transcripts[item_id],
+                response_id,
+                agent_snapshot=agent_snapshot,
+                output_response_generation=output_response_generation,
+                is_audio_output=is_audio_output,
+            )
+
+    def _enqueue_guardrail_task(
+        self,
+        text: str,
+        response_id: str,
+        *,
+        agent_snapshot: RealtimeAgent[Any] | None = None,
+        output_response_generation: int | None = None,
+        is_audio_output: bool = True,
+    ) -> None:
+        # Runs the guardrails in a separate task to avoid blocking the main loop
+        if self._closing or self._closed:
+            return
+
+        task = asyncio.create_task(
+            self._run_output_guardrails(
+                text,
+                response_id,
+                agent_snapshot=agent_snapshot,
+                output_response_generation=output_response_generation,
+                is_audio_output=is_audio_output,
+            )
+        )
         self._guardrail_tasks.add(task)
+        self._guardrail_tasks_by_response_id.setdefault(response_id, set()).add(task)
 
         # Add callback to remove completed tasks and handle exceptions
-        task.add_done_callback(self._on_guardrail_task_done)
+        task.add_done_callback(partial(self._on_guardrail_task_done, response_id=response_id))
 
-    def _on_guardrail_task_done(self, task: asyncio.Task[Any]) -> None:
+    def _on_guardrail_task_done(self, task: asyncio.Task[Any], *, response_id: str) -> None:
         """Handle completion of a guardrail task."""
         # Remove from tracking set
         self._guardrail_tasks.discard(task)
+        response_tasks = self._guardrail_tasks_by_response_id.get(response_id)
+        if response_tasks is not None:
+            response_tasks.discard(task)
+            if not response_tasks:
+                self._guardrail_tasks_by_response_id.pop(response_id, None)
+
+        should_retire_response_audio = (
+            response_id in self._responses_awaiting_guardrail_cleanup
+            and response_id not in self._guardrail_tasks_by_response_id
+        )
+        if should_retire_response_audio:
+            self._responses_awaiting_guardrail_cleanup.discard(response_id)
+
+        if self._closing or self._closed:
+            self._consume_task_result(task)
+            return
+
+        if should_retire_response_audio:
+            self._retire_response_audio(response_id)
 
         # Check for exceptions and propagate as events
         if not task.cancelled():
             exception = task.exception()
-            if exception:
+            if exception is not None:
                 # Create an exception event instead of raising
-                asyncio.create_task(
-                    self._put_event(
-                        RealtimeError(
-                            info=self._event_info,
-                            error={"message": f"Guardrail task failed: {str(exception)}"},
-                        )
+                self._put_event_nowait(
+                    RealtimeError(
+                        info=self._event_info,
+                        error={"message": f"Guardrail task failed: {str(exception)}"},
                     )
                 )
 
-    def _cleanup_guardrail_tasks(self) -> None:
-        for task in self._guardrail_tasks:
-            if not task.done():
-                task.cancel()
-        self._guardrail_tasks.clear()
+    def _finish_response_guardrail_lifecycle(self, response_id: str) -> None:
+        if response_id in self._guardrail_tasks_by_response_id:
+            self._responses_awaiting_guardrail_cleanup.add(response_id)
+            return
+        self._retire_response_audio(response_id)
+
+    def _retire_response_audio(self, response_id: str) -> None:
+        try:
+            self._model._retire_response_audio(response_id)
+        except Exception as exception:
+            self._put_event_nowait(
+                RealtimeError(
+                    info=self._event_info,
+                    error={"message": f"Response audio cleanup failed: {exception}"},
+                )
+            )
+        finally:
+            self._interrupted_response_ids.discard(response_id)
 
     def _enqueue_tool_call_task(
         self,
         event: RealtimeModelToolCallEvent,
         agent_snapshot: RealtimeAgent,
+        dispatch_snapshot: _RealtimeDispatchSnapshot | None = None,
         *,
         from_pending_approval: bool = False,
         call_id_reserved: bool = False,
     ) -> None:
         """Run tool calls in the background to avoid blocking realtime transport."""
+        if self._closing or self._closed:
+            if call_id_reserved:
+                self._finish_tool_call(event.call_id, mark_completed=False)
+            return
+
         handle_kwargs: dict[str, Any] = {"agent_snapshot": agent_snapshot}
+        if dispatch_snapshot is not None:
+            handle_kwargs["dispatch_snapshot"] = dispatch_snapshot
         if from_pending_approval:
             handle_kwargs["from_pending_approval"] = True
         if call_id_reserved:
@@ -1181,53 +1903,96 @@ class RealtimeSession(RealtimeModelListener):
             return
 
         exception = task.exception()
+        if isinstance(exception, ModelBehaviorError):
+            _clear_data_redacted_error_traceback(exception)
+
+        if self._closing or self._closed:
+            return
+
         if exception is None:
             return
 
         if isinstance(exception, _PendingToolOutputSendError):
-            logger.warning(
-                "Realtime tool output send failed for call %s; cached output will be retried",
-                exception.call_id,
-                exc_info=exception,
-            )
-            asyncio.create_task(
-                self._put_event(
-                    RealtimeError(
-                        info=self._event_info,
-                        error={
-                            "message": (
-                                "Tool output send failed; cached output will be retried: "
-                                f"{exception}"
-                            )
-                        },
-                    )
+            if _debug.DONT_LOG_TOOL_DATA:
+                logger.warning("Realtime tool output send failed; cached output will be retried")
+            else:
+                logger.warning(
+                    "Realtime tool output send failed for call %s; cached output will be retried",
+                    exception.call_id,
+                    exc_info=exception,
+                )
+            self._put_event_nowait(
+                RealtimeError(
+                    info=self._event_info,
+                    error={
+                        "message": (
+                            f"Tool output send failed; cached output will be retried: {exception}"
+                        )
+                    },
                 )
             )
             return
 
-        logger.exception("Realtime tool call task failed", exc_info=exception)
+        log_tool_action_error(logger, "Realtime tool call task failed", exception)
 
         if self._stored_exception is None:
             self._stored_exception = exception
 
-        asyncio.create_task(
-            self._put_event(
-                RealtimeError(
-                    info=self._event_info,
-                    error={"message": f"Tool call task failed: {exception}"},
-                )
+        self._put_event_nowait(
+            RealtimeError(
+                info=self._event_info,
+                error={"message": f"Tool call task failed: {exception}"},
             )
         )
 
-    def _cleanup_tool_call_tasks(self) -> None:
-        for task in self._tool_call_tasks:
+    @staticmethod
+    def _consume_task_result(task: asyncio.Task[Any]) -> None:
+        if not task.cancelled():
+            task.exception()
+
+    def _on_cleanup_task_done(self, task: asyncio.Task[None]) -> None:
+        if self._cleanup_task is task:
+            self._cleanup_task = None
+        self._consume_task_result(task)
+
+    async def _cancel_background_tasks(self) -> None:
+        tracked_tasks = self._guardrail_tasks | self._tool_call_tasks
+        if not tracked_tasks:
+            return
+
+        for task in tracked_tasks:
             if not task.done():
                 task.cancel()
-        self._tool_call_tasks.clear()
+
+        done, pending = await asyncio.wait(
+            tracked_tasks,
+            timeout=_BACKGROUND_TASK_CANCEL_GRACE_SECONDS,
+        )
+
+        self._guardrail_tasks.difference_update(done)
+        self._tool_call_tasks.difference_update(done)
+        for task in done:
+            self._consume_task_result(task)
+
+        if pending:
+            logger.warning(
+                "Realtime session cleanup timed out with %d background task(s) still stopping.",
+                len(pending),
+            )
 
     def _wake_event_iterators(self) -> None:
         for _ in range(self._event_iterator_waiters):
             self._event_queue.put_nowait(_REALTIME_SESSION_CLOSED_SENTINEL)
+
+    def _clear_response_bookkeeping(self) -> None:
+        self._interrupted_response_ids.clear()
+        self._active_output_response_generation = None
+        self._active_output_response_id = None
+        self._active_output_response_agent = None
+        self._item_transcripts.clear()
+        self._item_guardrail_run_counts.clear()
+        self._guardrail_tasks_by_response_id.clear()
+        self._responses_awaiting_guardrail_cleanup.clear()
 
     async def _cleanup(self) -> None:
         """Clean up all resources and mark session as closed."""
@@ -1235,23 +2000,72 @@ class RealtimeSession(RealtimeModelListener):
             self._wake_event_iterators()
             return
 
-        # Cancel and cleanup guardrail tasks
-        self._cleanup_guardrail_tasks()
-        self._cleanup_tool_call_tasks()
-
-        # Remove ourselves as a listener
+        # Stop new model events before cleanup yields control.
         self._model.remove_listener(self)
+
+        # Account for session-owned background work before closing its transport.
+        await self._cancel_background_tasks()
+        self._clear_response_bookkeeping()
 
         # Close the model connection
         await self._model.close()
 
         # Clear pending approval tracking
         self._pending_tool_calls.clear()
+        self._tool_invocation_routes.clear()
         self._pending_tool_outputs.clear()
+        self._active_tool_invocations.clear()
 
         # Mark as closed
         self._closed = True
         self._wake_event_iterators()
+
+    def _dispatch_snapshot_from_settings(
+        self,
+        agent: RealtimeAgent[Any],
+        settings: RealtimeSessionModelSettings,
+    ) -> _RealtimeDispatchSnapshot:
+        return _RealtimeDispatchSnapshot(
+            agent=agent,
+            tools=tuple(settings.get("tools", [])),
+            handoffs=tuple(
+                cast(list[Handoff[Any, RealtimeAgent[Any]]], settings.get("handoffs", []))
+            ),
+        )
+
+    async def _resolve_dispatch_snapshot(
+        self,
+        agent: RealtimeAgent[Any],
+        dispatch_snapshot: _RealtimeDispatchSnapshot | None,
+    ) -> _RealtimeDispatchSnapshot:
+        if dispatch_snapshot is not None:
+            return dispatch_snapshot
+
+        if (
+            self._current_dispatch_snapshot is not None
+            and self._current_dispatch_snapshot.agent is agent
+        ):
+            return self._current_dispatch_snapshot
+
+        tools, handoffs = await gather_with_cancel(
+            agent.get_all_tools(self._context_wrapper),
+            self._get_handoffs(agent, self._context_wrapper),
+        )
+        return _RealtimeDispatchSnapshot(agent=agent, tools=tuple(tools), handoffs=tuple(handoffs))
+
+    async def _filter_enabled_dispatch_snapshot(
+        self,
+        snapshot: _RealtimeDispatchSnapshot,
+    ) -> _RealtimeDispatchSnapshot:
+        tools, handoffs = await gather_with_cancel(
+            filter_enabled_tools(snapshot.tools, self._context_wrapper, snapshot.agent),
+            filter_enabled_handoffs(snapshot.handoffs, self._context_wrapper, snapshot.agent),
+        )
+        return _RealtimeDispatchSnapshot(
+            agent=snapshot.agent,
+            tools=tuple(tools),
+            handoffs=tuple(cast(list[Handoff[Any, RealtimeAgent[Any]]], handoffs)),
+        )
 
     async def _get_updated_model_settings_from_agent(
         self,
@@ -1264,7 +2078,7 @@ class RealtimeSession(RealtimeModelListener):
         if agent.prompt is not None:
             updated_settings["prompt"] = agent.prompt
 
-        instructions, tools, handoffs = await asyncio.gather(
+        instructions, tools, handoffs = await gather_with_cancel(
             agent.get_system_prompt(self._context_wrapper),
             agent.get_all_tools(self._context_wrapper),
             self._get_handoffs(agent, self._context_wrapper),
@@ -1276,6 +2090,22 @@ class RealtimeSession(RealtimeModelListener):
         # Apply starting settings (from model config) next
         if starting_settings:
             updated_settings.update(starting_settings)
+            if "tools" in starting_settings:
+                updated_settings["tools"] = await filter_enabled_tools(
+                    updated_settings.get("tools") or [],
+                    self._context_wrapper,
+                    agent,
+                )
+            if "handoffs" in starting_settings:
+                updated_settings["handoffs"] = await filter_enabled_handoffs(
+                    updated_settings.get("handoffs") or [],
+                    self._context_wrapper,
+                    agent,
+                )
+        validate_realtime_tool_names(
+            updated_settings.get("tools", []),
+            updated_settings.get("handoffs", []),
+        )
 
         disable_tracing = self._run_config.get("tracing_disabled", False)
         if disable_tracing:
@@ -1287,22 +2117,4 @@ class RealtimeSession(RealtimeModelListener):
     async def _get_handoffs(
         cls, agent: RealtimeAgent[Any], context_wrapper: RunContextWrapper[Any]
     ) -> list[Handoff[Any, RealtimeAgent[Any]]]:
-        handoffs: list[Handoff[Any, RealtimeAgent[Any]]] = []
-        for handoff_item in agent.handoffs:
-            if isinstance(handoff_item, Handoff):
-                handoffs.append(handoff_item)
-            elif isinstance(handoff_item, RealtimeAgent):
-                handoffs.append(realtime_handoff(handoff_item))
-
-        async def _check_handoff_enabled(handoff_obj: Handoff[Any, RealtimeAgent[Any]]) -> bool:
-            attr = handoff_obj.is_enabled
-            if isinstance(attr, bool):
-                return attr
-            res = attr(context_wrapper, agent)
-            if inspect.isawaitable(res):
-                return await res
-            return res
-
-        results = await asyncio.gather(*(_check_handoff_enabled(h) for h in handoffs))
-        enabled = [h for h, ok in zip(handoffs, results, strict=False) if ok]
-        return enabled
+        return await collect_enabled_handoffs(agent, context_wrapper)

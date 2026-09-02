@@ -21,12 +21,15 @@ import termios
 import time
 import uuid
 from collections import deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Literal, cast
 
+from ...logger import log_tool_action_warning
+from .._mount_security import redact_mount_error_data
 from ..errors import (
     ExecNonZeroError,
     ExecTimeoutError,
@@ -45,6 +48,7 @@ from ..session import SandboxSession, SandboxSessionState
 from ..session.base_sandbox_session import BaseSandboxSession
 from ..session.dependencies import Dependencies
 from ..session.manager import Instrumentation
+from ..session.pty_output import collect_pty_output
 from ..session.pty_types import (
     PTY_PROCESSES_MAX,
     PTY_PROCESSES_WARNING,
@@ -53,12 +57,12 @@ from ..session.pty_types import (
     clamp_pty_yield_time_ms,
     process_id_to_prune_from_meta,
     resolve_pty_write_yield_time_ms,
-    truncate_text_by_tokens,
 )
 from ..session.sandbox_client import BaseSandboxClient, BaseSandboxClientOptions
 from ..session.workspace_payloads import coerce_write_payload
 from ..snapshot import SnapshotBase, SnapshotSpec, resolve_snapshot
 from ..types import ExecResult, ExposedPortEndpoint, Permissions, User
+from ..util.blocking_io import run_blocking_workspace_io
 from ..util.tar_utils import (
     UnsafeTarMemberError,
     safe_extract_tarfile,
@@ -70,8 +74,37 @@ _DEFAULT_WORKSPACE_PREFIX = "sandbox-local-"
 _DEFAULT_MANIFEST_ROOT = cast(str, Manifest.model_fields["root"].default)
 _PTY_READ_CHUNK_BYTES = 16_384
 _PTY_CHILD_SIGNAL_DEFAULTS = (signal.SIGINT, signal.SIGQUIT)
+_PTY_FD_CLOSE_GRACE_SECONDS = 0.1
+_HOST_ENVIRONMENT_ALLOWLIST = frozenset(
+    {
+        "PATH",
+        "LANG",
+        "LC_ALL",
+        "LC_COLLATE",
+        "LC_CTYPE",
+        "LC_MESSAGES",
+        "LC_MONETARY",
+        "LC_NUMERIC",
+        "LC_TIME",
+        "TZ",
+        "TERM",
+        "TMPDIR",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+        "NODE_EXTRA_CA_CERTS",
+        "UV_PYTHON",
+        "NO_COLOR",
+        "FORCE_COLOR",
+        "CI",
+    }
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _mount_path_diagnostic_extra(mount_path: Path) -> dict[str, object]:
+    return {"mount_path": str(mount_path)}
 
 
 def _close_fd_quietly(fd: int) -> None:
@@ -130,6 +163,8 @@ class UnixLocalSandboxSession(BaseSandboxSession):
     _pty_lock: asyncio.Lock
     _pty_processes: dict[int, _UnixPtyProcessEntry]
     _reserved_pty_process_ids: set[int]
+    _fd_close_tasks: set[asyncio.Task[None]]
+    _host_environment_allowlist: frozenset[str] | None
 
     def __init__(self, *, state: UnixLocalSandboxSessionState) -> None:
         self.state = state
@@ -137,10 +172,27 @@ class UnixLocalSandboxSession(BaseSandboxSession):
         self._pty_lock = asyncio.Lock()
         self._pty_processes = {}
         self._reserved_pty_process_ids = set()
+        self._fd_close_tasks = set()
+        self._host_environment_allowlist = None
 
     @classmethod
     def from_state(cls, state: UnixLocalSandboxSessionState) -> "UnixLocalSandboxSession":
         return cls(state=state)
+
+    async def _validate_manifest_application(
+        self,
+        *,
+        only_ephemeral: bool = False,
+        manifest: Manifest | None = None,
+        session_running: bool | None = None,
+    ) -> None:
+        _ = (only_ephemeral, session_running)
+        from .._mount_security import validate_manifest_mount_credential_boundaries
+
+        validate_manifest_mount_credential_boundaries(
+            manifest or self.state.manifest,
+            provider_backend_id="unix_local",
+        )
 
     async def _prepare_backend_workspace(self) -> None:
         workspace = Path(self.state.manifest.root)
@@ -168,6 +220,7 @@ class UnixLocalSandboxSession(BaseSandboxSession):
         only_ephemeral: bool = False,
         provision_accounts: bool = True,
     ) -> MaterializationResult:
+        _assert_unix_local_host_path_grants_unsupported(self.state.manifest)
         if self.state.manifest.users or self.state.manifest.groups:
             raise ValueError(
                 "UnixLocalSandboxSession does not support manifest users or groups because "
@@ -178,12 +231,6 @@ class UnixLocalSandboxSession(BaseSandboxSession):
             provision_accounts=provision_accounts,
         )
 
-    async def apply_manifest(self, *, only_ephemeral: bool = False) -> MaterializationResult:
-        return await self._apply_manifest(
-            only_ephemeral=only_ephemeral,
-            provision_accounts=not only_ephemeral,
-        )
-
     async def provision_manifest_accounts(self) -> None:
         if self.state.manifest.users or self.state.manifest.groups:
             raise ValueError(
@@ -192,9 +239,13 @@ class UnixLocalSandboxSession(BaseSandboxSession):
             )
 
     async def _after_shutdown(self) -> None:
+        await self._wait_for_fd_close_tasks()
         # Best-effort: mark session not running. We intentionally do not delete the workspace
         # directory here; cleanup is handled by the Client.delete().
         self._running = False
+
+    async def _after_stop(self) -> None:
+        await self._wait_for_fd_close_tasks()
 
     async def _resolve_exposed_port(self, port: int) -> ExposedPortEndpoint:
         return ExposedPortEndpoint(host="127.0.0.1", port=port, tls=False)
@@ -312,8 +363,8 @@ class UnixLocalSandboxSession(BaseSandboxSession):
             else:
                 with suppress(OSError):
                     os.close(secondary_fd)
-            entry = _UnixPtyProcessEntry(process=process, tty=True, primary_fd=primary_fd)
-            entry.pump_tasks = [asyncio.create_task(self._pump_pty_primary_fd(entry))]
+                entry = _UnixPtyProcessEntry(process=process, tty=True, primary_fd=primary_fd)
+                entry.pump_tasks = [asyncio.create_task(self._pump_pty_primary_fd(entry))]
         else:
             process = await asyncio.create_subprocess_exec(
                 *exec_command,
@@ -416,7 +467,14 @@ class UnixLocalSandboxSession(BaseSandboxSession):
             await self._terminate_pty_entry(entry)
 
     async def _resolved_exec_context(self) -> tuple[dict[str, str], str]:
-        env = os.environ.copy()
+        if self._host_environment_allowlist is None:
+            env = dict(os.environ)
+        else:
+            env = {
+                name: value
+                for name, value in os.environ.items()
+                if name in self._host_environment_allowlist
+            }
         env.update(await self.state.manifest.environment.resolve())
 
         workspace = Path(self.state.manifest.root)
@@ -476,36 +534,14 @@ class UnixLocalSandboxSession(BaseSandboxSession):
         yield_time_ms: int,
         max_output_tokens: int | None,
     ) -> tuple[bytes, int | None]:
-        deadline = time.monotonic() + (yield_time_ms / 1000)
-        output = bytearray()
-
-        while True:
-            async with entry.output_lock:
-                while entry.output_chunks:
-                    output.extend(entry.output_chunks.popleft())
-
-            if time.monotonic() >= deadline:
-                break
-
-            if entry.output_closed.is_set():
-                async with entry.output_lock:
-                    while entry.output_chunks:
-                        output.extend(entry.output_chunks.popleft())
-                break
-
-            remaining_s = deadline - time.monotonic()
-            if remaining_s <= 0:
-                break
-
-            try:
-                await asyncio.wait_for(entry.output_notify.wait(), timeout=remaining_s)
-            except asyncio.TimeoutError:
-                break
-            entry.output_notify.clear()
-
-        text = output.decode("utf-8", errors="replace")
-        truncated_text, original_token_count = truncate_text_by_tokens(text, max_output_tokens)
-        return truncated_text.encode("utf-8", errors="replace"), original_token_count
+        return await collect_pty_output(
+            output_chunks=entry.output_chunks,
+            output_lock=entry.output_lock,
+            output_notify=entry.output_notify,
+            is_done=entry.output_closed.is_set,
+            yield_time_ms=yield_time_ms,
+            max_output_tokens=max_output_tokens,
+        )
 
     async def _finalize_pty_update(
         self,
@@ -564,9 +600,9 @@ class UnixLocalSandboxSession(BaseSandboxSession):
         if entry.tty:
             if primary_fd is not None:
                 # On macOS we have observed os.close() on the PTY master fd block while a
-                # background reader thread is still inside os.read(). Close it off-thread so
-                # session teardown remains best-effort and non-blocking.
-                asyncio.create_task(asyncio.to_thread(_close_fd_quietly, primary_fd))
+                # background reader thread is still inside os.read(). Keep the close task owned
+                # by the session without making PTY termination wait indefinitely for it.
+                self._schedule_fd_close(primary_fd)
             entry.output_closed.set()
             entry.output_notify.set()
             return
@@ -576,6 +612,16 @@ class UnixLocalSandboxSession(BaseSandboxSession):
         await asyncio.gather(*entry.pump_tasks, return_exceptions=True)
         if entry.wait_task is not None:
             await asyncio.gather(entry.wait_task, return_exceptions=True)
+
+    def _schedule_fd_close(self, fd: int) -> None:
+        task = asyncio.create_task(asyncio.to_thread(_close_fd_quietly, fd))
+        self._fd_close_tasks.add(task)
+        task.add_done_callback(self._fd_close_tasks.discard)
+
+    async def _wait_for_fd_close_tasks(self) -> None:
+        tasks = tuple(self._fd_close_tasks)
+        if tasks:
+            await asyncio.wait(tasks, timeout=_PTY_FD_CLOSE_GRACE_SECONDS)
 
     def _confined_exec_command(
         self,
@@ -629,7 +675,12 @@ class UnixLocalSandboxSession(BaseSandboxSession):
         return rewritten
 
     @staticmethod
-    def _darwin_allowable_read_roots(path: Path, *, host_home: Path) -> list[Path]:
+    def _darwin_allowable_read_roots(
+        path: Path,
+        *,
+        host_home: Path,
+        allow_virtual_environment_root: bool = False,
+    ) -> list[Path]:
         candidates: set[Path] = set()
         normalized = path.expanduser()
         try:
@@ -646,6 +697,14 @@ class UnixLocalSandboxSession(BaseSandboxSession):
             candidates.add(resolved)
         else:
             candidates.add(resolved.parent)
+
+        if allow_virtual_environment_root:
+            for candidate in (normalized, resolved):
+                if candidate.name != "bin":
+                    continue
+                virtual_env_root = candidate.parent
+                if (virtual_env_root / "pyvenv.cfg").is_file():
+                    candidates.add(virtual_env_root)
 
         resolved_text = resolved.as_posix()
         if resolved_text == "/opt/homebrew" or resolved_text.startswith("/opt/homebrew/"):
@@ -685,13 +744,21 @@ class UnixLocalSandboxSession(BaseSandboxSession):
         allowed: list[Path] = []
         seen: set[str] = set()
 
-        def _append(path: str | Path | None) -> None:
+        def _append(
+            path: str | Path | None,
+            *,
+            allow_virtual_environment_root: bool = False,
+        ) -> None:
             if path is None:
                 return
             candidate = Path(path).expanduser()
             if not candidate.is_absolute():
                 return
-            for root in self._darwin_allowable_read_roots(candidate, host_home=host_home):
+            for root in self._darwin_allowable_read_roots(
+                candidate,
+                host_home=host_home,
+                allow_virtual_environment_root=allow_virtual_environment_root,
+            ):
                 key = root.as_posix()
                 if key in seen:
                     continue
@@ -704,6 +771,12 @@ class UnixLocalSandboxSession(BaseSandboxSession):
 
         executable = shutil.which(command_parts[0], path=env.get("PATH"))
         _append(executable)
+
+        # Only host-controlled PATH entries may widen a bin grant to its virtual environment
+        # root. Manifest environment overrides must not authorize broader host filesystem reads.
+        for path_entry in os.environ.get("PATH", "").split(os.pathsep):
+            if path_entry:
+                _append(path_entry, allow_virtual_environment_root=True)
         return allowed
 
     def _darwin_extra_path_grant_roots(self) -> list[tuple[Path, bool]]:
@@ -890,7 +963,7 @@ class UnixLocalSandboxSession(BaseSandboxSession):
         try:
             if normalized.is_dir() and not normalized.is_symlink():
                 if recursive:
-                    shutil.rmtree(normalized)
+                    await run_blocking_workspace_io(shutil.rmtree, normalized)
                 else:
                     normalized.rmdir()
             else:
@@ -1011,7 +1084,8 @@ class UnixLocalSandboxSession(BaseSandboxSession):
 
         skip = self._persist_workspace_skip_relpaths()
         buf = io.BytesIO()
-        try:
+
+        def _archive_workspace() -> None:
             with tarfile.open(fileobj=buf, mode="w") as tar:
                 tar.add(
                     root,
@@ -1026,6 +1100,9 @@ class UnixLocalSandboxSession(BaseSandboxSession):
                         else ti
                     ),
                 )
+
+        try:
+            await run_blocking_workspace_io(_archive_workspace)
         except (tarfile.TarError, OSError) as e:
             raise WorkspaceArchiveReadError(path=root, cause=e) from e
 
@@ -1034,7 +1111,8 @@ class UnixLocalSandboxSession(BaseSandboxSession):
 
     async def hydrate_workspace(self, data: io.IOBase) -> None:
         root = Path(self.state.manifest.root)
-        try:
+
+        def _extract_workspace() -> None:
             root.mkdir(parents=True, exist_ok=True)
             with tarfile.open(fileobj=data, mode="r:*") as tar:
                 safe_extract_tarfile(
@@ -1042,6 +1120,9 @@ class UnixLocalSandboxSession(BaseSandboxSession):
                     root=root,
                     allow_external_symlink_targets=False,
                 )
+
+        try:
+            await run_blocking_workspace_io(_extract_workspace)
         except UnsafeTarMemberError as e:
             raise WorkspaceArchiveWriteError(
                 path=root, context={"reason": e.reason, "member": e.member}, cause=e
@@ -1060,10 +1141,28 @@ class UnixLocalSandboxClient(BaseSandboxClient[UnixLocalSandboxClientOptions | N
         *,
         instrumentation: Instrumentation | None = None,
         dependencies: Dependencies | None = None,
+        inherit_host_environment: bool = True,
+        host_environment_allowlist: Collection[str] | None = None,
     ) -> None:
-        self._instrumentation = instrumentation or Instrumentation()
-        self._dependencies = dependencies
+        if inherit_host_environment and host_environment_allowlist is not None:
+            raise ValueError("host_environment_allowlist requires inherit_host_environment=False")
+        if isinstance(host_environment_allowlist, str):
+            raise TypeError("host_environment_allowlist must be a collection of variable names")
 
+        self._instrumentation = (
+            instrumentation if instrumentation is not None else Instrumentation()
+        )
+        self._dependencies = dependencies
+        if inherit_host_environment:
+            self._host_environment_allowlist = None
+        else:
+            self._host_environment_allowlist = frozenset(
+                _HOST_ENVIRONMENT_ALLOWLIST
+                if host_environment_allowlist is None
+                else host_environment_allowlist
+            )
+
+    @redact_mount_error_data
     async def create(
         self,
         *,
@@ -1071,17 +1170,17 @@ class UnixLocalSandboxClient(BaseSandboxClient[UnixLocalSandboxClientOptions | N
         manifest: Manifest | None = None,
         options: UnixLocalSandboxClientOptions | None = None,
     ) -> SandboxSession:
-        resolved_options = options or UnixLocalSandboxClientOptions()
+        resolved_options = options if options is not None else UnixLocalSandboxClientOptions()
+        manifest = manifest if manifest is not None else Manifest()
+        _assert_unix_local_host_path_grants_unsupported(manifest)
+        self._validate_manifest_for_create(manifest)
         # For local execution, runner-created sessions should always get an isolated temp root
         # unless the caller explicitly chose a custom host path.
         workspace_root_owned = False
-        if manifest is None or manifest.root == _DEFAULT_MANIFEST_ROOT:
+        if manifest.root == _DEFAULT_MANIFEST_ROOT:
             workspace_dir = tempfile.mkdtemp(prefix=_DEFAULT_WORKSPACE_PREFIX)
             workspace_root_owned = True
-            if manifest is None:
-                manifest = Manifest(root=workspace_dir)
-            else:
-                manifest = manifest.model_copy(update={"root": workspace_dir}, deep=True)
+            manifest = manifest.model_copy(update={"root": workspace_dir}, deep=True)
 
         session_id = uuid.uuid4()
         snapshot_id = str(session_id)
@@ -1094,6 +1193,9 @@ class UnixLocalSandboxClient(BaseSandboxClient[UnixLocalSandboxClientOptions | N
             exposed_ports=resolved_options.exposed_ports,
         )
         inner = UnixLocalSandboxSession.from_state(state)
+        # Keep host inheritance policy under trusted runtime control. Session state and manifests
+        # must not be able to change it when a session is resumed by another client.
+        inner._host_environment_allowlist = self._host_environment_allowlist
         return self._wrap_session(inner, instrumentation=self._instrumentation)
 
     async def delete(self, session: SandboxSession) -> SandboxSession:
@@ -1107,12 +1209,13 @@ class UnixLocalSandboxClient(BaseSandboxClient[UnixLocalSandboxClientOptions | N
         for mount_entry, mount_path in inner.state.manifest.ephemeral_mount_targets():
             try:
                 await mount_entry.unmount(inner, mount_path, Path("/"))
-            except Exception:
+            except Exception as exc:
                 unmount_failed = True
-                logger.warning(
-                    "Failed to unmount UnixLocal workspace mount before deleting root: %s",
-                    mount_path,
-                    exc_info=True,
+                log_tool_action_warning(
+                    logger,
+                    "Failed to unmount UnixLocal workspace mount before deleting root",
+                    exc,
+                    diagnostic_extra=partial(_mount_path_diagnostic_extra, mount_path),
                 )
         if unmount_failed:
             return session
@@ -1124,14 +1227,32 @@ class UnixLocalSandboxClient(BaseSandboxClient[UnixLocalSandboxClientOptions | N
             pass
         return session
 
+    @redact_mount_error_data
     async def resume(
         self,
         state: SandboxSessionState,
     ) -> SandboxSession:
         if not isinstance(state, UnixLocalSandboxSessionState):
             raise TypeError("UnixLocalSandboxClient.resume expects a UnixLocalSandboxSessionState")
+        state.assert_path_grants_rebound()
+        _assert_unix_local_host_path_grants_unsupported(state.manifest)
         inner = UnixLocalSandboxSession.from_state(state)
+        inner._host_environment_allowlist = self._host_environment_allowlist
         return self._wrap_session(inner, instrumentation=self._instrumentation)
 
     def deserialize_session_state(self, payload: dict[str, object]) -> SandboxSessionState:
-        return UnixLocalSandboxSessionState.model_validate(payload)
+        return self._deserialize_session_state_payload(payload, UnixLocalSandboxSessionState)
+
+
+def _assert_unix_local_host_path_grants_unsupported(manifest: Manifest) -> None:
+    grant = next(
+        (grant for grant in manifest.extra_path_grants if grant.host_path is not None),
+        None,
+    )
+    if grant is None:
+        return
+    raise ValueError(
+        "UnixLocalSandboxClient does not support sandbox path grant host_path "
+        f"for {grant.path!r}; omit host_path when both paths are the same or use "
+        "DockerSandboxClient"
+    )

@@ -4,17 +4,17 @@ search:
 ---
 # 高级 SQLite 会话
 
-`AdvancedSQLiteSession` 是基础 `SQLiteSession` 的增强版本，提供高级对话管理能力，包括对话分支、详细的使用情况分析以及结构化对话查询。
+`AdvancedSQLiteSession` 是基础版 `SQLiteSession` 的增强版本，提供高级对话管理功能，包括对话分支、详细的用量分析和结构化对话查询。
 
-## 功能
+## 功能 {#features}
 
-- **对话分支**：从任意用户消息创建替代对话路径
-- **使用情况追踪**：按轮次提供详细的 token 使用情况分析，并包含完整的 JSON 明细
-- **结构化查询**：按轮次获取对话、工具使用统计等
-- **分支管理**：独立的分支切换与管理
-- **消息结构元数据**：跟踪消息类型、工具使用情况和对话流程
+- **对话分支**：从任意用户消息创建不同的对话路径
+- **用量追踪**：按轮次提供详细的 token 用量分析及完整的 JSON 明细
+- **结构化查询**：按轮次获取对话、工具使用统计信息等
+- **分支管理**：独立切换和管理分支
+- **消息结构元数据**：追踪消息类型、工具使用情况和对话流程
 
-## 快速开始
+## 快速开始 {#quick-start}
 
 ```python
 from agents import Agent, Runner
@@ -54,7 +54,7 @@ print(result.final_output)  # "California"
 await session.store_run_usage(result)
 ```
 
-## 初始化
+## 初始化 {#initialization}
 
 ```python
 from agents.extensions.memory import AdvancedSQLiteSession
@@ -68,7 +68,7 @@ session = AdvancedSQLiteSession(
 # With persistent storage
 session = AdvancedSQLiteSession(
     session_id="user_123",
-    db_path="path/to/conversations.db",
+    db_path="conversations.db",
     create_tables=True
 )
 
@@ -82,18 +82,18 @@ session = AdvancedSQLiteSession(
 )
 ```
 
-### 参数
+### 参数 {#parameters}
 
-- `session_id` (str)：对话会话的唯一标识符
-- `db_path` (str | Path)：SQLite 数据库文件路径。默认为 `:memory:`，用于内存存储
-- `create_tables` (bool)：是否自动创建高级表。默认为 `False`
-- `logger` (logging.Logger | None)：用于会话的自定义日志记录器。默认为模块日志记录器
+- `session_id`（str）：对话会话的唯一标识符
+- `db_path`（str | Path）：SQLite 数据库文件的路径。默认为 `:memory:`，即使用内存存储
+- `create_tables`（bool）：是否自动创建高级表。默认为 `False`
+- `logger`（logging.Logger | None）：会话的自定义日志记录器。默认为模块日志记录器
 
-## 使用情况追踪
+## 用量追踪 {#usage-tracking}
 
-AdvancedSQLiteSession 通过按对话轮次存储 token 使用情况数据，提供详细的使用情况分析。**这完全依赖于在每次智能体运行后调用 `store_run_usage` 方法。**
+AdvancedSQLiteSession 通过存储每个对话轮次的 token 用量数据，提供详细的用量分析。**这完全依赖于在每次智能体运行后调用 `store_run_usage` 方法。**
 
-### 使用情况数据存储
+### 用量数据存储 {#storing-usage-data}
 
 ```python
 # After each agent run, store the usage data
@@ -107,7 +107,7 @@ await session.store_run_usage(result)
 # - Detailed JSON token information (if available)
 ```
 
-### 使用情况统计检索
+### 用量统计信息检索 {#retrieving-usage-statistics}
 
 ```python
 # Get session-level usage (all branches)
@@ -135,11 +135,11 @@ for turn_data in turn_usage:
 turn_2_usage = await session.get_turn_usage(user_turn_number=2)
 ```
 
-## 对话分支
+## 对话分支 {#conversation-branching}
 
-AdvancedSQLiteSession 的关键功能之一是能够从任意用户消息创建对话分支，从而让你探索替代的对话路径。
+AdvancedSQLiteSession 的主要功能之一是能够从任意用户消息创建对话分支，让你可以探索不同的对话路径。
 
-### 分支创建
+### 分支创建 {#creating-branches}
 
 ```python
 # Get available turns for branching
@@ -165,7 +165,9 @@ branch_id = await session.create_branch_from_content(
 )
 ```
 
-### 分支管理
+分支 ID 在会话 ID 的整个生命周期内保持唯一。删除分支或清除会话会移除其对话数据，但不会让之前使用过的分支 ID 再次可用；创建其他分支时，请使用新名称。
+
+### 分支管理 {#branch-management}
 
 ```python
 # List all branches
@@ -182,7 +184,7 @@ await session.switch_to_branch(branch_id)
 await session.delete_branch(branch_id, force=True)  # force=True allows deleting current branch
 ```
 
-### 分支工作流示例
+### 分支工作流示例 {#branch-workflow-example}
 
 ```python
 # Original conversation
@@ -215,11 +217,11 @@ result = await Runner.run(
 await session.store_run_usage(result)
 ```
 
-## 结构化查询
+## 结构化查询 {#structured-queries}
 
-AdvancedSQLiteSession 提供了多种方法，用于分析对话结构和内容。
+AdvancedSQLiteSession 提供了多种用于分析对话结构和内容的方法。
 
-### 对话分析
+### 对话分析 {#conversation-analysis}
 
 ```python
 # Get conversation organized by turns
@@ -243,21 +245,21 @@ for turn in matching_turns:
     print(f"Turn {turn['turn']}: {turn['content']}")
 ```
 
-### 消息结构
+### 消息结构 {#message-structure}
 
-会话会自动跟踪消息结构，包括：
+会话会自动追踪消息结构，包括：
 
-- 消息类型（用户、assistant、tool_call 等）
+- 消息类型值（`user`、`assistant`、`tool_call` 等）
 - 工具调用的工具名称
-- 轮次编号和序列号
+- 轮次编号和序列编号
 - 分支关联
 - 时间戳
 
-## 数据库架构
+## 数据库架构 {#database-schema}
 
-AdvancedSQLiteSession 在基础 SQLite 架构之上扩展了两个额外的表：
+AdvancedSQLiteSession 在基础 SQLite 架构上扩展了三个附加表：
 
-### message_structure 表
+### message_structure 表 {#message_structure-table}
 
 ```sql
 CREATE TABLE message_structure (
@@ -276,7 +278,19 @@ CREATE TABLE message_structure (
 );
 ```
 
-### turn_usage 表
+### branch_reservations 表 {#branch_reservations-table}
+
+```sql
+CREATE TABLE branch_reservations (
+    session_id TEXT NOT NULL,
+    branch_id TEXT NOT NULL,
+    PRIMARY KEY (session_id, branch_id)
+);
+```
+
+此表以原子方式预留分支 ID，包括复制前缀为空的分支。删除分支或清除会话时，预留记录都会保留，从而防止过期的会话实例将历史记录合并到之后复用同一 ID 的分支中。
+
+### turn_usage 表 {#turn_usage-table}
 
 ```sql
 CREATE TABLE turn_usage (
@@ -296,12 +310,12 @@ CREATE TABLE turn_usage (
 );
 ```
 
-## 完整示例
+## 完整示例 {#complete-example}
 
-查看[完整示例](https://github.com/openai/openai-agents-python/tree/main/examples/memory/advanced_sqlite_session_example.py)，全面了解所有功能。
+请查看[完整示例](https://github.com/openai/openai-agents-python/tree/main/examples/memory/advanced_sqlite_session_example.py)，了解所有功能的综合演示。
 
 
-## API 参考
+## API 参考 {#api-reference}
 
 - [`AdvancedSQLiteSession`][agents.extensions.memory.advanced_sqlite_session.AdvancedSQLiteSession] - 主类
 - [`Session`][agents.memory.session.Session] - 基础会话协议

@@ -1,17 +1,25 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime
 from typing import Any
 
 import pytest
 from openai.types.responses import ResponseCompletedEvent
 
-from agents import Agent, GuardrailFunctionOutput, InputGuardrail, RunContextWrapper, Runner
+from agents import (
+    Agent,
+    GuardrailFunctionOutput,
+    InputGuardrail,
+    MaxTurnsExceeded,
+    RunContextWrapper,
+    Runner,
+)
 from agents.exceptions import InputGuardrailTripwireTriggered
 from agents.items import TResponseInputItem
-from tests.fake_model import FakeModel
-from tests.test_responses import get_text_message
+from agents.testing import ScriptedModel
+from tests.test_responses import get_function_tool, get_function_tool_call, get_text_message
 from tests.testing_processor import fetch_events, fetch_ordered_spans
 
 FAST_GUARDRAIL_DELAY = 0.005
@@ -49,8 +57,8 @@ async def test_input_guardrail_results_follow_completion_order():
             output_info={"delay": FAST_GUARDRAIL_DELAY}, tripwire_triggered=False
         )
 
-    model = FakeModel()
-    model.set_next_output([get_text_message("Final response")])
+    model = ScriptedModel()
+    model.enqueue([get_text_message("Final response")])
 
     agent = Agent(
         name="TimingAgentOrder",
@@ -81,8 +89,8 @@ async def test_run_streamed_input_guardrail_timing_is_consistent(guardrail_delay
     """
 
     # Arrange: Agent with a single text output and a delayed input guardrail
-    model = FakeModel()
-    model.set_next_output([get_text_message("Final response")])
+    model = ScriptedModel()
+    model.enqueue([get_text_message("Final response")])
 
     agent = Agent(
         name="TimingAgent",
@@ -122,8 +130,8 @@ async def test_run_streamed_input_guardrail_sequences_match_between_fast_and_slo
     """Run twice with fast vs slow input guardrail and compare event sequences exactly."""
 
     async def run_once(delay: float) -> list[str]:
-        model = FakeModel()
-        model.set_next_output([get_text_message("Final response")])
+        model = ScriptedModel()
+        model.enqueue([get_text_message("Final response")])
         agent = Agent(
             name="TimingAgent",
             model=model,
@@ -148,8 +156,8 @@ async def test_run_streamed_input_guardrail_sequences_match_between_fast_and_slo
 async def test_run_streamed_input_guardrail_tripwire_raises(guardrail_delay: float):
     """Guardrail tripwire must raise from stream_events regardless of timing."""
 
-    model = FakeModel()
-    model.set_next_output([get_text_message("Final response")])
+    model = ScriptedModel()
+    model.enqueue([get_text_message("Final response")])
 
     agent = Agent(
         name="TimingAgentTrip",
@@ -173,11 +181,95 @@ async def test_run_streamed_input_guardrail_tripwire_raises(guardrail_delay: flo
     )
 
 
-class SlowCompleteFakeModel(FakeModel):
-    """A FakeModel that delays just before emitting ResponseCompletedEvent in streaming."""
+@pytest.mark.asyncio
+async def test_max_turns_does_not_clobber_input_guardrail_tripwire():
+    """A guardrail tripwire recorded before max_turns fires must win over MaxTurnsExceeded.
 
-    def __init__(self, delay_seconds: float, tracing_enabled: bool = True):
-        super().__init__(tracing_enabled=tracing_enabled)
+    Regression test: RunResultStreaming._check_errors() re-creates a fresh
+    MaxTurnsExceeded and overwrites self._stored_exception on *every* call once
+    current_turn > max_turns, because self._max_turns_handled is only ever set
+    True by the max_turns error-handler path -- never in the default (no
+    handler) path. stream_events() calls _check_errors() again unconditionally
+    in its `finally` block, so a guardrail trip that was already captured as
+    InputGuardrailTripwireTriggered got silently replaced with MaxTurnsExceeded
+    by that final call. Callers using the documented
+    `except InputGuardrailTripwireTriggered` pattern never saw the tripwire.
+
+    This race must not be ordered with a real-time sleep: a fixed delay only
+    approximates "the guardrail finishes after max_turns is exceeded", and
+    under CI load, tracing overhead, or slower model instrumentation the
+    guardrail can instead finish *before* current_turn > max_turns is ever
+    reached, in which case the test would observe the correct exception even
+    against the unpatched (buggy) implementation and silently stop being a
+    regression test. Instead, an `error_handlers={"max_turns": ...}` hook
+    (returning None, so it falls through to the exact same default raise path
+    as if no handler were registered) sets an `asyncio.Event` at the precise
+    moment the run loop establishes current_turn > max_turns. The guardrail
+    awaits that event before returning its tripwire, so it can only ever
+    resolve *after* the max-turns condition genuinely holds.
+    """
+
+    max_turns_reached = asyncio.Event()
+
+    async def tripping_guardrail(
+        ctx: RunContextWrapper[Any], agent: Agent[Any], input: str | list[TResponseInputItem]
+    ) -> GuardrailFunctionOutput:
+        # Wait for the run loop to have actually established current_turn >
+        # max_turns, rather than guessing at a delay long enough to outlast it.
+        await max_turns_reached.wait()
+        return GuardrailFunctionOutput(output_info={"reason": "blocked"}, tripwire_triggered=True)
+
+    model = ScriptedModel()
+    func_output = json.dumps({"a": "b"})
+    model.extend(
+        [
+            [
+                get_text_message(str(i)),
+                get_function_tool_call("some_function", func_output, str(i)),
+            ]
+            for i in range(1, 10)
+        ]
+    )
+
+    agent = Agent(
+        name="MaxTurnsGuardrailAgent",
+        model=model,
+        tools=[get_function_tool("some_function", "result")],
+        # run_in_parallel defaults to True -- this is the default configuration,
+        # not an opt-in one.
+        input_guardrails=[InputGuardrail(guardrail_function=tripping_guardrail, name="trip")],
+    )
+
+    result = Runner.run_streamed(
+        agent,
+        input="user_message",
+        max_turns=1,
+        # Declining (returning None) preserves the exact default max_turns
+        # behavior; the handler exists purely to signal, deterministically,
+        # the moment current_turn > max_turns is established.
+        error_handlers={"max_turns": lambda data: max_turns_reached.set()},
+    )
+
+    raised: BaseException | None = None
+    try:
+        async for _ in result.stream_events():
+            pass
+    except BaseException as exc:  # noqa: BLE001 - we need to inspect the exact type raised
+        raised = exc
+
+    assert isinstance(raised, InputGuardrailTripwireTriggered), (
+        f"Expected InputGuardrailTripwireTriggered, got "
+        f"{type(raised).__name__ if raised else None}. The tripped guardrail "
+        "result was silently clobbered by a freshly-minted MaxTurnsExceeded."
+    )
+    assert not isinstance(raised, MaxTurnsExceeded)
+
+
+class SlowCompleteScriptedModel(ScriptedModel):
+    """A ScriptedModel that delays just before emitting ResponseCompletedEvent in streaming."""
+
+    def __init__(self, delay_seconds: float, emit_traces: bool = True):
+        super().__init__(emit_traces=emit_traces)
         self._delay_seconds = delay_seconds
 
     async def stream_response(self, *args, **kwargs):
@@ -206,8 +298,8 @@ def _iso(s: str | None) -> datetime:
 async def test_parent_span_and_trace_finish_after_slow_input_guardrail():
     """Agent span and trace finish after guardrail when guardrail completes last."""
 
-    model = FakeModel(tracing_enabled=True)
-    model.set_next_output([get_text_message("Final response")])
+    model = ScriptedModel(emit_traces=True)
+    model.enqueue([get_text_message("Final response")])
     agent = Agent(
         name="TimingAgentTrace",
         model=model,
@@ -240,8 +332,8 @@ async def test_parent_span_and_trace_finish_after_slow_input_guardrail():
 async def test_parent_span_and_trace_finish_after_slow_model():
     """Agent span and trace finish after model when model completes last."""
 
-    model = SlowCompleteFakeModel(delay_seconds=SLOW_GUARDRAIL_DELAY, tracing_enabled=True)
-    model.set_next_output([get_text_message("Final response")])
+    model = SlowCompleteScriptedModel(delay_seconds=SLOW_GUARDRAIL_DELAY, emit_traces=True)
+    model.enqueue([get_text_message("Final response")])
     agent = Agent(
         name="TimingAgentTrace",
         model=model,

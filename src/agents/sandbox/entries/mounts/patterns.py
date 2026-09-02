@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Annotated, Literal, TypeVar
 
 from pydantic import BaseModel, Field
 
+from ....exceptions import _mark_error_data_redacted
 from ...errors import (
     MountCommandError,
     MountConfigError,
@@ -23,6 +24,11 @@ from ...workspace_paths import (
     posix_path_as_path,
     sandbox_path_str,
     windows_absolute_path,
+)
+from ._redaction import (
+    _inline_url_authority_values,
+    _redact_mount_lifecycle_error,
+    _url_contains_inline_authority,
 )
 
 if TYPE_CHECKING:
@@ -171,11 +177,17 @@ class FuseMountPattern(MountPatternBase):
     log_level: str = Field(default="log_debug")
     cache_type: Literal["block_cache", "file_cache"] = Field(default="block_cache")
     cache_path: Path | None = None
-    cache_size_mb: int | None = None
+    cache_size_mb: int | None = Field(
+        default=None,
+        description="Cache size in MB. None or 0 uses the SDK default for the cache type.",
+    )
     block_cache_block_size_mb: int = Field(default=16)
     block_cache_disk_timeout_sec: int = Field(default=3600)
     file_cache_timeout_sec: int = Field(default=120)
-    file_cache_max_size_mb: int | None = None
+    file_cache_max_size_mb: int | None = Field(
+        default=None,
+        description="File-cache maximum size in MB. None or 0 uses cache_size_mb.",
+    )
     attr_cache_timeout_sec: int | None = None
     entry_cache_timeout_sec: int | None = None
     negative_entry_cache_timeout_sec: int | None = None
@@ -271,7 +283,9 @@ class FuseMountPattern(MountPatternBase):
                     ]
                 )
 
-            attr_cache_timeout = self.attr_cache_timeout_sec or 7200
+            attr_cache_timeout = (
+                self.attr_cache_timeout_sec if self.attr_cache_timeout_sec is not None else 7200
+            )
             lines.extend(
                 [
                     "attr_cache:",
@@ -298,6 +312,7 @@ class FuseMountPattern(MountPatternBase):
             lines.append("")
             return "\n".join(lines)
 
+    @_redact_mount_lifecycle_error
     async def apply(
         self,
         session: BaseSandboxSession,
@@ -359,6 +374,8 @@ class FuseMountPattern(MountPatternBase):
 
         endpoint = fuse_config.endpoint or f"https://{account}.blob.core.windows.net"
         cache_type = self.cache_type
+        # Zero has no portable meaning across Blobfuse cache types, so the SDK intentionally uses
+        # its cache-type-specific default for both zero and None.
         cache_size_mb = self.cache_size_mb or (50_000 if cache_type == "block_cache" else 4_096)
         file_cache_max_size_mb = self.file_cache_max_size_mb or cache_size_mb
         blobfuse_config = self.BlobfuseConfig(
@@ -392,12 +409,15 @@ class FuseMountPattern(MountPatternBase):
 
         result = await session.exec(*cmd, shell=False)
         if not result.ok():
-            raise MountCommandError(
+            error = MountCommandError(
                 command=" ".join(cmd),
                 stderr=result.stderr.decode("utf-8", errors="replace"),
                 context={"account": account, "container": container},
             )
+            _mark_error_data_redacted(error)
+            raise error
 
+    @_redact_mount_lifecycle_error
     async def unapply(
         self,
         session: BaseSandboxSession,
@@ -426,6 +446,7 @@ class MountpointMountPattern(MountPatternBase):
 
     options: MountpointOptions = Field(default_factory=MountpointOptions)
 
+    @_redact_mount_lifecycle_error
     async def apply(
         self,
         session: BaseSandboxSession,
@@ -434,6 +455,12 @@ class MountpointMountPattern(MountPatternBase):
     ) -> None:
         mountpoint_config = _require_mount_config(config, MountpointMountConfig)
         bucket = mountpoint_config.bucket
+        protected_endpoint_url = (
+            mountpoint_config.endpoint_url
+            if _url_contains_inline_authority(mountpoint_config.endpoint_url)
+            else None
+        )
+        endpoint_env_reference = "${OPENAI_AGENTS_MOUNT_ENDPOINT_URL}"
 
         tool_check = await session.exec("command -v mount-s3 >/dev/null 2>&1")
         if not tool_check.ok():
@@ -445,6 +472,8 @@ class MountpointMountPattern(MountPatternBase):
         await session.mkdir(path, parents=True)
 
         cmd: list[str] = ["mount-s3"]
+        if not (mountpoint_config.access_key_id and mountpoint_config.secret_access_key):
+            cmd.append("--no-sign-request")
         if mountpoint_config.read_only:
             cmd.append("--read-only")
         elif mountpoint_config.mount_type in {"s3_mount", "gcs_mount"}:
@@ -453,7 +482,14 @@ class MountpointMountPattern(MountPatternBase):
         if mountpoint_config.region:
             cmd.extend(["--region", mountpoint_config.region])
         if mountpoint_config.endpoint_url:
-            cmd.extend(["--endpoint-url", mountpoint_config.endpoint_url])
+            cmd.extend(
+                [
+                    "--endpoint-url",
+                    endpoint_env_reference
+                    if protected_endpoint_url is not None
+                    else mountpoint_config.endpoint_url,
+                ]
+            )
         if mountpoint_config.mount_type == "gcs_mount":
             # GCS XML API rejects the default upload checksum flow used by mount-s3.
             cmd.extend(["--upload-checksums", "off"])
@@ -470,10 +506,15 @@ class MountpointMountPattern(MountPatternBase):
             env_vars.append(("AWS_SECRET_ACCESS_KEY", secret_access_key))
             if session_token:
                 env_vars.append(("AWS_SESSION_TOKEN", session_token))
+        if protected_endpoint_url is not None:
+            env_vars.append(("OPENAI_AGENTS_MOUNT_ENDPOINT_URL", protected_endpoint_url))
 
-        joined_cmd = " ".join(shlex.quote(part) for part in cmd)
+        joined_cmd = " ".join(
+            f'"{part}"' if part == endpoint_env_reference else shlex.quote(part) for part in cmd
+        )
         stderr_path: Path | None = None
         sensitive_values = [value for _name, value in env_vars]
+        sensitive_values.extend(_inline_url_authority_values(protected_endpoint_url))
         if env_vars:
             session_id = getattr(session.state, "session_id", None)
             if session_id is None:
@@ -509,12 +550,15 @@ class MountpointMountPattern(MountPatternBase):
             if stderr_path is not None:
                 stderr += await _read_text_if_present(session, stderr_path)
             stderr = _redact_sensitive_values(stderr, sensitive_values)
-            raise MountCommandError(
-                command=joined_cmd,
+            error = MountCommandError(
+                command=_redact_sensitive_values(joined_cmd, sensitive_values),
                 stderr=stderr,
                 context={"bucket": bucket},
             )
+            _mark_error_data_redacted(error)
+            raise error
 
+    @_redact_mount_lifecycle_error
     async def unapply(
         self,
         session: BaseSandboxSession,
@@ -543,6 +587,7 @@ class S3FilesMountPattern(MountPatternBase):
 
     options: S3FilesOptions = Field(default_factory=S3FilesOptions)
 
+    @_redact_mount_lifecycle_error
     async def apply(
         self,
         session: BaseSandboxSession,
@@ -590,6 +635,7 @@ class S3FilesMountPattern(MountPatternBase):
                 context={"file_system_id": s3files_config.file_system_id},
             )
 
+    @_redact_mount_lifecycle_error
     async def unapply(
         self,
         session: BaseSandboxSession,
@@ -868,6 +914,7 @@ class RcloneMountPattern(MountPatternBase):
                 context={"type": config.mount_type},
             )
 
+    @_redact_mount_lifecycle_error
     async def apply(
         self,
         session: BaseSandboxSession,
@@ -942,6 +989,7 @@ class RcloneMountPattern(MountPatternBase):
                 config_path=command_config_path,
             )
 
+    @_redact_mount_lifecycle_error
     async def unapply(
         self,
         session: BaseSandboxSession,

@@ -130,19 +130,22 @@ def _parse_update_diff(lines: list[str], input: str) -> ParsedUpdateDiff:
     cursor = 0
 
     while not _is_done(parser, END_SECTION_MARKERS):
-        anchor = _read_str(parser, "@@ ")
-        has_bare_anchor = (
-            anchor == "" and parser.index < len(parser.lines) and parser.lines[parser.index] == "@@"
-        )
-        if has_bare_anchor:
-            parser.index += 1
+        anchors, anchor_count = _read_anchors(parser)
 
-        if not (anchor or has_bare_anchor or cursor == 0):
+        if not (anchor_count > 0 or cursor == 0):
             current_line = parser.lines[parser.index] if parser.index < len(parser.lines) else ""
             raise ValueError(f"Invalid Line:\n{current_line}")
 
-        if anchor.strip():
-            cursor = _advance_cursor_to_anchor(anchor, input_lines, cursor, parser)
+        require_anchor_match = anchor_count > 1
+        for index, anchor in enumerate(anchors):
+            cursor = _advance_cursor_to_anchor(
+                anchor,
+                input_lines,
+                cursor,
+                parser,
+                require_match=require_anchor_match,
+                force_forward_search=index > 0,
+            )
 
         section = _read_section(parser.lines, parser.index)
         find_result = _find_context(input_lines, section.next_context, cursor, section.eof)
@@ -168,28 +171,78 @@ def _parse_update_diff(lines: list[str], input: str) -> ParsedUpdateDiff:
     return ParsedUpdateDiff(chunks=chunks, fuzz=parser.fuzz)
 
 
+def _read_anchors(parser: ParserState) -> tuple[list[str], int]:
+    """Consume the ``@@`` header lines that introduce one hunk.
+
+    The patch format lets a hunk carry several stacked headers, so nested code can be
+    located when a single header plus context is still ambiguous::
+
+        @@ class BaseClass
+        @@     def method():
+
+    Returns the non-empty headers in the order they should narrow the search, plus
+    the total number of consumed headers, including bare ``@@`` markers.
+    """
+    anchors: list[str] = []
+    anchor_count = 0
+
+    while True:
+        start_index = parser.index
+        anchor = _read_str(parser, "@@ ")
+        consumed = parser.index != start_index
+
+        if not consumed and parser.index < len(parser.lines) and parser.lines[parser.index] == "@@":
+            parser.index += 1
+            consumed = True
+
+        if not consumed:
+            break
+        anchor_count += 1
+        if anchor.strip():
+            anchors.append(anchor)
+
+    return anchors, anchor_count
+
+
 def _advance_cursor_to_anchor(
     anchor: str,
     input_lines: list[str],
     cursor: int,
     parser: ParserState,
+    *,
+    require_match: bool = False,
+    force_forward_search: bool = False,
 ) -> int:
     found = False
 
-    if not any(line == anchor for line in input_lines[:cursor]):
+    has_exact_match_before_cursor = not force_forward_search and any(
+        line == anchor for line in input_lines[:cursor]
+    )
+    if has_exact_match_before_cursor:
+        found = True
+    else:
         for i in range(cursor, len(input_lines)):
             if input_lines[i] == anchor:
                 cursor = i + 1
                 found = True
                 break
 
-    if not found and not any(line.strip() == anchor.strip() for line in input_lines[:cursor]):
-        for i in range(cursor, len(input_lines)):
-            if input_lines[i].strip() == anchor.strip():
-                cursor = i + 1
-                parser.fuzz += 1
-                found = True
-                break
+    if not found:
+        has_trimmed_match_before_cursor = not force_forward_search and any(
+            line.strip() == anchor.strip() for line in input_lines[:cursor]
+        )
+        if has_trimmed_match_before_cursor:
+            found = True
+        else:
+            for i in range(cursor, len(input_lines)):
+                if input_lines[i].strip() == anchor.strip():
+                    cursor = i + 1
+                    parser.fuzz += 1
+                    found = True
+                    break
+
+    if require_match and not found:
+        raise ValueError(f"Invalid Anchor {cursor}:\n{anchor}")
 
     return cursor
 
@@ -280,13 +333,24 @@ class ContextMatch:
 
 def _find_context(lines: list[str], context: list[str], start: int, eof: bool) -> ContextMatch:
     if eof:
-        end_start = max(0, len(lines) - len(context))
-        end_match = _find_context_core(lines, context, end_start)
+        # `str.split("\n")` keeps a trailing empty element for text that ends in a
+        # newline. Treat that as the file terminator, not as a line, so EOF hunks
+        # append after the last real line instead of after a phantom blank.
+        search_lines = _eof_search_lines(lines)
+        end_start = max(0, len(search_lines) - len(context))
+        end_match = _find_context_core(search_lines, context, end_start)
         if end_match.new_index != -1:
             return end_match
-        fallback = _find_context_core(lines, context, start)
+        fallback_start = min(start, len(search_lines))
+        fallback = _find_context_core(search_lines, context, fallback_start)
         return ContextMatch(new_index=fallback.new_index, fuzz=fallback.fuzz + 10000)
     return _find_context_core(lines, context, start)
+
+
+def _eof_search_lines(lines: list[str]) -> list[str]:
+    if lines and lines[-1] == "":
+        return lines[:-1]
+    return lines
 
 
 def _find_context_core(lines: list[str], context: list[str], start: int) -> ContextMatch:

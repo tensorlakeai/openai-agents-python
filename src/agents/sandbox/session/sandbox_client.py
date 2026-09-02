@@ -1,17 +1,26 @@
 from __future__ import annotations
 
 import abc
+from collections.abc import Mapping
 from typing import Any, ClassVar, Generic, TypeVar, cast
 
 from pydantic import BaseModel, ConfigDict, model_serializer
 
+from ...exceptions import _raise_data_redacted_error
+from .._mount_security import (
+    redact_mount_error_data_sync,
+)
+from ..errors import MountConfigError
 from ..manifest import Manifest
 from ..snapshot import SnapshotBase, SnapshotSpec
 from .base_sandbox_session import BaseSandboxSession
 from .dependencies import Dependencies
 from .manager import Instrumentation
 from .sandbox_session import SandboxSession
-from .sandbox_session_state import SandboxSessionState
+from .sandbox_session_state import (
+    REDACTED_HOST_PATH_GRANT_PATHS_KEY,
+    SandboxSessionState,
+)
 
 SandboxClientOptionsClass = type["BaseSandboxClientOptions"]
 ClientOptionsT = TypeVar("ClientOptionsT")
@@ -123,6 +132,18 @@ class BaseSandboxClient(abc.ABC, Generic[ClientOptionsT]):
             dependencies=self._resolve_dependencies(),
         )
 
+    def _validate_manifest_for_create(
+        self,
+        manifest: Manifest,
+    ) -> Manifest:
+        from .._mount_security import validate_manifest_mount_credential_boundaries
+
+        validate_manifest_mount_credential_boundaries(
+            manifest,
+            provider_backend_id=self.backend_id,
+        )
+        return manifest
+
     @abc.abstractmethod
     async def create(
         self,
@@ -170,9 +191,90 @@ class BaseSandboxClient(abc.ABC, Generic[ClientOptionsT]):
         `session=` when you want to reuse an already-running sandbox session.
         """
 
+    @redact_mount_error_data_sync
     def serialize_session_state(self, state: SandboxSessionState) -> dict[str, object]:
         """Serialize backend-specific sandbox state into a JSON-compatible payload."""
-        return state.model_dump(mode="json")
+        from ...exceptions import _raise_data_redacted_error
+        from .._mount_security import (
+            _manifest_has_configured_mount_authority,
+            _manifest_mount_provenance_error,
+            _mark_mount_validation_error,
+            _redact_mount_serialization_error,
+        )
+
+        provenance_error = _manifest_mount_provenance_error(state.manifest)
+        if provenance_error is not None:
+            _mark_mount_validation_error(provenance_error)
+            state = cast(Any, None)
+            _raise_data_redacted_error(provenance_error)
+
+        try:
+            return self._serialize_session_state(state)
+        except MountConfigError:
+            raise
+        except Exception as error:
+            if not _manifest_has_configured_mount_authority(state.manifest):
+                raise
+            raise _redact_mount_serialization_error(error) from None
+
+    def _serialize_session_state(self, state: SandboxSessionState) -> dict[str, object]:
+        redacted_paths = set(state.path_grants_require_rebind)
+        persistent_grants = []
+        for grant in state.manifest.extra_path_grants:
+            if grant.host_path is not None:
+                redacted_paths.add(grant.path)
+                continue
+            persistent_grants.append(grant)
+
+        persistent_manifest = state.manifest.model_copy(
+            update={"extra_path_grants": tuple(persistent_grants)},
+        )
+        persistent_state = state.model_copy(update={"manifest": persistent_manifest})
+        payload = cast(dict[str, object], persistent_state.model_dump(mode="json"))
+        if redacted_paths:
+            payload[REDACTED_HOST_PATH_GRANT_PATHS_KEY] = sorted(redacted_paths)
+        return payload
+
+    @staticmethod
+    def _deserialize_session_state_payload(
+        payload: Mapping[str, object],
+        state_class: type[SandboxSessionState],
+    ) -> SandboxSessionState:
+        from ...exceptions import _replace_data_redacted_process_control_error
+        from .._mount_security import (
+            _redact_mount_state_validation_error,
+            sanitize_raw_session_state_mount_authority,
+        )
+
+        safe_error: BaseException | None = None
+        persisted_payload: dict[str, object] | None = None
+        try:
+            sanitized, _redacted = sanitize_raw_session_state_mount_authority(payload)
+            if not isinstance(sanitized, dict):
+                raise TypeError("sandbox session state payload must be a mapping")
+            persisted_payload = sanitized
+            if isinstance(payload, dict):
+                payload.clear()
+                payload.update(sanitized)
+                persisted_payload = payload
+            state = state_class.model_validate(persisted_payload)
+        except BaseException as error:
+            safe_error = _replace_data_redacted_process_control_error(error)
+            if safe_error is None:
+                safe_error = _redact_mount_state_validation_error(
+                    error,
+                    message="sandbox session state payload is invalid",
+                )
+
+        if safe_error is not None:
+            if isinstance(payload, dict):
+                payload.clear()
+            sanitized = cast(Any, None)
+            persisted_payload = None
+            state_class = cast(Any, None)
+            _raise_data_redacted_error(safe_error)
+        assert persisted_payload is not None
+        return SandboxSessionState._mark_persisted_path_grants(state, payload=persisted_payload)
 
     @abc.abstractmethod
     def deserialize_session_state(self, payload: dict[str, object]) -> SandboxSessionState:

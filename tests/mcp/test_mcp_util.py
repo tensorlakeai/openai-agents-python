@@ -1,12 +1,15 @@
 import asyncio
+import copy
 import dataclasses
 import json
 import logging
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 from inline_snapshot import snapshot
-from mcp.types import CallToolResult, ImageContent, TextContent, Tool as MCPTool
+from mcp import Tool as MCPToolType
+from mcp.types import CallToolResult as CallToolResultType, TextContent
 from pydantic import BaseModel, TypeAdapter
 
 import agents._debug as _debug
@@ -15,6 +18,9 @@ from agents import (
     FunctionTool,
     Handoff,
     RunContextWrapper,
+    ToolGuardrailFunctionOutput,
+    ToolInputGuardrail,
+    ToolOutputGuardrail,
     default_tool_error_function,
     handoff,
 )
@@ -24,10 +30,18 @@ from agents.exceptions import (
     ModelBehaviorError,
     UserError,
 )
-from agents.mcp import MCPServer, MCPUtil
+from agents.mcp import (
+    MCPServer,
+    MCPServerSse,
+    MCPServerStdio,
+    MCPServerStreamableHttp,
+    MCPUtil,
+)
+from agents.mcp._compat import MCPError, tool_input_schema
 from agents.tool_context import ToolContext
 
 from .helpers import FakeMCPServer
+from .model_compat import CallToolResult, ImageContent, Tool as MCPTool, create_mcp_error
 
 
 class Foo(BaseModel):
@@ -41,11 +55,28 @@ class Bar(BaseModel):
 
 Baz = TypeAdapter(dict[str, str])
 
+_URL_DERIVED_SECRET_SERVER_NAME = (
+    "streamable_http: https://user:s3cr3t_pw@mcp.example.test:8443/mcp"
+    "?api_key=SECRET_QS_KEY#SECRET_FRAGMENT"
+)
+_SANITIZED_SERVER_NAME = "streamable_http: https://mcp.example.test:8443/mcp"
+_SERVER_URL_SECRETS = ("user", "s3cr3t_pw", "SECRET_QS_KEY", "SECRET_FRAGMENT")
+
 
 def _convertible_schema() -> dict[str, Any]:
     schema = Foo.model_json_schema()
     schema["additionalProperties"] = False
     return schema
+
+
+def _nested_object_schema(depth: int) -> dict[str, Any]:
+    root: dict[str, Any] = {"type": "object", "properties": {}}
+    current = root
+    for _ in range(depth):
+        child: dict[str, Any] = {"type": "object", "properties": {}}
+        current["properties"]["child"] = child
+        current = child
+    return root
 
 
 @pytest.mark.asyncio
@@ -96,6 +127,117 @@ async def test_get_all_function_tools():
 
 
 @pytest.mark.asyncio
+async def test_mcp_server_guardrails_apply_to_every_converted_tool_with_isolated_lists():
+    input_guardrail = ToolInputGuardrail(
+        guardrail_function=lambda _: ToolGuardrailFunctionOutput.allow()
+    )
+    output_guardrail = ToolOutputGuardrail(
+        guardrail_function=lambda _: ToolGuardrailFunctionOutput.allow()
+    )
+    server = FakeMCPServer(
+        tool_input_guardrails=[input_guardrail],
+        tool_output_guardrails=[output_guardrail],
+    )
+    server.add_tool("first", {})
+    server.add_tool("second", {})
+
+    tools = await MCPUtil.get_all_function_tools(
+        [server],
+        False,
+        RunContextWrapper(context=None),
+        Agent(name="test_agent"),
+    )
+
+    assert [tool.name for tool in tools] == ["first", "second"]
+    first, second = tools
+    assert isinstance(first, FunctionTool)
+    assert isinstance(second, FunctionTool)
+    assert first.tool_input_guardrails is not None
+    assert first.tool_output_guardrails is not None
+    assert first.tool_input_guardrails == [input_guardrail]
+    assert second.tool_input_guardrails == [input_guardrail]
+    assert first.tool_output_guardrails == [output_guardrail]
+    assert second.tool_output_guardrails == [output_guardrail]
+    assert first.tool_input_guardrails is not server.tool_input_guardrails
+    assert first.tool_input_guardrails is not second.tool_input_guardrails
+    assert first.tool_output_guardrails is not server.tool_output_guardrails
+    assert first.tool_output_guardrails is not second.tool_output_guardrails
+
+    first.tool_input_guardrails.clear()
+    first.tool_output_guardrails.clear()
+    assert server.tool_input_guardrails == [input_guardrail]
+    assert server.tool_output_guardrails == [output_guardrail]
+    assert second.tool_input_guardrails == [input_guardrail]
+    assert second.tool_output_guardrails == [output_guardrail]
+
+
+@pytest.mark.asyncio
+async def test_mcp_server_guardrails_do_not_leak_across_servers_or_filtered_tools():
+    input_guardrail = ToolInputGuardrail(
+        guardrail_function=lambda _: ToolGuardrailFunctionOutput.allow()
+    )
+    guarded_server = FakeMCPServer(
+        tool_filter={"allowed_tool_names": ["guarded"]},
+        tool_input_guardrails=[input_guardrail],
+    )
+    guarded_server.add_tool("guarded", {})
+    guarded_server.add_tool("filtered_out", {})
+    unguarded_server = FakeMCPServer()
+    unguarded_server.add_tool("unguarded", {})
+
+    tools = await MCPUtil.get_all_function_tools(
+        [guarded_server, unguarded_server],
+        False,
+        RunContextWrapper(context=None),
+        Agent(name="test_agent"),
+    )
+
+    assert [tool.name for tool in tools] == ["guarded", "unguarded"]
+    guarded, unguarded = tools
+    assert isinstance(guarded, FunctionTool)
+    assert isinstance(unguarded, FunctionTool)
+    assert guarded.tool_input_guardrails == [input_guardrail]
+    assert guarded.tool_output_guardrails is None
+    assert unguarded.tool_input_guardrails is None
+    assert unguarded.tool_output_guardrails is None
+
+
+def test_public_mcp_server_constructors_forward_guardrail_configuration():
+    input_guardrails: list[ToolInputGuardrail[Any]] = []
+    output_guardrails: list[ToolOutputGuardrail[Any]] = []
+    servers = [
+        MCPServerStdio(
+            params={"command": "test"},
+            tool_input_guardrails=input_guardrails,
+            tool_output_guardrails=output_guardrails,
+        ),
+        MCPServerSse(
+            params={"url": "https://example.test/sse"},
+            tool_input_guardrails=input_guardrails,
+            tool_output_guardrails=output_guardrails,
+        ),
+        MCPServerStreamableHttp(
+            params={"url": "https://example.test/mcp"},
+            tool_input_guardrails=input_guardrails,
+            tool_output_guardrails=output_guardrails,
+        ),
+    ]
+
+    assert all(server.tool_input_guardrails is input_guardrails for server in servers)
+    assert all(server.tool_output_guardrails is output_guardrails for server in servers)
+
+    tool = MCPUtil.to_function_tool(
+        MCPTool(name="test", inputSchema={}),
+        servers[0],
+        convert_schemas_to_strict=False,
+    )
+    assert tool.tool_input_guardrails == []
+    assert tool.tool_output_guardrails == []
+    assert tool.tool_input_guardrails is not input_guardrails
+    assert tool.tool_output_guardrails is not output_guardrails
+
+
+@pytest.mark.asyncio
 async def test_get_all_function_tools_duplicate_error_is_deterministic():
     server1 = FakeMCPServer(server_name="server_1")
     server1.add_tool("zeta", {})
@@ -111,7 +253,46 @@ async def test_get_all_function_tools_duplicate_error_is_deterministic():
     with pytest.raises(UserError) as exc_info:
         await MCPUtil.get_all_function_tools([server1, server2], False, run_context, agent)
 
-    assert str(exc_info.value) == "Duplicate tool names found across MCP servers: alpha, zeta"
+    assert str(exc_info.value) == (
+        "Duplicate tool names found across MCP servers: alpha, zeta. "
+        "Pass `include_server_in_tool_names=True` to "
+        "`MCPUtil.get_all_function_tools()` or set "
+        "`mcp_config={'include_server_in_tool_names': True}` on the "
+        "agent to prefix tool names with their server name and avoid "
+        "collisions."
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_all_function_tools_duplicate_error_without_hint_when_prefixed():
+    """When include_server_in_tool_names is already enabled, duplicates should
+    not suggest enabling the same option again.
+    """
+    server1 = FakeMCPServer(server_name="server_1")
+    server1.add_tool("alpha", {})
+
+    server2 = FakeMCPServer(server_name="server_2")
+    server2.add_tool("beta", {})
+
+    run_context = RunContextWrapper(context=None)
+    agent = Agent(name="test_agent", instructions="Test agent")
+
+    def _return_colliding_names(server_tool_batches, *, reserved_names):
+        return {(0, 0): "mcp_same__tool", (1, 0): "mcp_same__tool"}
+
+    with patch.object(
+        MCPUtil, "_build_prefixed_tool_name_overrides", side_effect=_return_colliding_names
+    ):
+        with pytest.raises(UserError) as exc_info:
+            await MCPUtil.get_all_function_tools(
+                [server1, server2],
+                False,
+                run_context,
+                agent,
+                include_server_in_tool_names=True,
+            )
+
+    assert str(exc_info.value) == "Duplicate tool names found across MCP servers: mcp_same__tool"
 
 
 @pytest.mark.asyncio
@@ -167,6 +348,31 @@ async def test_get_all_function_tools_can_prefix_server_tool_names():
     assert server1.tool_calls == []
     assert server2.tool_calls == ["search"]
     assert captured_meta_context == {"server_name": "calendar", "tool_name": "search"}
+
+
+@pytest.mark.asyncio
+async def test_get_all_function_tools_hides_url_credentials_from_public_name_and_origin():
+    server = FakeMCPServer(server_name=_URL_DERIVED_SECRET_SERVER_NAME)
+    server.add_tool("search", {})
+
+    tools = await MCPUtil.get_all_function_tools(
+        [server],
+        False,
+        RunContextWrapper(context=None),
+        Agent(name="test_agent", instructions="Test agent"),
+        include_server_in_tool_names=True,
+    )
+
+    assert len(tools) == 1
+    function_tool = tools[0]
+    assert isinstance(function_tool, FunctionTool)
+    assert function_tool.name == ("mcp_streamable_http__https___mcp_example_test_8443_mcp__search")
+    assert function_tool._tool_origin is not None
+    assert function_tool._tool_origin.mcp_server_name == _SANITIZED_SERVER_NAME
+    assert server.name == _URL_DERIVED_SECRET_SERVER_NAME
+    for secret in _SERVER_URL_SECRETS:
+        assert secret not in function_tool.name
+        assert secret not in repr(function_tool._tool_origin)
 
 
 @pytest.mark.asyncio
@@ -595,7 +801,7 @@ async def test_to_function_tool_does_not_reuse_nested_static_mcp_meta():
             tool_name: str,
             arguments: dict[str, Any] | None,
             meta: dict[str, Any] | None = None,
-        ) -> CallToolResult:
+        ) -> CallToolResultType:
             if meta is not None:
                 meta["nested"]["headers"].append("mutated")
             return await super().call_tool(tool_name, arguments, meta=meta)
@@ -636,7 +842,7 @@ async def test_mcp_invoke_bad_json_errors(caplog: pytest.LogCaptureFixture):
     with pytest.raises(ModelBehaviorError):
         await MCPUtil.invoke_mcp_tool(server, tool, ctx, "not_json")
 
-    assert "Invalid JSON input for tool test_tool_1" in caplog.text
+    assert "Invalid JSON input for MCP tool" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -733,6 +939,11 @@ class SlowFakeMCPServer(FakeMCPServer):
         return await super().call_tool(tool_name, arguments, meta=meta)
 
 
+_CREDENTIALED_SERVER_NAME = (
+    "sse: https://user:s3cr3t_pw@mcp.example.com/sse?api_key=SECRET_QS_KEY#SECRET_FRAGMENT"
+)
+
+
 class CleanupOnCancelFakeMCPServer(FakeMCPServer):
     def __init__(self, cleanup_finished: asyncio.Event):
         super().__init__()
@@ -766,7 +977,113 @@ async def test_mcp_invocation_crash_causes_error(caplog: pytest.LogCaptureFixtur
     with pytest.raises(AgentsException):
         await MCPUtil.invoke_mcp_tool(server, tool, ctx, "")
 
-    assert "Error invoking MCP tool test_tool_1" in caplog.text
+    assert "Error invoking MCP tool" in caplog.text
+
+
+class SecretCrashingFakeMCPServer(FakeMCPServer):
+    async def call_tool(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any] | None,
+        meta: dict[str, Any] | None = None,
+    ):
+        raise Exception("crash with SECRET_CRASH_123")
+
+
+class McpErrorFakeMCPServer(FakeMCPServer):
+    async def call_tool(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any] | None,
+        meta: dict[str, Any] | None = None,
+    ):
+        raise create_mcp_error(-32000, "upstream said SECRET_MCP_123")
+
+
+@pytest.mark.asyncio
+async def test_mcp_invocation_crash_redacts_error_when_dont_log_tool_data(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    caplog.set_level(logging.DEBUG)
+    monkeypatch.setattr(_debug, "DONT_LOG_TOOL_DATA", True)
+
+    server = SecretCrashingFakeMCPServer(server_name="SECRET_CUSTOM_MCP_SERVER")
+    server.add_tool("SECRET_MCP_TOOL_NAME", {})
+    ctx = RunContextWrapper(context=None)
+    tool = MCPTool(name="SECRET_MCP_TOOL_NAME", inputSchema={})
+
+    with pytest.raises(AgentsException):
+        await MCPUtil.invoke_mcp_tool(server, tool, ctx, "")
+
+    assert "Error invoking MCP tool" in caplog.text
+    assert "SECRET_CUSTOM_MCP_SERVER" not in caplog.text
+    assert "SECRET_MCP_TOOL_NAME" not in caplog.text
+    assert "SECRET_CRASH_123" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_mcp_invocation_crash_includes_error_when_tool_logging_enabled(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    caplog.set_level(logging.DEBUG)
+    monkeypatch.setattr(_debug, "DONT_LOG_TOOL_DATA", False)
+
+    server = SecretCrashingFakeMCPServer(
+        server_name=(
+            "streamable_http: https://SECRET_CREDENTIAL@example.test/"
+            "SECRET_MCP_PATH?token=SECRET_MCP_QUERY"
+        )
+    )
+    server.add_tool("test_tool_1", {})
+    ctx = RunContextWrapper(context=None)
+    tool = MCPTool(name="test_tool_1", inputSchema={})
+
+    with pytest.raises(AgentsException):
+        await MCPUtil.invoke_mcp_tool(server, tool, ctx, "")
+
+    assert "SECRET_CRASH_123" in caplog.text
+    assert "SECRET_MCP_PATH" in caplog.text
+    assert "SECRET_CREDENTIAL" not in caplog.text
+    assert "SECRET_MCP_QUERY" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_returned_error_redacts_message_when_dont_log_tool_data(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    caplog.set_level(logging.DEBUG)
+    monkeypatch.setattr(_debug, "DONT_LOG_TOOL_DATA", True)
+
+    server = McpErrorFakeMCPServer(server_name="SECRET_CUSTOM_MCP_SERVER")
+    server.add_tool("SECRET_MCP_TOOL_NAME", {})
+    ctx = RunContextWrapper(context=None)
+    tool = MCPTool(name="SECRET_MCP_TOOL_NAME", inputSchema={})
+
+    with pytest.raises(MCPError):
+        await MCPUtil.invoke_mcp_tool(server, tool, ctx, "")
+
+    assert "MCP tool returned an error" in caplog.text
+    assert "SECRET_CUSTOM_MCP_SERVER" not in caplog.text
+    assert "SECRET_MCP_TOOL_NAME" not in caplog.text
+    assert "SECRET_MCP_123" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_returned_error_includes_message_when_tool_logging_enabled(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    caplog.set_level(logging.DEBUG)
+    monkeypatch.setattr(_debug, "DONT_LOG_TOOL_DATA", False)
+
+    server = McpErrorFakeMCPServer()
+    server.add_tool("test_tool_1", {})
+    ctx = RunContextWrapper(context=None)
+    tool = MCPTool(name="test_tool_1", inputSchema={})
+
+    with pytest.raises(MCPError):
+        await MCPUtil.invoke_mcp_tool(server, tool, ctx, "")
+
+    assert "SECRET_MCP_123" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -794,6 +1111,45 @@ async def test_mcp_tool_inner_cancellation_becomes_tool_error():
     result = await function_tool.on_invoke_tool(tool_context, "{}")
     assert isinstance(result, str)
     assert "tool execution was cancelled" in result
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_inner_cancellation_sanitizes_url_derived_server_name():
+    server = CancelledFakeMCPServer(server_name=_CREDENTIALED_SERVER_NAME)
+    server.add_tool("cancel_tool", {})
+    ctx = RunContextWrapper(context=None)
+    tool = MCPTool(name="cancel_tool", inputSchema={})
+
+    with pytest.raises(MCPToolCancellationError) as exc_info:
+        await MCPUtil.invoke_mcp_tool(server, tool, ctx, "{}")
+
+    message = str(exc_info.value)
+    assert "cancel_tool" in message
+    assert "mcp.example.com/sse" in message
+    assert "s3cr3t_pw" not in message
+    assert "SECRET_QS_KEY" not in message
+    assert "SECRET_FRAGMENT" not in message
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_generic_error_sanitizes_only_url_derived_server_name():
+    server = CrashingFakeMCPServer(server_name=_CREDENTIALED_SERVER_NAME)
+    server.add_tool("crashing_tool", {})
+    ctx = RunContextWrapper(context=None)
+    tool = MCPTool(name="crashing_tool", inputSchema={})
+
+    with pytest.raises(AgentsException) as exc_info:
+        await MCPUtil.invoke_mcp_tool(server, tool, ctx, "{}")
+
+    message = str(exc_info.value)
+    assert "crashing_tool" in message
+    assert "mcp.example.com/sse" in message
+    assert "Crash!" in message
+    assert "s3cr3t_pw" not in message
+    assert "SECRET_QS_KEY" not in message
+    assert "SECRET_FRAGMENT" not in message
+    assert isinstance(exc_info.value.__cause__, Exception)
+    assert str(exc_info.value.__cause__) == "Crash!"
 
 
 @pytest.mark.asyncio
@@ -934,9 +1290,6 @@ async def test_mcp_invocation_mcp_error_reraises(caplog: pytest.LogCaptureFixtur
     """
     caplog.set_level(logging.DEBUG)
 
-    from mcp.shared.exceptions import McpError
-    from mcp.types import ErrorData
-
     class McpErrorFakeMCPServer(FakeMCPServer):
         async def call_tool(
             self,
@@ -944,7 +1297,7 @@ async def test_mcp_invocation_mcp_error_reraises(caplog: pytest.LogCaptureFixtur
             arguments: dict[str, Any] | None,
             meta: dict[str, Any] | None = None,
         ):
-            raise McpError(ErrorData(code=-32000, message="upstream 422 Unprocessable Entity"))
+            raise create_mcp_error(-32000, "upstream 422 Unprocessable Entity")
 
     server = McpErrorFakeMCPServer()
     server.add_tool("search", {})
@@ -953,7 +1306,7 @@ async def test_mcp_invocation_mcp_error_reraises(caplog: pytest.LogCaptureFixtur
     tool = MCPTool(name="search", inputSchema={})
 
     # invoke_mcp_tool itself should re-raise McpError
-    with pytest.raises(McpError):
+    with pytest.raises(MCPError):
         await MCPUtil.invoke_mcp_tool(server, tool, ctx, "{}")
 
     # Warning (not error) should be logged before re-raising
@@ -1025,6 +1378,30 @@ async def test_mcp_tool_graceful_error_handling(caplog: pytest.LogCaptureFixture
     assert (
         "MCP tool crashing_tool failed" in caplog.text or "Error invoking MCP tool" in caplog.text
     )
+
+
+@pytest.mark.asyncio
+async def test_mcp_default_tool_error_hides_url_credentials():
+    server = SecretCrashingFakeMCPServer(server_name=_URL_DERIVED_SECRET_SERVER_NAME)
+    function_tool = MCPUtil.to_function_tool(
+        MCPTool(name="crashing_tool", inputSchema={}),
+        server,
+        convert_schemas_to_strict=False,
+        agent=Agent(name="test-agent"),
+    )
+    tool_context = ToolContext(
+        context=None,
+        tool_name="crashing_tool",
+        tool_call_id="test_call_url_credentials",
+        tool_arguments="{}",
+    )
+
+    result = await function_tool.on_invoke_tool(tool_context, "{}")
+
+    assert isinstance(result, str)
+    assert _SANITIZED_SERVER_NAME in result
+    for secret in _SERVER_URL_SECRETS:
+        assert secret not in result
 
 
 @pytest.mark.asyncio
@@ -1141,7 +1518,7 @@ async def test_to_function_tool_legacy_call_callable_policy_requires_approval():
     def require_approval(
         _run_context: RunContextWrapper[Any],
         _agent: Agent,
-        _tool: MCPTool,
+        _tool: MCPToolType,
     ) -> bool:
         return False
 
@@ -1165,7 +1542,7 @@ async def test_to_function_tool_callable_policy_uses_agent_and_tool():
     def require_approval(
         run_context: RunContextWrapper[Any],
         agent: Agent,
-        tool: MCPTool,
+        tool: MCPToolType,
     ) -> bool:
         captured["run_context"] = run_context
         captured["agent"] = agent
@@ -1201,7 +1578,7 @@ async def test_to_function_tool_async_callable_policy_is_awaited():
     async def require_approval(
         _run_context: RunContextWrapper[Any],
         _agent: Agent,
-        tool: MCPTool,
+        tool: MCPToolType,
     ) -> bool:
         await asyncio.sleep(0)
         return tool.name == "async_guarded_tool"
@@ -1518,6 +1895,37 @@ async def test_mcp_fastmcp_behavior_verification():
 
 
 @pytest.mark.asyncio
+async def test_non_text_content_serialized_as_json():
+    """Non-text, non-image content blocks should reach the model as valid JSON, not repr."""
+
+    from mcp.types import ContentBlock, EmbeddedResource, ResourceLink, TextResourceContents
+
+    from .model_compat import AudioContent
+
+    server = FakeMCPServer()
+    server.add_tool("test_tool", {})
+
+    ctx = RunContextWrapper(context=None)
+    tool = MCPTool(name="test_tool", inputSchema={})
+
+    resource_link = ResourceLink(type="resource_link", name="report", uri="resource://reports/1")
+    embedded = EmbeddedResource(
+        type="resource",
+        resource=TextResourceContents(uri="resource://reports/2", text="hello world"),
+    )
+    audio = AudioContent(type="audio", data="AAAA", mimeType="audio/wav")
+    content_items: list[ContentBlock] = [resource_link, embedded, audio]
+    server._custom_content = content_items
+    result = await MCPUtil.invoke_mcp_tool(server, tool, ctx, "")
+
+    assert isinstance(result, list) and len(result) == len(content_items)
+    for output_item, content_item in zip(result, content_items, strict=False):
+        assert output_item["type"] == "text"
+        # The text must parse as JSON and round-trip the content block's data.
+        assert json.loads(output_item["text"]) == content_item.model_dump(mode="json")
+
+
+@pytest.mark.asyncio
 async def test_agent_convert_schemas_unset():
     """Test that leaving convert_schemas_to_strict unset (defaulting to False) leaves tool schemas
     as non-strict.
@@ -1594,7 +2002,21 @@ def test_to_function_tool_does_not_mutate_mcp_input_schema():
         "properties": {},
     }
     assert schema == {"type": "object", "description": "Test tool"}
-    assert tool.inputSchema == {"type": "object", "description": "Test tool"}
+    assert tool_input_schema(tool) == {"type": "object", "description": "Test tool"}
+
+
+@pytest.mark.parametrize("convert_schemas_to_strict", [False, True])
+def test_to_function_tool_rejects_deep_schema_before_copying(
+    convert_schemas_to_strict: bool,
+):
+    tool = MCPTool(name="deep_tool", inputSchema=_nested_object_schema(1_000))
+
+    with pytest.raises(UserError, match="too deeply nested"):
+        MCPUtil.to_function_tool(
+            tool,
+            FakeMCPServer(),
+            convert_schemas_to_strict=convert_schemas_to_strict,
+        )
 
 
 def test_to_function_tool_failed_strict_conversion_keeps_original_schema():
@@ -1605,7 +2027,7 @@ def test_to_function_tool_failed_strict_conversion_keeps_original_schema():
     schema = {
         "type": "object",
         "properties": {
-            "x": {"type": "object", "additionalProperties": True},
+            "x": {"additionalProperties": True},
         },
     }
     tool = MCPTool(name="test_tool", inputSchema=schema)
@@ -1616,9 +2038,585 @@ def test_to_function_tool_failed_strict_conversion_keeps_original_schema():
     assert function_tool.params_json_schema == {
         "type": "object",
         "properties": {
-            "x": {"type": "object", "additionalProperties": True},
+            "x": {"additionalProperties": True},
         },
     }
+
+
+@pytest.mark.parametrize(
+    "node_schema",
+    [
+        {
+            "properties": {"a": {"type": "string"}},
+            "required": ["a"],
+            "$ref": "#/$defs/T",
+        },
+        {
+            "$ref": "#/$defs/T",
+            "allOf": [{"$ref": "#/$defs/U"}],
+        },
+        {"$ref": "#/$defs/T", "additionalProperties": False},
+    ],
+    ids=["overlapping-properties", "singleton-all-of", "interacting-object-constraints"],
+)
+def test_to_function_tool_ref_sibling_falls_back_to_original_schema(node_schema):
+    schema = {
+        "$defs": {
+            "T": {
+                "type": "object",
+                "properties": {"b": {"type": "string"}},
+                "required": ["b"],
+            },
+            "U": {"type": "integer"},
+        },
+        "type": "object",
+        "properties": {"node": node_schema},
+    }
+    tool = MCPTool(name="test_tool", inputSchema=schema)
+
+    function_tool = MCPUtil.to_function_tool(tool, FakeMCPServer(), convert_schemas_to_strict=True)
+
+    assert function_tool.strict_json_schema is False
+    assert function_tool.params_json_schema == schema
+
+
+def test_to_function_tool_ref_with_schema_metadata_remains_strict():
+    schema = {
+        "$defs": {"T": {"type": "string"}},
+        "type": "object",
+        "properties": {
+            "value": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "$ref": "#/$defs/T",
+            }
+        },
+    }
+    tool = MCPTool(name="test_tool", inputSchema=schema)
+
+    function_tool = MCPUtil.to_function_tool(tool, FakeMCPServer(), convert_schemas_to_strict=True)
+
+    assert function_tool.strict_json_schema is True
+    assert function_tool.params_json_schema["properties"]["value"] == {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "string",
+    }
+    assert function_tool.params_json_schema["additionalProperties"] is False
+
+
+def test_to_function_tool_ref_with_nested_id_falls_back_to_original_schema():
+    schema = {
+        "$defs": {"T": {"type": "string"}},
+        "type": "object",
+        "properties": {
+            "value": {
+                "$id": "https://example.test/nested",
+                "$defs": {"T": {"type": "integer"}},
+                "$ref": "#/$defs/T",
+            }
+        },
+        "additionalProperties": False,
+    }
+    tool = MCPTool(name="test_tool", inputSchema=schema)
+
+    function_tool = MCPUtil.to_function_tool(tool, FakeMCPServer(), convert_schemas_to_strict=True)
+
+    assert function_tool.strict_json_schema is False
+    assert function_tool.params_json_schema == schema
+
+
+def test_to_function_tool_ref_with_anchor_remains_strict():
+    schema = {
+        "$defs": {"T": {"type": "string"}},
+        "type": "object",
+        "properties": {
+            "value": {
+                "$anchor": "value",
+                "$ref": "#/$defs/T",
+            }
+        },
+        "additionalProperties": False,
+    }
+    tool = MCPTool(name="test_tool", inputSchema=schema)
+
+    function_tool = MCPUtil.to_function_tool(tool, FakeMCPServer(), convert_schemas_to_strict=True)
+
+    assert function_tool.strict_json_schema is True
+    assert function_tool.params_json_schema["properties"]["value"] == {
+        "$anchor": "value",
+        "type": "string",
+    }
+    assert function_tool.params_json_schema["additionalProperties"] is False
+
+
+def test_to_function_tool_single_all_of_annotated_alias_remains_strict():
+    schema = {
+        "components": {
+            "schemas": {
+                "Inner": {
+                    "type": "object",
+                    "description": "inner",
+                    "properties": {"value": {"type": "string"}},
+                    "additionalProperties": False,
+                },
+                "Outer": {
+                    "$ref": "#/components/schemas/Inner",
+                    "description": "outer",
+                },
+            }
+        },
+        "type": "object",
+        "allOf": [
+            {
+                "$ref": "#/components/schemas/Outer",
+                "title": "entry",
+            }
+        ],
+        "additionalProperties": False,
+    }
+    tool = MCPTool(name="test_tool", inputSchema=schema)
+
+    function_tool = MCPUtil.to_function_tool(tool, FakeMCPServer(), convert_schemas_to_strict=True)
+
+    assert function_tool.strict_json_schema is True
+    assert function_tool.params_json_schema["description"] == "outer"
+    assert function_tool.params_json_schema["title"] == "entry"
+    assert function_tool.params_json_schema["properties"] == {"value": {"type": "string"}}
+    assert function_tool.params_json_schema["required"] == ["value"]
+    assert function_tool.params_json_schema["additionalProperties"] is False
+    assert "$ref" not in function_tool.params_json_schema
+
+
+def test_to_function_tool_single_all_of_annotated_entry_conflict_falls_back():
+    schema = {
+        "$defs": {
+            "T": {
+                "type": "object",
+                "properties": {"inner": {"type": "string"}},
+                "additionalProperties": False,
+            }
+        },
+        "type": "object",
+        "properties": {"outer": {"type": "string"}},
+        "allOf": [{"$ref": "#/$defs/T", "description": "alias"}],
+        "additionalProperties": False,
+    }
+    tool = MCPTool(name="test_tool", inputSchema=schema)
+
+    function_tool = MCPUtil.to_function_tool(tool, FakeMCPServer(), convert_schemas_to_strict=True)
+
+    assert function_tool.strict_json_schema is False
+    assert function_tool.params_json_schema == schema
+
+
+def test_to_function_tool_nested_single_all_of_conflict_falls_back():
+    schema = {
+        "$defs": {
+            "T": {
+                "type": "object",
+                "properties": {"inner": {"type": "string"}},
+                "additionalProperties": False,
+            }
+        },
+        "type": "object",
+        "properties": {"outer": {"type": "string"}},
+        "allOf": [{"allOf": [{"$ref": "#/$defs/T"}]}],
+        "additionalProperties": False,
+    }
+    tool = MCPTool(name="test_tool", inputSchema=schema)
+
+    function_tool = MCPUtil.to_function_tool(tool, FakeMCPServer(), convert_schemas_to_strict=True)
+
+    assert function_tool.strict_json_schema is False
+    assert function_tool.params_json_schema == schema
+
+
+def test_to_function_tool_single_all_of_json_distinct_overlap_falls_back():
+    schema = {
+        "$defs": {"T": {"const": 1}},
+        "type": "object",
+        "const": True,
+        "properties": {},
+        "allOf": [{"$ref": "#/$defs/T"}],
+        "additionalProperties": False,
+    }
+    tool = MCPTool(name="test_tool", inputSchema=schema)
+
+    function_tool = MCPUtil.to_function_tool(tool, FakeMCPServer(), convert_schemas_to_strict=True)
+
+    assert function_tool.strict_json_schema is False
+    assert function_tool.params_json_schema == schema
+
+
+def test_to_function_tool_single_all_of_nested_id_falls_back():
+    schema = {
+        "$defs": {"T": {"type": "string"}},
+        "contentSchema": {
+            "$id": "https://example.test/nested",
+            "$defs": {"T": {"type": "integer"}},
+            "type": "object",
+            "properties": {"value": {"$ref": "#/$defs/T"}},
+        },
+        "type": "object",
+        "properties": {},
+        "allOf": [{"$ref": "#/contentSchema"}],
+        "additionalProperties": False,
+    }
+    tool = MCPTool(name="test_tool", inputSchema=schema)
+
+    function_tool = MCPUtil.to_function_tool(tool, FakeMCPServer(), convert_schemas_to_strict=True)
+
+    assert function_tool.strict_json_schema is False
+    assert function_tool.params_json_schema == schema
+
+
+def test_to_function_tool_single_all_of_nested_id_owner_falls_back():
+    schema = {
+        "$defs": {"T": {"type": "string"}},
+        "type": "object",
+        "properties": {
+            "node": {
+                "$id": "https://example.test/nested",
+                "$defs": {"T": {"type": "integer"}},
+                "allOf": [{"$ref": "#/$defs/T"}],
+            }
+        },
+        "additionalProperties": False,
+    }
+    tool = MCPTool(name="test_tool", inputSchema=schema)
+
+    function_tool = MCPUtil.to_function_tool(tool, FakeMCPServer(), convert_schemas_to_strict=True)
+
+    assert function_tool.strict_json_schema is False
+    assert function_tool.params_json_schema == schema
+
+
+def test_to_function_tool_single_all_of_descendant_nested_id_owner_falls_back():
+    schema = {
+        "$defs": {"T": {"type": "string"}},
+        "type": "object",
+        "properties": {
+            "node": {
+                "$id": "https://example.test/nested",
+                "$defs": {"T": {"type": "integer"}},
+                "type": "object",
+                "properties": {
+                    "child": {
+                        "allOf": [{"$ref": "#/$defs/T"}],
+                    }
+                },
+                "additionalProperties": False,
+            }
+        },
+        "additionalProperties": False,
+    }
+    tool = MCPTool(name="test_tool", inputSchema=schema)
+
+    function_tool = MCPUtil.to_function_tool(tool, FakeMCPServer(), convert_schemas_to_strict=True)
+
+    assert function_tool.strict_json_schema is False
+    assert function_tool.params_json_schema == schema
+
+
+def test_to_function_tool_single_all_of_target_below_nested_id_falls_back():
+    schema = {
+        "$defs": {"T": {"type": "string"}},
+        "contentSchema": {
+            "$id": "https://example.test/nested",
+            "$defs": {"T": {"type": "integer"}},
+            "target": {"$ref": "#/$defs/T"},
+        },
+        "type": "object",
+        "properties": {},
+        "allOf": [{"$ref": "#/contentSchema/target"}],
+        "additionalProperties": False,
+    }
+    tool = MCPTool(name="test_tool", inputSchema=schema)
+
+    function_tool = MCPUtil.to_function_tool(tool, FakeMCPServer(), convert_schemas_to_strict=True)
+
+    assert function_tool.strict_json_schema is False
+    assert function_tool.params_json_schema == schema
+
+
+def test_to_function_tool_ref_allows_unrelated_id_definition_name():
+    schema = {
+        "$defs": {
+            "$id": {"type": "integer"},
+            "T": {"type": "string"},
+        },
+        "type": "object",
+        "properties": {
+            "value": {
+                "$ref": "#/$defs/T",
+                "description": "value",
+            }
+        },
+        "additionalProperties": False,
+    }
+    tool = MCPTool(name="test_tool", inputSchema=schema)
+
+    function_tool = MCPUtil.to_function_tool(tool, FakeMCPServer(), convert_schemas_to_strict=True)
+
+    assert function_tool.strict_json_schema is True
+    assert function_tool.params_json_schema["properties"]["value"] == {
+        "type": "string",
+        "description": "value",
+    }
+
+
+@pytest.mark.parametrize(
+    "free_form_schema",
+    [
+        {"type": "object", "description": "key/value pairs"},
+        {"type": "object", "properties": {}},
+        {"type": "object", "properties": {}, "required": []},
+        {
+            "type": "object",
+            "properties": {},
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+        },
+        {"type": "object", "properties": {}, "$comment": "Arbitrary values."},
+    ],
+    ids=[
+        "properties-omitted",
+        "properties-empty",
+        "required-empty",
+        "schema-metadata",
+        "comment-metadata",
+    ],
+)
+def test_to_function_tool_free_form_object_arg_falls_back_to_non_strict(free_form_schema):
+    schema = {
+        "type": "object",
+        "properties": {
+            "target": {"type": "string"},
+            "keysAndValues": free_form_schema,
+        },
+        "required": ["target", "keysAndValues"],
+    }
+    tool = MCPTool(name="set_properties", inputSchema=schema)
+
+    function_tool = MCPUtil.to_function_tool(tool, FakeMCPServer(), convert_schemas_to_strict=True)
+
+    assert function_tool.strict_json_schema is False
+    assert function_tool.params_json_schema == schema
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"type": "object", "description": "Arbitrary key/value pairs"},
+        {"type": "object", "properties": {}},
+        {"type": "object", "properties": {}, "required": []},
+        {
+            "type": "object",
+            "properties": {},
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+        },
+        {"type": "object", "properties": {}, "$comment": "Arbitrary values."},
+    ],
+    ids=[
+        "properties-omitted",
+        "properties-empty",
+        "required-empty",
+        "schema-metadata",
+        "comment-metadata",
+    ],
+)
+def test_to_function_tool_free_form_root_falls_back_to_non_strict(schema):
+    tool = MCPTool(name="set_properties", inputSchema=schema)
+
+    function_tool = MCPUtil.to_function_tool(tool, FakeMCPServer(), convert_schemas_to_strict=True)
+
+    assert function_tool.strict_json_schema is False
+    assert function_tool.params_json_schema == {**schema, "properties": {}}
+
+
+def test_to_function_tool_finds_free_form_object_in_array_items():
+    schema = {
+        "type": "object",
+        "properties": {
+            "entries": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {},
+                    "$comment": "Arbitrary values.",
+                },
+            },
+        },
+    }
+    tool = MCPTool(name="set_properties", inputSchema=schema)
+
+    function_tool = MCPUtil.to_function_tool(tool, FakeMCPServer(), convert_schemas_to_strict=True)
+
+    assert function_tool.strict_json_schema is False
+    assert function_tool.params_json_schema == schema
+
+
+def test_to_function_tool_does_not_convert_schema_when_conversion_is_disabled():
+    schema = {"type": "object", "properties": {"value": {"type": "string"}}}
+    tool = MCPTool(name="non_strict", inputSchema=schema)
+
+    with patch(
+        "agents.mcp.util.ensure_strict_json_schema",
+        side_effect=AssertionError("Strict conversion should not run."),
+    ):
+        function_tool = MCPUtil.to_function_tool(
+            tool, FakeMCPServer(), convert_schemas_to_strict=False
+        )
+
+    assert function_tool.strict_json_schema is False
+    assert function_tool.params_json_schema == schema
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {},
+        {"type": "object", "additionalProperties": False},
+        {
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+        },
+    ],
+    ids=["empty-schema", "explicitly-closed", "declared-property"],
+)
+def test_to_function_tool_strictable_closed_and_shaped_objects_stay_strict(schema):
+    tool = MCPTool(name="strictable", inputSchema=schema)
+
+    function_tool = MCPUtil.to_function_tool(tool, FakeMCPServer(), convert_schemas_to_strict=True)
+
+    assert function_tool.strict_json_schema is True
+    assert function_tool.params_json_schema["additionalProperties"] is False
+
+
+def test_to_function_tool_advanced_open_root_falls_back_without_schema_evaluation():
+    schema = {
+        "type": "object",
+        "allOf": [{"type": "object", "properties": {"value": {"type": "string"}}}],
+    }
+    tool = MCPTool(name="advanced", inputSchema=schema)
+
+    function_tool = MCPUtil.to_function_tool(tool, FakeMCPServer(), convert_schemas_to_strict=True)
+
+    assert function_tool.strict_json_schema is False
+    assert function_tool.params_json_schema == {**schema, "properties": {}}
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {
+            "type": "object",
+            "properties": {
+                "value": {
+                    "anyOf": [
+                        {"type": "object", "properties": {}},
+                        {"type": "null"},
+                    ]
+                }
+            },
+        },
+        {
+            "type": "object",
+            "properties": {
+                "value": {
+                    "oneOf": [
+                        {"type": "object", "properties": {}},
+                        {"type": "null"},
+                    ]
+                }
+            },
+        },
+        {
+            "type": "object",
+            "properties": {
+                "value": {"allOf": [{"type": "object", "properties": {}}]},
+            },
+        },
+        {
+            "type": "object",
+            "properties": {"value": {"$ref": "#/$defs/value"}},
+            "$defs": {"value": {"type": "object", "properties": {}}},
+        },
+        {
+            "type": "object",
+            "properties": {"value": {"$ref": "#/definitions/value"}},
+            "definitions": {"value": {"type": "object", "properties": {}}},
+        },
+        {
+            "type": "object",
+            "properties": {"value": {"$ref": "#/components/schemas/value"}},
+            "components": {"schemas": {"value": {"type": "object", "properties": {}}}},
+        },
+        {
+            "type": "object",
+            "properties": {
+                "value": {
+                    "$ref": "#/components/schemas/value",
+                    "description": "Arbitrary values.",
+                }
+            },
+            "components": {"schemas": {"value": {"type": "object", "properties": {}}}},
+        },
+    ],
+    ids=[
+        "any-of",
+        "one-of",
+        "all-of",
+        "defs",
+        "definitions",
+        "pure-ref-unvisited-target",
+        "ref-reentry",
+    ],
+)
+def test_to_function_tool_finds_free_form_objects_in_supported_schema_nodes(schema):
+    tool = MCPTool(name="nested", inputSchema=schema)
+
+    function_tool = MCPUtil.to_function_tool(tool, FakeMCPServer(), convert_schemas_to_strict=True)
+
+    assert function_tool.strict_json_schema is False
+    assert function_tool.params_json_schema == schema
+
+
+@pytest.mark.parametrize(
+    ("ref", "definitions"),
+    [
+        ("#/$defs/value", {"value": {"type": "string"}}),
+        ("#/$defs/a%20b", {"a b": {"type": "string"}}),
+    ],
+    ids=["ordinary", "percent-encoded"],
+)
+def test_to_function_tool_preserved_pure_refs_fall_back_to_non_strict(ref, definitions):
+    schema = {
+        "$defs": definitions,
+        "type": "object",
+        "properties": {"payload": {"$ref": ref}},
+    }
+    original_schema = copy.deepcopy(schema)
+    tool = MCPTool(name="pure_ref", inputSchema=schema)
+
+    function_tool = MCPUtil.to_function_tool(tool, FakeMCPServer(), convert_schemas_to_strict=True)
+
+    assert function_tool.strict_json_schema is False
+    assert function_tool.params_json_schema == original_schema
+    assert schema == original_schema
+
+
+def test_to_function_tool_nullable_root_falls_back_to_non_strict():
+    schema = {
+        "anyOf": [
+            {"type": "object", "properties": {"value": {"type": "string"}}},
+            {"type": "null"},
+        ]
+    }
+    tool = MCPTool(name="test_tool", inputSchema=schema)
+
+    function_tool = MCPUtil.to_function_tool(tool, FakeMCPServer(), convert_schemas_to_strict=True)
+
+    assert function_tool.strict_json_schema is False
+    assert function_tool.params_json_schema == {**schema, "properties": {}}
 
 
 class StructuredContentTestServer(FakeMCPServer):
@@ -1629,23 +2627,35 @@ class StructuredContentTestServer(FakeMCPServer):
         self.use_structured_content = use_structured_content
         self._test_content: list[Any] = []
         self._test_structured_content: dict[str, Any] | None = None
+        self._test_is_error: bool | None = None
 
-    def set_test_result(self, content: list[Any], structured_content: dict[str, Any] | None = None):
+    def set_test_result(
+        self,
+        content: list[Any],
+        structured_content: dict[str, Any] | None = None,
+        is_error: bool | None = None,
+    ):
         """Set the content and structured content that will be returned by call_tool."""
         self._test_content = content
         self._test_structured_content = structured_content
+        self._test_is_error = is_error
 
     async def call_tool(
         self,
         tool_name: str,
         arguments: dict[str, Any] | None,
         meta: dict[str, Any] | None = None,
-    ) -> CallToolResult:
+    ) -> CallToolResultType:
         """Return test result with specified content and structured content."""
         self.tool_calls.append(tool_name)
 
+        extra: dict[str, Any] = {}
+        if self._test_is_error is not None:
+            extra["isError"] = self._test_is_error
         return CallToolResult(
-            content=self._test_content, structuredContent=self._test_structured_content
+            content=self._test_content,
+            structuredContent=self._test_structured_content,
+            **extra,
         )
 
 
@@ -1738,6 +2748,46 @@ async def test_structured_content_handling(
 
     result = await MCPUtil.invoke_mcp_tool(server, tool, ctx, "{}")
     assert result == expected_output
+
+
+@pytest.mark.asyncio
+async def test_structured_content_skipped_for_error_results():
+    """A result flagged as an error keeps the content that carries the error text."""
+
+    server = StructuredContentTestServer(use_structured_content=True)
+    server.add_tool("failing_tool", {})
+    server.set_test_result(
+        [TextContent(text="database connection refused", type="text")],
+        {"answer": 42},
+        is_error=True,
+    )
+
+    ctx = RunContextWrapper(context=None)
+    tool = MCPTool(name="failing_tool", inputSchema={})
+
+    result = await MCPUtil.invoke_mcp_tool(server, tool, ctx, "{}")
+
+    assert result == {"type": "text", "text": "database connection refused"}
+
+
+@pytest.mark.asyncio
+async def test_structured_content_used_for_non_error_results():
+    """An explicit isError=False result still prefers structured content."""
+
+    server = StructuredContentTestServer(use_structured_content=True)
+    server.add_tool("ok_tool", {})
+    server.set_test_result(
+        [TextContent(text="ignored", type="text")],
+        {"answer": 42},
+        is_error=False,
+    )
+
+    ctx = RunContextWrapper(context=None)
+    tool = MCPTool(name="ok_tool", inputSchema={})
+
+    result = await MCPUtil.invoke_mcp_tool(server, tool, ctx, "{}")
+
+    assert result == '{"answer": 42}'
 
 
 @pytest.mark.asyncio

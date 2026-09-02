@@ -13,7 +13,8 @@ import asyncio
 import sys
 from pathlib import Path
 
-from agents import Runner, function_tool
+from agents import Runner
+from agents.decorators import tool
 from agents.mcp import MCPServerStdio
 from agents.run import RunConfig
 from agents.sandbox import SandboxAgent, SandboxRunConfig
@@ -32,7 +33,7 @@ DEFAULT_QUESTION = (
 )
 
 
-@function_tool
+@tool
 def get_discount_approval_path(discount_percent: int) -> str:
     """Return the approver required for a proposed discount percentage."""
     if discount_percent <= 10:
@@ -109,7 +110,7 @@ async def main(model: str, question: str) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="gpt-5.5", help="Model name to use.")
+    parser.add_argument("--model", default="gpt-5.6-sol", help="Model name to use.")
     parser.add_argument("--question", default=DEFAULT_QUESTION, help="Prompt to send to the agent.")
     args = parser.parse_args()
 

@@ -26,10 +26,10 @@ class _DummyModel(pydantic.BaseModel):
 
 def _session_with_output(fmt: Any | None) -> RealtimeSessionCreateRequest:
     if fmt is None:
-        return RealtimeSessionCreateRequest(type="realtime", model="gpt-realtime-2")
+        return RealtimeSessionCreateRequest(type="realtime", model="gpt-realtime-2.1")
     return RealtimeSessionCreateRequest(
         type="realtime",
-        model="gpt-realtime-2",
+        model="gpt-realtime-2.1",
         # Use dict for output to avoid importing non-exported symbols in tests
         audio=RealtimeAudioConfig(output=cast(Any, {"format": fmt})),
     )
@@ -49,7 +49,7 @@ def test_normalize_session_payload_variants() -> None:
     assert Model._normalize_session_payload(transcription_mapping) is None
 
     # Valid realtime mapping should be converted to model
-    realtime_mapping: Mapping[str, object] = {"type": "realtime", "model": "gpt-realtime-2"}
+    realtime_mapping: Mapping[str, object] = {"type": "realtime", "model": "gpt-realtime-2.1"}
     as_model = Model._normalize_session_payload(realtime_mapping)
     assert isinstance(as_model, RealtimeSessionCreateRequest)
     assert as_model.type == "realtime"
@@ -73,6 +73,36 @@ def test_extract_audio_format_from_session_objects() -> None:
     # Missing/None output format -> None
     s_none = _session_with_output(None)
     assert Model._extract_audio_format(s_none) is None
+
+
+def test_extract_audio_format_preserves_falsy_present_models() -> None:
+    class FalsyAudioConfig(RealtimeAudioConfig):
+        def __bool__(self) -> bool:
+            return False
+
+    class FalsyAudioPCM(AudioPCM):
+        def __bool__(self) -> bool:
+            return False
+
+    audio = FalsyAudioConfig(output=cast(Any, {"format": AudioPCM(type="audio/pcm")}))
+    falsy_audio_session = RealtimeSessionCreateRequest(
+        type="realtime",
+        model="gpt-realtime-2.1",
+        audio=audio,
+    )
+    fmt = FalsyAudioPCM(type="audio/pcm")
+    falsy_format_session = RealtimeSessionCreateRequest(
+        type="realtime",
+        model="gpt-realtime-2.1",
+        audio=RealtimeAudioConfig(output=cast(Any, {"format": fmt})),
+    )
+
+    assert falsy_audio_session.audio is audio
+    assert Model._extract_audio_format(falsy_audio_session) == "pcm16"
+    assert falsy_format_session.audio is not None
+    assert falsy_format_session.audio.output is not None
+    assert falsy_format_session.audio.output.format is fmt
+    assert Model._extract_audio_format(falsy_format_session) == "pcm16"
 
 
 def test_normalize_audio_format_fallbacks() -> None:

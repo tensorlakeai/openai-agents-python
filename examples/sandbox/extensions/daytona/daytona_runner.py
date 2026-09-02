@@ -74,9 +74,6 @@ def _build_manifest(
 
     manifest.entries["cloud-bucket"] = S3Mount(
         bucket=cloud_bucket_name,
-        access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
-        secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
-        session_token=os.environ.get("AWS_SESSION_TOKEN"),
         endpoint_url=cloud_bucket_endpoint_url,
         prefix=cloud_bucket_key_prefix,
         mount_path=Path(cloud_bucket_mount_path) if cloud_bucket_mount_path is not None else None,
@@ -160,7 +157,7 @@ async def main(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="gpt-5.5", help="Model name to use.")
+    parser.add_argument("--model", default="gpt-5.6-sol", help="Model name to use.")
     parser.add_argument("--question", default=DEFAULT_QUESTION, help="Prompt to send to the agent.")
     parser.add_argument(
         "--pause-on-exit",
@@ -172,7 +169,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--cloud-bucket-name",
         default=None,
-        help="S3 bucket name to mount into the sandbox.",
+        help="Public S3 bucket name to mount anonymously into the sandbox.",
     )
     parser.add_argument(
         "--cloud-bucket-mount-path",

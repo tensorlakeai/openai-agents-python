@@ -10,15 +10,30 @@ from agents import (
     ModelBehaviorError,
     RunContextWrapper,
     Runner,
+    ToolGuardrailFunctionOutput,
+    ToolInputGuardrailData,
+    ToolOutputGuardrailData,
     UserError,
     default_tool_error_function,
     handoff,
 )
 from agents.exceptions import AgentsException
+from agents.testing import ScriptedModel
+from agents.tool_guardrails import tool_input_guardrail, tool_output_guardrail
 
-from ..fake_model import FakeModel
 from ..test_responses import get_function_tool_call, get_text_message
 from .helpers import FakeMCPServer
+
+
+def _model_tool_outputs(model: ScriptedModel) -> list[Any]:
+    values: list[Any] = []
+    for item in model.calls[-1].input:
+        item_type = item.get("type") if isinstance(item, dict) else getattr(item, "type", None)
+        if item_type == "function_call_output":
+            values.append(
+                item.get("output") if isinstance(item, dict) else getattr(item, "output", None)
+            )
+    return values
 
 
 @pytest.mark.asyncio
@@ -29,14 +44,14 @@ async def test_runner_calls_mcp_tool(streaming: bool):
     server.add_tool("test_tool_1", {})
     server.add_tool("test_tool_2", {})
     server.add_tool("test_tool_3", {})
-    model = FakeModel()
+    model = ScriptedModel()
     agent = Agent(
         name="test",
         model=model,
         mcp_servers=[server],
     )
 
-    model.add_multiple_turn_outputs(
+    model.extend(
         [
             # First turn: a message and tool call
             [get_text_message("a_message"), get_function_tool_call("test_tool_2", "")],
@@ -57,20 +72,89 @@ async def test_runner_calls_mcp_tool(streaming: bool):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("streaming", [False, True])
+async def test_mcp_input_guardrail_rejection_prevents_server_call(streaming: bool):
+    seen_inputs: list[tuple[str, str]] = []
+
+    @tool_input_guardrail
+    def reject_input(data: ToolInputGuardrailData) -> ToolGuardrailFunctionOutput:
+        seen_inputs.append((data.context.tool_name, data.context.tool_arguments))
+        return ToolGuardrailFunctionOutput.reject_content("blocked MCP input")
+
+    server = FakeMCPServer(tool_input_guardrails=[reject_input])
+    server.add_tool("sensitive", {})
+    model = ScriptedModel(
+        [
+            [get_function_tool_call("sensitive", '{"secret":"value"}')],
+            [get_text_message("done")],
+        ]
+    )
+    agent = Agent(name="test", model=model, mcp_servers=[server])
+
+    if streaming:
+        result = Runner.run_streamed(agent, input="user_message")
+        async for _ in result.stream_events():
+            pass
+    else:
+        result = await Runner.run(agent, input="user_message")
+
+    assert result.final_output == "done"
+    assert server.tool_calls == []
+    assert seen_inputs == [("sensitive", '{"secret":"value"}')]
+    assert len(result.tool_input_guardrail_results) == 1
+    assert _model_tool_outputs(model) == ["blocked MCP input"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_mcp_output_guardrail_checks_converted_output_before_model_input(streaming: bool):
+    seen_outputs: list[Any] = []
+
+    @tool_output_guardrail
+    def reject_output(data: ToolOutputGuardrailData) -> ToolGuardrailFunctionOutput:
+        seen_outputs.append(data.output)
+        return ToolGuardrailFunctionOutput.reject_content("blocked MCP output")
+
+    server = FakeMCPServer(tool_output_guardrails=[reject_output])
+    server.add_tool("lookup", {})
+    model = ScriptedModel(
+        [
+            [get_function_tool_call("lookup", "{}")],
+            [get_text_message("done")],
+        ]
+    )
+    agent = Agent(name="test", model=model, mcp_servers=[server])
+
+    if streaming:
+        result = Runner.run_streamed(agent, input="user_message")
+        async for _ in result.stream_events():
+            pass
+    else:
+        result = await Runner.run(agent, input="user_message")
+
+    assert result.final_output == "done"
+    assert server.tool_calls == ["lookup"]
+    assert seen_outputs == [{"type": "text", "text": server.tool_results[0]}]
+    assert len(result.tool_output_guardrail_results) == 1
+    assert _model_tool_outputs(model) == ["blocked MCP output"]
+    assert server.tool_results[0] not in str(model.calls[-1].input)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
 async def test_runner_asserts_when_mcp_tool_not_found(streaming: bool):
     """Test that the runner asserts when an MCP tool is not found."""
     server = FakeMCPServer()
     server.add_tool("test_tool_1", {})
     server.add_tool("test_tool_2", {})
     server.add_tool("test_tool_3", {})
-    model = FakeModel()
+    model = ScriptedModel()
     agent = Agent(
         name="test",
         model=model,
         mcp_servers=[server],
     )
 
-    model.add_multiple_turn_outputs(
+    model.extend(
         [
             # First turn: a message and tool call
             [get_text_message("a_message"), get_function_tool_call("test_tool_doesnt_exist", "")],
@@ -99,14 +183,14 @@ async def test_runner_works_with_multiple_mcp_servers(streaming: bool):
     server2.add_tool("test_tool_2", {})
     server2.add_tool("test_tool_3", {})
 
-    model = FakeModel()
+    model = ScriptedModel()
     agent = Agent(
         name="test",
         model=model,
         mcp_servers=[server1, server2],
     )
 
-    model.add_multiple_turn_outputs(
+    model.extend(
         [
             # First turn: a message and tool call
             [get_text_message("a_message"), get_function_tool_call("test_tool_2", "")],
@@ -138,14 +222,14 @@ async def test_runner_errors_when_mcp_tools_clash(streaming: bool):
     server2.add_tool("test_tool_2", {})
     server2.add_tool("test_tool_3", {})
 
-    model = FakeModel()
+    model = ScriptedModel()
     agent = Agent(
         name="test",
         model=model,
         mcp_servers=[server1, server2],
     )
 
-    model.add_multiple_turn_outputs(
+    model.extend(
         [
             # First turn: a message and tool call
             [get_text_message("a_message"), get_function_tool_call("test_tool_3", "")],
@@ -172,7 +256,7 @@ async def test_runner_can_call_server_prefixed_mcp_tool_names(streaming: bool):
     server2 = FakeMCPServer(server_name="calendar")
     server2.add_tool("search", {})
 
-    model = FakeModel()
+    model = ScriptedModel()
     agent = Agent(
         name="test",
         model=model,
@@ -180,7 +264,7 @@ async def test_runner_can_call_server_prefixed_mcp_tool_names(streaming: bool):
         mcp_config={"include_server_in_tool_names": True},
     )
 
-    model.add_multiple_turn_outputs(
+    model.extend(
         [
             [get_text_message("a_message"), get_function_tool_call("mcp_calendar__search", "")],
             [get_text_message("done")],
@@ -220,7 +304,7 @@ async def test_runner_prefixed_mcp_tool_names_do_not_collide_with_agent_tools(st
         on_invoke_tool=invoke_local_tool,
     )
 
-    model = FakeModel()
+    model = ScriptedModel()
     agent = Agent(
         name="test",
         model=model,
@@ -238,7 +322,7 @@ async def test_runner_prefixed_mcp_tool_names_do_not_collide_with_agent_tools(st
     assert calendar_search_tool_name != "mcp_calendar__search"
     assert calendar_search_tool_name.startswith("mcp_calendar__search_")
 
-    model.add_multiple_turn_outputs(
+    model.extend(
         [
             [get_text_message("a_message"), get_function_tool_call(calendar_search_tool_name, "")],
             [get_text_message("done")],
@@ -263,11 +347,11 @@ async def test_runner_prefixed_mcp_tool_names_do_not_collide_with_handoffs(strea
     server = FakeMCPServer(server_name="calendar")
     server.add_tool("search", {})
 
-    target_model = FakeModel()
+    target_model = ScriptedModel()
     target_agent = Agent(name="calendar_agent", model=target_model)
-    target_model.add_multiple_turn_outputs([[get_text_message("handoff target")]])
+    target_model.extend([[get_text_message("handoff target")]])
 
-    model = FakeModel()
+    model = ScriptedModel()
     agent = Agent(
         name="test",
         model=model,
@@ -282,7 +366,7 @@ async def test_runner_prefixed_mcp_tool_names_do_not_collide_with_handoffs(strea
     assert calendar_search_tool_name != "mcp_calendar__search"
     assert calendar_search_tool_name.startswith("mcp_calendar__search_")
 
-    model.add_multiple_turn_outputs(
+    model.extend(
         [
             [get_text_message("a_message"), get_function_tool_call(calendar_search_tool_name, "")],
             [get_text_message("done")],
@@ -297,7 +381,7 @@ async def test_runner_prefixed_mcp_tool_names_do_not_collide_with_handoffs(strea
         await Runner.run(agent, input="user_message")
 
     assert server.tool_calls == ["search"]
-    assert target_model.first_turn_args is None
+    assert not target_model.calls
 
 
 class Foo(BaseModel):
@@ -314,7 +398,7 @@ async def test_runner_calls_mcp_tool_with_args(streaming: bool):
     server.add_tool("test_tool_1", {})
     server.add_tool("test_tool_2", Foo.model_json_schema())
     server.add_tool("test_tool_3", {})
-    model = FakeModel()
+    model = ScriptedModel()
     agent = Agent(
         name="test",
         model=model,
@@ -323,7 +407,7 @@ async def test_runner_calls_mcp_tool_with_args(streaming: bool):
 
     json_args = json.dumps(Foo(bar="baz", baz=1).model_dump())
 
-    model.add_multiple_turn_outputs(
+    model.extend(
         [
             # First turn: a message and tool call
             [get_text_message("a_message"), get_function_tool_call("test_tool_2", json_args)],
@@ -362,14 +446,14 @@ async def test_runner_emits_mcp_error_tool_call_output_item(streaming: bool):
     server = CrashingFakeMCPServer()
     server.add_tool("crashing_tool", {})
 
-    model = FakeModel()
+    model = ScriptedModel()
     agent = Agent(
         name="test",
         model=model,
         mcp_servers=[server],
     )
 
-    model.add_multiple_turn_outputs(
+    model.extend(
         [
             [get_text_message("a_message"), get_function_tool_call("crashing_tool", "{}")],
             [get_text_message("done")],

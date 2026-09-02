@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import logging
 import os
 import re
 import shutil
@@ -11,13 +12,14 @@ import tarfile
 import tempfile
 import uuid
 from collections.abc import Sequence
-from pathlib import Path
-from typing import Any, Literal, TypedDict, cast
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Any, ClassVar, Literal, TypedDict, cast
 
 import pytest
 from openai.types.responses.response_output_item import LocalShellCall, LocalShellCallAction
 from openai.types.responses.response_reasoning_item import ResponseReasoningItem, Summary
 
+import agents._debug as _debug
 import agents.sandbox.runtime_agent_preparation as runtime_agent_preparation_module
 from agents import Agent, AgentHooks, LocalShellTool, RunHooks, Runner, function_tool
 from agents.exceptions import InputGuardrailTripwireTriggered, UserError
@@ -25,6 +27,7 @@ from agents.guardrail import GuardrailFunctionOutput, InputGuardrail, OutputGuar
 from agents.items import ModelResponse, ToolCallOutputItem, TResponseInputItem
 from agents.model_settings import ModelSettings
 from agents.prompts import GenerateDynamicPromptData, Prompt
+from agents.result import RunResult, RunResultStreaming
 from agents.run import CallModelData, ModelInputData, RunConfig
 from agents.run_context import AgentHookContext, RunContextWrapper
 from agents.run_state import RunState, _build_agent_identity_map
@@ -40,6 +43,10 @@ from agents.sandbox import (
     SandboxRunConfig,
     User,
 )
+from agents.sandbox._mount_security import (
+    REDACTED_MOUNT_AUTHORITY_KEY,
+    validate_manifest_mount_credential_boundaries,
+)
 from agents.sandbox.capabilities import (
     Capability,
     Compaction,
@@ -48,27 +55,38 @@ from agents.sandbox.capabilities import (
     Shell,
     StaticCompactionPolicy,
 )
+from agents.sandbox.capabilities.tools import (
+    ExecCommandTool,
+    SandboxApplyPatchTool,
+    ViewImageTool,
+)
 from agents.sandbox.entries import (
     BaseEntry,
+    DockerVolumeMountStrategy,
     File,
     InContainerMountStrategy,
     MountpointMountPattern,
+    RcloneMountPattern,
     S3Mount,
 )
 from agents.sandbox.errors import (
     ExecNonZeroError,
     ExecTransportError,
     InvalidManifestPathError,
+    MountConfigError,
     WorkspaceArchiveWriteError,
 )
 from agents.sandbox.files import EntryKind, FileEntry
-from agents.sandbox.materialization import MaterializedFile
+from agents.sandbox.materialization import MaterializationResult, MaterializedFile
 from agents.sandbox.remote_mount_policy import (
     REMOTE_MOUNT_POLICY,
 )
 from agents.sandbox.runtime import SandboxRuntime
 from agents.sandbox.runtime_agent_preparation import get_default_sandbox_instructions
-from agents.sandbox.runtime_session_manager import SandboxRuntimeSessionManager
+from agents.sandbox.runtime_session_manager import (
+    SandboxRuntimeSessionManager,
+    _SandboxSessionResources,
+)
 from agents.sandbox.sandboxes import unix_local as unix_local_module
 from agents.sandbox.sandboxes.unix_local import (
     UnixLocalSandboxClient,
@@ -84,9 +102,10 @@ from agents.sandbox.session.sandbox_session_state import SandboxSessionState
 from agents.sandbox.snapshot import LocalSnapshotSpec, NoopSnapshot, SnapshotBase
 from agents.sandbox.types import ExecResult
 from agents.stream_events import RunItemStreamEvent
-from agents.tool import Tool
+from agents.testing import ScriptedModel, scripted_sandbox_session
+from agents.tool import FunctionTool, Tool
+from agents.tool_context import ToolContext
 from agents.tracing import trace
-from tests.fake_model import FakeModel
 from tests.test_responses import (
     get_final_output_message,
     get_function_tool,
@@ -96,6 +115,30 @@ from tests.test_responses import (
 from tests.testing_processor import fetch_normalized_spans
 from tests.utils.factories import TestSessionState
 from tests.utils.simple_session import SimpleListSession
+
+
+def test_process_manifest_rejects_custom_pattern_before_deepcopy() -> None:
+    class CustomRclonePattern(RcloneMountPattern):
+        deepcopy_called: ClassVar[bool] = False
+
+        def __deepcopy__(self, memo: dict[int, Any] | None = None) -> CustomRclonePattern:
+            _ = memo
+            type(self).deepcopy_called = True
+            raise AssertionError("custom pattern deepcopy must not run")
+
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                mount_strategy=InContainerMountStrategy(pattern=CustomRclonePattern()),
+            )
+        }
+    )
+
+    with pytest.raises(MountConfigError, match="custom mount patterns"):
+        SandboxRuntimeSessionManager._process_manifest([], manifest)
+
+    assert CustomRclonePattern.deepcopy_called is False
 
 
 class _FakeSession(BaseSandboxSession):
@@ -111,6 +154,7 @@ class _FakeSession(BaseSandboxSession):
         )
         self._start_gate = start_gate
         self._running = False
+        self.running_calls = 0
         self.start_calls = 0
         self.stop_calls = 0
         self.shutdown_calls = 0
@@ -140,6 +184,7 @@ class _FakeSession(BaseSandboxSession):
         self.shutdown_calls += 1
 
     async def running(self) -> bool:
+        self.running_calls += 1
         return self._running
 
     async def read(self, path: Path, *, user: object = None) -> io.BytesIO:
@@ -169,10 +214,118 @@ class _FakeSession(BaseSandboxSession):
         await super()._aclose_dependencies()
 
 
+class _CwdProbeSession(_FakeSession):
+    def __init__(self, manifest: Manifest, *, accessible: bool = True) -> None:
+        super().__init__(manifest)
+        self.accessible = accessible
+        self.cwd_probe_calls: list[tuple[tuple[str, ...], bool | list[str], User | str | None]] = []
+
+    async def exec(
+        self,
+        *command: str | Path,
+        timeout: float | None = None,
+        shell: bool | list[str] = True,
+        user: str | User | None = None,
+    ) -> ExecResult:
+        _ = timeout
+        self.cwd_probe_calls.append((tuple(str(part) for part in command), shell, user))
+        return ExecResult(
+            stdout=b"",
+            stderr=b"" if self.accessible else b"not accessible",
+            exit_code=0 if self.accessible else 1,
+        )
+
+
+class _WindowsPathCwdProbeSession(_CwdProbeSession):
+    def normalize_path(self, path: Path | str, *, for_write: bool = False) -> Path:
+        _ = (path, for_write)
+        return cast(Path, PureWindowsPath("/workspace/tasks/a"))
+
+
 class _FailingStopSession(_FakeSession):
     async def stop(self) -> None:
         await super().stop()
         raise RuntimeError("stop failed")
+
+
+def _external_mount_manifest(secret_access_key: str) -> Manifest:
+    return Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                access_key_id="access-key",
+                secret_access_key=secret_access_key,
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            )
+        }
+    )
+
+
+def _assert_mount_error_redacted(
+    error: BaseException,
+    *,
+    source_error: BaseException,
+    sentinel: str,
+) -> None:
+    assert sentinel not in str(error)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert cast(Any, BaseException.args).__get__(source_error, type(source_error)) == ()
+    assert cast(Any, BaseException.__traceback__).__get__(source_error, type(source_error)) is None
+    traceback = error.__traceback__
+    while traceback is not None:
+        frame_path = Path(traceback.tb_frame.f_code.co_filename).as_posix()
+        if "/src/agents/" in frame_path:
+            assert sentinel not in repr(traceback.tb_frame.f_locals)
+        traceback = traceback.tb_next
+
+
+class _WorkspacePersistenceProbeSession(_FakeSession):
+    def __init__(self, manifest: Manifest) -> None:
+        super().__init__(manifest)
+        self.persist_calls = 0
+        self.hydrate_calls = 0
+
+    async def persist_workspace(self) -> io.IOBase:
+        self.persist_calls += 1
+        return io.BytesIO()
+
+    async def hydrate_workspace(self, data: io.IOBase) -> None:
+        _ = data
+        self.hydrate_calls += 1
+
+
+class _ManifestApplyProbeSession(_FakeSession):
+    def __init__(self, manifest: Manifest) -> None:
+        super().__init__(manifest)
+        self.materialize_calls = 0
+
+    async def _apply_manifest(
+        self,
+        *,
+        only_ephemeral: bool = False,
+        provision_accounts: bool = True,
+    ) -> MaterializationResult:
+        _ = (only_ephemeral, provision_accounts)
+        self.materialize_calls += 1
+        return MaterializationResult(files=[])
+
+
+class _FailingBackendStartSession(_ManifestApplyProbeSession):
+    async def _ensure_backend_started(self) -> None:
+        raise RuntimeError("backend failed with protected-start-secret")
+
+
+class _FailingSnapshotSession(_FakeSession):
+    def __init__(self, manifest: Manifest) -> None:
+        super().__init__(manifest)
+        self.persist_calls = 0
+
+    async def _persist_snapshot(self) -> None:
+        self.persist_calls += 1
+        mount = self.state.manifest.entries["data"]
+        assert isinstance(mount, S3Mount)
+        raise RuntimeError(f"snapshot failed with {mount.secret_access_key}")
 
 
 class _LiveSessionDeltaRecorder(_FakeSession):
@@ -201,6 +354,18 @@ class _LiveSessionDeltaRecorder(_FakeSession):
             self._fail_entry_batch_times -= 1
             raise RuntimeError("delta apply failed")
         return []
+
+
+class _RejectingLiveSessionDeltaRecorder(_LiveSessionDeltaRecorder):
+    async def _validate_manifest_application(
+        self,
+        *,
+        only_ephemeral: bool = False,
+        manifest: Manifest | None = None,
+        session_running: bool | None = None,
+    ) -> None:
+        _ = (only_ephemeral, manifest, session_running)
+        raise RuntimeError("live manifest update rejected")
 
 
 class _PathGuardingSession(_FakeSession):
@@ -377,6 +542,245 @@ async def test_sandbox_session_aclose_closes_dependencies_when_stop_fails() -> N
     assert inner.stop_calls == 1
     assert inner.shutdown_calls == 0
     assert inner.close_dependency_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_sandbox_session_aclose_redacts_pre_stop_hook_failure() -> None:
+    sentinel = "pre-stop-hook-secret"
+    source_error = RuntimeError(f"pre-stop hook failed with {sentinel}")
+    inner = _FakeSession(_external_mount_manifest(sentinel))
+    session = SandboxSession(inner)
+
+    async def failing_hook() -> None:
+        raise source_error
+
+    session.register_pre_stop_hook(failing_hook)
+
+    with pytest.raises(RuntimeError, match="protected mount configuration") as exc:
+        await session.aclose()
+
+    _assert_mount_error_redacted(exc.value, source_error=source_error, sentinel=sentinel)
+    assert inner.stop_calls == 0
+    assert inner.shutdown_calls == 1
+    assert inner.close_dependency_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_sandbox_session_aclose_redacts_dependency_close_failure() -> None:
+    sentinel = "dependency-close-secret"
+    source_error = RuntimeError(f"dependency close failed with {sentinel}")
+    inner = _FakeSession(_external_mount_manifest(sentinel))
+    session = SandboxSession(inner)
+
+    async def failing_dependency_close() -> None:
+        inner.close_dependency_calls += 1
+        raise source_error
+
+    inner._aclose_dependencies = failing_dependency_close  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="protected mount configuration") as exc:
+        await session.aclose()
+
+    _assert_mount_error_redacted(exc.value, source_error=source_error, sentinel=sentinel)
+    assert inner.stop_calls == 1
+    assert inner.shutdown_calls == 1
+    assert inner.close_dependency_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_runner_owned_cleanup_redacts_pre_stop_hook_failure() -> None:
+    sentinel = "runner-pre-stop-hook-secret"
+    source_error = RuntimeError(f"pre-stop hook failed with {sentinel}")
+    session = _FakeSession(_external_mount_manifest(sentinel))
+    resources = _SandboxSessionResources(session=session, client=None, owns_session=True)
+
+    async def failing_hook() -> None:
+        raise source_error
+
+    session.register_pre_stop_hook(failing_hook)
+
+    with pytest.raises(RuntimeError, match="protected mount configuration") as exc:
+        await resources.cleanup()
+
+    _assert_mount_error_redacted(exc.value, source_error=source_error, sentinel=sentinel)
+    assert session.stop_calls == 0
+    assert session.shutdown_calls == 1
+    assert session.close_dependency_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("runner_owned", [False, True])
+async def test_pre_stop_cancellation_skips_persistence_and_completes_cleanup(
+    runner_owned: bool,
+) -> None:
+    inner = _FakeSession(Manifest())
+    client: _FakeClient | None = None
+
+    async def cancelled_hook() -> None:
+        raise asyncio.CancelledError()
+
+    if runner_owned:
+        client = _FakeClient(inner)
+        client.session.register_pre_stop_hook(cancelled_hook)
+        with pytest.raises(asyncio.CancelledError):
+            await _SandboxSessionResources(
+                session=client.session,
+                client=client,
+                owns_session=True,
+            ).cleanup()
+    else:
+        session = SandboxSession(inner)
+        session.register_pre_stop_hook(cancelled_hook)
+        with pytest.raises(asyncio.CancelledError):
+            await session.aclose()
+
+    assert inner.stop_calls == 0
+    assert inner.shutdown_calls == 1
+    assert inner.close_dependency_calls == 1
+    if client is not None:
+        assert client.delete_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_repeated_direct_aclose_never_persists_after_pre_stop_failure(
+    cancelled: bool,
+) -> None:
+    session = _FakeSession(Manifest())
+    source_error: BaseException
+    if cancelled:
+        source_error = asyncio.CancelledError()
+    else:
+        source_error = RuntimeError("pre-stop hook failed")
+
+    async def failing_hook() -> None:
+        raise source_error
+
+    session.register_pre_stop_hook(failing_hook)
+
+    with pytest.raises(type(source_error)):
+        await session.aclose()
+    await session.aclose()
+
+    assert session.stop_calls == 0
+    assert session.shutdown_calls == 2
+    assert session.close_dependency_calls == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancelled", [False, True])
+@pytest.mark.parametrize("cancel_waiter", [False, True])
+async def test_concurrent_direct_aclose_waits_for_pre_stop_failure(
+    cancelled: bool,
+    cancel_waiter: bool,
+) -> None:
+    first_hook_started = asyncio.Event()
+    second_cleanup_started = asyncio.Event()
+    release_hook = asyncio.Event()
+
+    class ConcurrentCleanupSession(_FakeSession):
+        aclose_calls = 0
+
+        async def aclose(self) -> None:
+            self.aclose_calls += 1
+            if self.aclose_calls == 2:
+                second_cleanup_started.set()
+            await super().aclose()
+
+    session = ConcurrentCleanupSession(Manifest())
+    source_error: BaseException
+    if cancelled:
+        source_error = asyncio.CancelledError()
+    else:
+        source_error = RuntimeError("pre-stop hook failed")
+
+    async def failing_hook() -> None:
+        first_hook_started.set()
+        await release_hook.wait()
+        raise source_error
+
+    session.register_pre_stop_hook(failing_hook)
+    first_cleanup = asyncio.create_task(session.aclose())
+    await first_hook_started.wait()
+    second_cleanup = asyncio.create_task(session.aclose())
+    await second_cleanup_started.wait()
+    if cancel_waiter:
+        second_cleanup.cancel()
+    release_hook.set()
+
+    first_result, second_result = await asyncio.gather(
+        first_cleanup,
+        second_cleanup,
+        return_exceptions=True,
+    )
+
+    assert isinstance(first_result, type(source_error))
+    if cancel_waiter:
+        assert isinstance(second_result, asyncio.CancelledError)
+    else:
+        assert second_result is None
+    assert session.stop_calls == 0
+    assert session.shutdown_calls == (1 if cancel_waiter else 2)
+    assert session.close_dependency_calls == (1 if cancel_waiter else 2)
+
+
+@pytest.mark.asyncio
+async def test_runner_owned_cleanup_redacts_client_delete_failure() -> None:
+    sentinel = "client-delete-secret"
+    source_error = RuntimeError(f"delete failed with {sentinel}")
+    inner = _FakeSession(_external_mount_manifest(sentinel))
+
+    class FailingDeleteClient(_FakeClient):
+        async def delete(self, session: SandboxSession) -> SandboxSession:
+            self.delete_calls += 1
+            raise source_error
+
+    client = FailingDeleteClient(inner)
+    resources = _SandboxSessionResources(
+        session=client.session,
+        client=client,
+        owns_session=True,
+    )
+
+    with pytest.raises(RuntimeError, match="protected mount configuration") as exc:
+        await resources.cleanup()
+
+    _assert_mount_error_redacted(exc.value, source_error=source_error, sentinel=sentinel)
+    assert inner.stop_calls == 1
+    assert inner.shutdown_calls == 1
+    assert client.delete_calls == 1
+    assert inner.close_dependency_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["persist", "hydrate"])
+async def test_sandbox_session_rejects_unsafe_manifest_before_workspace_persistence(
+    operation: str,
+) -> None:
+    sentinel = "workspace-persistence-secret"
+    inner = _WorkspacePersistenceProbeSession(
+        Manifest(
+            entries={
+                "data": S3Mount(
+                    bucket="bucket",
+                    access_key_id="access-key",
+                    secret_access_key=sentinel,
+                    mount_strategy=InContainerMountStrategy(pattern=RcloneMountPattern()),
+                )
+            }
+        )
+    )
+    session = SandboxSession(inner)
+
+    with pytest.raises(MountConfigError, match="mount-scoped credentials cannot be exposed") as exc:
+        if operation == "persist":
+            await session.persist_workspace()
+        else:
+            await session.hydrate_workspace(io.BytesIO(b"archive"))
+
+    assert inner.persist_calls == 0
+    assert inner.hydrate_calls == 0
+    assert sentinel not in str(exc.value)
 
 
 @pytest.mark.asyncio
@@ -657,6 +1061,25 @@ class _NestedObjectCapability(Capability):
         )
 
 
+class _StatefulFunctionTool(FunctionTool):
+    def __init__(self, state: str) -> None:
+        self.state = state
+        super().__init__(
+            name="stateful_tool",
+            description="Return state from the tool instance.",
+            params_json_schema={},
+            on_invoke_tool=self._invoke,
+        )
+
+    async def _invoke(self, _ctx: ToolContext[Any], _raw_input: str) -> str:
+        return self.state
+
+
+class _ToolStateCapability(Capability):
+    type: Literal["tool-state"] = "tool-state"
+    tool: Any
+
+
 class _AwaitableSessionCapability(Capability):
     type: str = "awaitable-session"
     bound_session: BaseSandboxSession | None = None
@@ -723,6 +1146,7 @@ class _ManifestMutationCapability(Capability):
     type: str = "manifest-mutation"
     rel_path: str
     content: bytes
+    process_calls: int
 
     def __init__(self, *, rel_path: str = "cap.txt", content: bytes = b"capability") -> None:
         super().__init__(
@@ -732,13 +1156,167 @@ class _ManifestMutationCapability(Capability):
                 {
                     "rel_path": rel_path,
                     "content": content,
+                    "process_calls": 0,
                 },
             ),
         )
 
     def process_manifest(self, manifest: Manifest) -> Manifest:
+        self.process_calls += 1
         manifest.entries[self.rel_path] = File(content=self.content)
         return manifest
+
+
+class _ManifestReplacementCapability(Capability):
+    type: str = "manifest-replacement"
+
+    def __init__(self) -> None:
+        super().__init__(type="manifest-replacement")
+
+    def process_manifest(self, manifest: Manifest) -> Manifest:
+        return Manifest(
+            version=manifest.version,
+            root=manifest.root,
+            entries={**manifest.entries, "cap.txt": File(content=b"capability")},
+            environment=manifest.environment.model_copy(deep=True),
+            users=[user.model_copy(deep=True) for user in manifest.users],
+            groups=[group.model_copy(deep=True) for group in manifest.groups],
+            extra_path_grants=tuple(
+                grant.model_copy(deep=True) for grant in manifest.extra_path_grants
+            ),
+            remote_mount_command_allowlist=list(manifest.remote_mount_command_allowlist),
+        )
+
+
+class _ManifestRootReplacementCapability(_ManifestReplacementCapability):
+    type: str = "manifest-root-replacement"
+
+    def __init__(self) -> None:
+        Capability.__init__(self, type="manifest-root-replacement")
+
+    def process_manifest(self, manifest: Manifest) -> Manifest:
+        replaced = super().process_manifest(manifest)
+        replaced.root = "/other"
+        return replaced
+
+
+def test_process_manifest_preserves_mount_acknowledgement_across_replacement() -> None:
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="example-bucket",
+                access_key_id="example-access-key",
+                secret_access_key="example-secret-key",
+                mount_strategy=InContainerMountStrategy(pattern=RcloneMountPattern()),
+            )
+        }
+    ).with_in_container_mount_credential_exposure_acknowledged("data")
+
+    processed = SandboxRuntimeSessionManager._process_manifest(
+        [_ManifestReplacementCapability()],
+        manifest,
+    )
+
+    assert processed is not None
+    assert processed.entries["cap.txt"] == File(content=b"capability")
+    validate_manifest_mount_credential_boundaries(processed)
+    assert processed._acknowledges_in_container_mount_credential_exposure(
+        "/workspace/data",
+        "mount_scoped",
+    )
+
+
+@pytest.mark.parametrize(
+    ("acknowledged_path", "expected_at_replacement_root"),
+    [("/workspace/data", False), ("data", True)],
+)
+def test_process_manifest_preserves_absolute_or_relative_acknowledgement_identity(
+    acknowledged_path: str,
+    expected_at_replacement_root: bool,
+) -> None:
+    manifest = Manifest(
+        root="/workspace",
+        entries={
+            "data": S3Mount(
+                bucket="example-bucket",
+                access_key_id="example-access-key",
+                secret_access_key="example-secret-key",
+                mount_strategy=InContainerMountStrategy(pattern=RcloneMountPattern()),
+            )
+        },
+    ).with_in_container_mount_credential_exposure_acknowledged(acknowledged_path)
+
+    processed = SandboxRuntimeSessionManager._process_manifest(
+        [_ManifestRootReplacementCapability()],
+        manifest,
+    )
+
+    assert processed is not None
+    assert processed.root == "/other"
+    assert (
+        processed._acknowledges_in_container_mount_credential_exposure(
+            "/other/data",
+            "mount_scoped",
+        )
+        is expected_at_replacement_root
+    )
+    if expected_at_replacement_root:
+        validate_manifest_mount_credential_boundaries(processed)
+    else:
+        assert processed._acknowledges_in_container_mount_credential_exposure(
+            "/workspace/data",
+            "mount_scoped",
+        )
+        with pytest.raises(MountConfigError, match="mount-scoped credentials"):
+            validate_manifest_mount_credential_boundaries(processed)
+
+
+class _CredentialedMountCapability(Capability):
+    type: str = "credentialed-mount"
+
+    def __init__(self) -> None:
+        super().__init__(type="credentialed-mount")
+
+    def process_manifest(self, manifest: Manifest) -> Manifest:
+        manifest.entries["remote"] = S3Mount(
+            bucket="example-bucket",
+            access_key_id="example-access-key",
+            secret_access_key="example-secret-key",
+            mount_strategy=InContainerMountStrategy(pattern=RcloneMountPattern()),
+        )
+        return manifest
+
+
+class _ManifestFailureCapability(Capability):
+    type: str = "manifest-failure"
+
+    def __init__(self) -> None:
+        super().__init__(type="manifest-failure")
+
+    def process_manifest(self, manifest: Manifest) -> Manifest:
+        mount = manifest.entries["data"]
+        assert isinstance(mount, S3Mount)
+        raise RuntimeError(f"capability failed with {mount.secret_access_key}")
+
+
+class _ManifestMutationFailureCapability(Capability):
+    type: str = "manifest-mutation-failure"
+    sentinel: str
+
+    def __init__(self, sentinel: str) -> None:
+        super().__init__(
+            type="manifest-mutation-failure",
+            **cast(Any, {"sentinel": sentinel}),
+        )
+
+    def process_manifest(self, manifest: Manifest) -> Manifest:
+        manifest.entries["data"] = S3Mount(
+            bucket="example-bucket",
+            access_key_id="example-access-key",
+            secret_access_key=self.sentinel,
+            mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+        )
+        raise RuntimeError("capability failed after manifest mutation")
 
 
 class _ManifestUsersCapability(Capability):
@@ -749,6 +1327,23 @@ class _ManifestUsersCapability(Capability):
 
     def process_manifest(self, manifest: Manifest) -> Manifest:
         manifest.users.append(User(name="sandbox-user"))
+        return manifest
+
+
+class _ManifestPathGrantsCapability(Capability):
+    type: str = "manifest-path-grants"
+    grants: tuple[SandboxPathGrant, ...]
+    process_calls: int
+
+    def __init__(self, grants: tuple[SandboxPathGrant, ...]) -> None:
+        super().__init__(
+            type="manifest-path-grants",
+            **cast(Any, {"grants": grants, "process_calls": 0}),
+        )
+
+    def process_manifest(self, manifest: Manifest) -> Manifest:
+        self.process_calls += 1
+        manifest.extra_path_grants = self.grants
         return manifest
 
 
@@ -784,6 +1379,30 @@ class _ProcessContextSessionCapability(Capability):
                     "content": f"process_calls={self.process_calls}",
                 },
             ),
+        ]
+
+
+class _DropContextTextCapability(Capability):
+    type: str = "drop-context-text"
+    text: str
+
+    def __init__(self, text: str) -> None:
+        super().__init__(type="drop-context-text", **cast(Any, {"text": text}))
+
+    def process_context(self, context: list[TResponseInputItem]) -> list[TResponseInputItem]:
+        return [item for item in context if self.text not in json.dumps(item, default=str)]
+
+
+class _RebuildContextWithoutPrivateMetadataCapability(Capability):
+    type: str = "rebuild-context-without-private-metadata"
+
+    def __init__(self) -> None:
+        super().__init__(type="rebuild-context-without-private-metadata")
+
+    def process_context(self, context: list[TResponseInputItem]) -> list[TResponseInputItem]:
+        return [
+            cast(TResponseInputItem, dict(item)) if isinstance(item, dict) else item
+            for item in context
         ]
 
 
@@ -930,7 +1549,7 @@ def _unix_local_run_config(
 
 @pytest.mark.asyncio
 async def test_runner_merges_sandbox_instructions_and_tools() -> None:
-    model = FakeModel(initial_output=[get_final_output_message("done")])
+    model = ScriptedModel(steps=[[get_final_output_message("done")]])
     capability_tool = get_function_tool("capability_tool", "ok")
     capability = _RecordingCapability(
         instruction_text="Capability instructions.",
@@ -978,8 +1597,8 @@ async def test_runner_merges_sandbox_instructions_and_tools() -> None:
     assert client.create_kwargs["options"] == {"image": "sandbox"}
     assert isinstance(client.create_kwargs["snapshot"], LocalSnapshotSpec)
 
-    assert model.first_turn_args is not None
-    assert model.first_turn_args["system_instructions"] == (
+    assert bool(model.calls)
+    assert model.calls[0].system_instructions == (
         f"{get_default_sandbox_instructions()}\n\n"
         "# Agent instructions\n\n"
         "Additional instructions.\n\n"
@@ -987,9 +1606,9 @@ async def test_runner_merges_sandbox_instructions_and_tools() -> None:
         "Capability instructions.\n\n"
         f"{runtime_agent_preparation_module._filesystem_instructions(manifest)}"
     )
-    assert [tool.name for tool in model.first_turn_args["tools"]] == ["capability_tool"]
+    assert [tool.name for tool in model.calls[0].tools] == ["capability_tool"]
 
-    input_items = model.first_turn_args["input"]
+    input_items = model.calls[0].input
     assert isinstance(input_items, list)
     assert _extract_user_text(input_items[0]) == "hello"
 
@@ -1017,7 +1636,7 @@ def test_filesystem_instructions_omit_extra_path_grants() -> None:
 
 @pytest.mark.asyncio
 async def test_runner_adds_run_as_user_to_created_manifest_without_default_manifest() -> None:
-    model = FakeModel(initial_output=[get_final_output_message("done")])
+    model = ScriptedModel(steps=[[get_final_output_message("done")]])
     session = _FakeSession(Manifest())
     client = _FakeClient(session)
     run_as = User(name="sandbox-user")
@@ -1043,7 +1662,7 @@ async def test_runner_adds_run_as_user_to_created_manifest_without_default_manif
 
 @pytest.mark.asyncio
 async def test_runner_uses_default_sandbox_prompt_when_instructions_missing() -> None:
-    model = FakeModel(initial_output=[get_final_output_message("done")])
+    model = ScriptedModel(steps=[[get_final_output_message("done")]])
     capability = _RecordingCapability(instruction_text="Capability instructions.")
     session = _FakeSession(Manifest())
     client = _FakeClient(session)
@@ -1060,21 +1679,21 @@ async def test_runner_uses_default_sandbox_prompt_when_instructions_missing() ->
     )
 
     assert result.final_output == "done"
-    assert model.first_turn_args is not None
+    assert bool(model.calls)
     expected_instructions = (
         f"{get_default_sandbox_instructions()}\n\n"
         "# Sandbox capability instructions\n\n"
         "Capability instructions.\n\n"
         f"{runtime_agent_preparation_module._filesystem_instructions(session.state.manifest)}"
     )
-    assert model.first_turn_args["system_instructions"] == (expected_instructions)
+    assert model.calls[0].system_instructions == (expected_instructions)
 
 
 @pytest.mark.asyncio
 async def test_runner_handles_missing_default_sandbox_prompt_resource(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    model = FakeModel(initial_output=[get_final_output_message("done")])
+    model = ScriptedModel(steps=[[get_final_output_message("done")]])
     capability = _RecordingCapability(instruction_text="Capability instructions.")
     session = _FakeSession(Manifest())
     client = _FakeClient(session)
@@ -1100,8 +1719,8 @@ async def test_runner_handles_missing_default_sandbox_prompt_resource(
         runtime_agent_preparation_module.get_default_sandbox_instructions.cache_clear()
 
     assert result.final_output == "done"
-    assert model.first_turn_args is not None
-    assert model.first_turn_args["system_instructions"] == (
+    assert bool(model.calls)
+    assert model.calls[0].system_instructions == (
         "# Agent instructions\n\n"
         "Additional instructions.\n\n"
         "# Sandbox capability instructions\n\n"
@@ -1112,7 +1731,7 @@ async def test_runner_handles_missing_default_sandbox_prompt_resource(
 
 @pytest.mark.asyncio
 async def test_runner_dynamic_instructions_do_not_override_default_sandbox_prompt() -> None:
-    model = FakeModel(initial_output=[get_final_output_message("done")])
+    model = ScriptedModel(steps=[[get_final_output_message("done")]])
     capability = _RecordingCapability(instruction_text="Capability instructions.")
     session = _FakeSession(Manifest())
     client = _FakeClient(session)
@@ -1137,8 +1756,8 @@ async def test_runner_dynamic_instructions_do_not_override_default_sandbox_promp
     )
 
     assert result.final_output == "done"
-    assert model.first_turn_args is not None
-    assert model.first_turn_args["system_instructions"] == (
+    assert bool(model.calls)
+    assert model.calls[0].system_instructions == (
         f"{get_default_sandbox_instructions()}\n\n"
         "# Sandbox capability instructions\n\n"
         "Capability instructions.\n\n"
@@ -1148,7 +1767,7 @@ async def test_runner_dynamic_instructions_do_not_override_default_sandbox_promp
 
 @pytest.mark.asyncio
 async def test_runner_base_instructions_override_default_sandbox_prompt() -> None:
-    model = FakeModel(initial_output=[get_final_output_message("done")])
+    model = ScriptedModel(steps=[[get_final_output_message("done")]])
     capability = _RecordingCapability(instruction_text="Capability instructions.")
     session = _FakeSession(Manifest())
     client = _FakeClient(session)
@@ -1167,8 +1786,8 @@ async def test_runner_base_instructions_override_default_sandbox_prompt() -> Non
     )
 
     assert result.final_output == "done"
-    assert model.first_turn_args is not None
-    assert model.first_turn_args["system_instructions"] == (
+    assert bool(model.calls)
+    assert model.calls[0].system_instructions == (
         "Custom base instructions.\n\n"
         "# Agent instructions\n\n"
         "Additional instructions.\n\n"
@@ -1180,7 +1799,7 @@ async def test_runner_base_instructions_override_default_sandbox_prompt() -> Non
 
 @pytest.mark.asyncio
 async def test_runner_adds_remote_mount_policy_instructions() -> None:
-    model = FakeModel(initial_output=[get_final_output_message("done")])
+    model = ScriptedModel(steps=[[get_final_output_message("done")]])
     manifest = Manifest(
         entries={
             "remote": S3Mount(
@@ -1205,8 +1824,8 @@ async def test_runner_adds_remote_mount_policy_instructions() -> None:
     )
 
     assert result.final_output == "done"
-    assert model.first_turn_args is not None
-    system_instructions = model.first_turn_args["system_instructions"]
+    assert bool(model.calls)
+    system_instructions = model.calls[0].system_instructions
     assert isinstance(system_instructions, str)
     expected_policy_pattern = re.escape(REMOTE_MOUNT_POLICY)
     expected_policy_pattern = expected_policy_pattern.replace(
@@ -1220,9 +1839,9 @@ async def test_runner_adds_remote_mount_policy_instructions() -> None:
     expected_policy_pattern = expected_policy_pattern.replace(
         re.escape("{edit_instructions}"),
         re.escape(
-            "Use `apply_patch` directly for text edits. "
-            "For shell-based edits, first `cp` the mounted file to a normal local workspace "
-            "path, edit the local copy there, then `cp` it back. "
+            "Do not edit paths marked read-only in place, including with `apply_patch`, "
+            "and do not write edited files back to them. Copy read-only files to a normal "
+            "local workspace path only if you need an editable scratch copy."
         ),
     )
     assert isinstance(re.search(expected_policy_pattern, system_instructions), re.Match)
@@ -1235,7 +1854,7 @@ async def test_runner_adds_remote_mount_policy_instructions() -> None:
 
 @pytest.mark.asyncio
 async def test_runner_adds_remote_mount_policy_for_non_ephemeral_mounts() -> None:
-    model = FakeModel(initial_output=[get_final_output_message("done")])
+    model = ScriptedModel(steps=[[get_final_output_message("done")]])
     manifest = Manifest(
         entries={
             "remote": S3Mount(
@@ -1261,15 +1880,15 @@ async def test_runner_adds_remote_mount_policy_for_non_ephemeral_mounts() -> Non
     )
 
     assert result.final_output == "done"
-    assert model.first_turn_args is not None
-    system_instructions = model.first_turn_args["system_instructions"]
+    assert bool(model.calls)
+    system_instructions = model.calls[0].system_instructions
     assert isinstance(system_instructions, str)
     assert "- /workspace/remote (mounted in read-only mode)" in system_instructions
 
 
 @pytest.mark.asyncio
 async def test_runner_applies_compaction_capability_to_input_and_model_settings() -> None:
-    model = FakeModel(initial_output=[get_final_output_message("done")])
+    model = ScriptedModel(steps=[[get_final_output_message("done")]])
     session = _FakeSession(Manifest())
     client = _FakeClient(session)
     agent = SandboxAgent(
@@ -1292,9 +1911,9 @@ async def test_runner_applies_compaction_capability_to_input_and_model_settings(
     )
 
     assert result.final_output == "done"
-    assert model.first_turn_args is not None
-    assert model.first_turn_args["input"] == input_items[1:]
-    model_settings = model.first_turn_args["model_settings"]
+    assert bool(model.calls)
+    assert model.calls[0].input == input_items[1:]
+    model_settings = model.calls[0].model_settings
     assert isinstance(model_settings, ModelSettings)
     assert model_settings.extra_args == {
         "context_management": [
@@ -1308,7 +1927,7 @@ async def test_runner_applies_compaction_capability_to_input_and_model_settings(
 
 @pytest.mark.asyncio
 async def test_runner_marks_writable_remote_mounts_in_policy() -> None:
-    model = FakeModel(initial_output=[get_final_output_message("done")])
+    model = ScriptedModel(steps=[[get_final_output_message("done")]])
     manifest = Manifest(
         entries={
             "remote": S3Mount(
@@ -1334,20 +1953,20 @@ async def test_runner_marks_writable_remote_mounts_in_policy() -> None:
     )
 
     assert result.final_output == "done"
-    assert model.first_turn_args is not None
-    system_instructions = model.first_turn_args["system_instructions"]
+    assert bool(model.calls)
+    system_instructions = model.calls[0].system_instructions
     assert isinstance(system_instructions, str)
     assert "- /workspace/remote (mounted in read+write mode)" in system_instructions
-    assert "Use `apply_patch` directly for text edits." in system_instructions
+    assert "Use `apply_patch` directly for text edits on read+write mounts." in system_instructions
     assert (
-        "For shell-based edits, first `cp` the mounted file to a normal local workspace path, "
-        "edit the local copy there, then `cp` it back." in system_instructions
+        "For shell-based edits on read+write mounts, first `cp` the mounted file to a normal "
+        "local workspace path, edit the local copy there, then copy it back." in system_instructions
     )
 
 
 @pytest.mark.asyncio
 async def test_runner_uses_manifest_remote_mount_command_allowlist_override() -> None:
-    model = FakeModel(initial_output=[get_final_output_message("done")])
+    model = ScriptedModel(steps=[[get_final_output_message("done")]])
     manifest = Manifest(
         entries={
             "remote": S3Mount(
@@ -1373,8 +1992,8 @@ async def test_runner_uses_manifest_remote_mount_command_allowlist_override() ->
     )
 
     assert result.final_output == "done"
-    assert model.first_turn_args is not None
-    system_instructions = model.first_turn_args["system_instructions"]
+    assert bool(model.calls)
+    system_instructions = model.calls[0].system_instructions
     assert isinstance(system_instructions, str)
     assert "Only use these commands on remote mounts:" in system_instructions
     assert "`ls`, `cp`" in system_instructions
@@ -1384,7 +2003,7 @@ async def test_runner_uses_manifest_remote_mount_command_allowlist_override() ->
 async def test_runner_requires_sandbox_config_for_sandbox_agent() -> None:
     agent = SandboxAgent(
         name="sandbox",
-        model=FakeModel(initial_output=[get_final_output_message("done")]),
+        model=ScriptedModel(steps=[[get_final_output_message("done")]]),
         instructions="Base instructions.",
     )
 
@@ -1394,7 +2013,7 @@ async def test_runner_requires_sandbox_config_for_sandbox_agent() -> None:
 
 @pytest.mark.asyncio
 async def test_runner_streamed_cleans_runner_owned_session() -> None:
-    model = FakeModel(initial_output=[get_final_output_message("done")])
+    model = ScriptedModel(steps=[[get_final_output_message("done")]])
     session = _FakeSession(Manifest())
     client = _FakeClient(session)
     agent = SandboxAgent(
@@ -1437,7 +2056,7 @@ async def test_runner_streamed_guardrail_trip_blocks_runner_owned_sandbox_creati
     client = _FakeClient(session)
     agent = SandboxAgent(
         name="sandbox",
-        model=FakeModel(initial_output=[get_final_output_message("done")]),
+        model=ScriptedModel(steps=[[get_final_output_message("done")]]),
         instructions="Base instructions.",
         input_guardrails=[
             InputGuardrail(
@@ -1461,7 +2080,7 @@ async def test_runner_streamed_guardrail_trip_blocks_runner_owned_sandbox_creati
 
 @pytest.mark.asyncio
 async def test_runner_does_not_close_injected_sandbox_session() -> None:
-    model = FakeModel(initial_output=[get_final_output_message("done")])
+    model = ScriptedModel(steps=[[get_final_output_message("done")]])
     default_manifest = Manifest(entries={"default.txt": File(content=b"default")})
     session_manifest = Manifest(entries={"session.txt": File(content=b"session")})
     injected_session = _FakeSession(session_manifest)
@@ -1489,15 +2108,15 @@ async def test_runner_does_not_close_injected_sandbox_session() -> None:
     assert injected_session.shutdown_calls == 0
     assert injected_session.close_dependency_calls == 0
 
-    assert model.first_turn_args is not None
-    input_items = model.first_turn_args["input"]
+    assert bool(model.calls)
+    input_items = model.calls[0].input
     assert isinstance(input_items, str) or isinstance(input_items, list)
     assert injected_session.state.manifest.entries == session_manifest.entries
 
 
 @pytest.mark.asyncio
 async def test_runner_does_not_restart_running_injected_sandbox_session() -> None:
-    model = FakeModel(initial_output=[get_final_output_message("done")])
+    model = ScriptedModel(steps=[[get_final_output_message("done")]])
     injected_session = _FakeSession(Manifest(entries={"session.txt": File(content=b"session")}))
     injected_session._running = True
     agent = SandboxAgent(
@@ -1524,7 +2143,7 @@ async def test_runner_guardrail_trip_blocks_runner_owned_sandbox_creation() -> N
     client = _FakeClient(session)
     agent = SandboxAgent(
         name="sandbox",
-        model=FakeModel(initial_output=[get_final_output_message("done")]),
+        model=ScriptedModel(steps=[[get_final_output_message("done")]]),
         instructions="Base instructions.",
         input_guardrails=[
             InputGuardrail(
@@ -1550,7 +2169,7 @@ async def test_runner_guardrail_trip_blocks_running_injected_session_mutation() 
     live_session._running = True
     agent = SandboxAgent(
         name="sandbox",
-        model=FakeModel(initial_output=[get_final_output_message("done")]),
+        model=ScriptedModel(steps=[[get_final_output_message("done")]]),
         instructions="Base instructions.",
         capabilities=[_ManifestMutationCapability()],
         input_guardrails=[
@@ -1581,7 +2200,7 @@ async def test_runner_streamed_guardrail_trip_blocks_running_injected_session_mu
     live_session._running = True
     agent = SandboxAgent(
         name="sandbox",
-        model=FakeModel(initial_output=[get_final_output_message("done")]),
+        model=ScriptedModel(steps=[[get_final_output_message("done")]]),
         instructions="Base instructions.",
         capabilities=[_ManifestMutationCapability()],
         input_guardrails=[
@@ -1610,7 +2229,7 @@ async def test_runner_streamed_guardrail_trip_blocks_running_injected_session_mu
 
 @pytest.mark.asyncio
 async def test_runner_uses_public_sandbox_agent_for_dynamic_instructions() -> None:
-    model = FakeModel(initial_output=[get_final_output_message("done")])
+    model = ScriptedModel(steps=[[get_final_output_message("done")]])
     session = _FakeSession(Manifest())
     client = _FakeClient(session)
     seen_agents: list[Agent[Any]] = []
@@ -1635,8 +2254,8 @@ async def test_runner_uses_public_sandbox_agent_for_dynamic_instructions() -> No
 
     assert result.final_output == "done"
     assert seen_agents == [agent]
-    assert model.first_turn_args is not None
-    assert model.first_turn_args["system_instructions"] == (
+    assert bool(model.calls)
+    assert model.calls[0].system_instructions == (
         f"{get_default_sandbox_instructions()}\n\n"
         "# Agent instructions\n\n"
         "Saw public agent.\n\n"
@@ -1656,7 +2275,7 @@ async def test_runner_uses_public_sandbox_agent_for_dynamic_prompts() -> None:
 
     agent = SandboxAgent(
         name="sandbox",
-        model=FakeModel(initial_output=[get_final_output_message("done")]),
+        model=ScriptedModel(steps=[[get_final_output_message("done")]]),
         instructions="Base instructions.",
         prompt=dynamic_prompt,
         capabilities=[_RecordingCapability(instruction_text="Capability instructions.")],
@@ -1671,7 +2290,7 @@ async def test_runner_uses_public_sandbox_agent_for_dynamic_prompts() -> None:
 
     streamed_agent = SandboxAgent(
         name="streamed-sandbox",
-        model=FakeModel(initial_output=[get_final_output_message("streamed done")]),
+        model=ScriptedModel(steps=[[get_final_output_message("streamed done")]]),
         instructions="Base instructions.",
         prompt=dynamic_prompt,
         capabilities=[_RecordingCapability(instruction_text="Capability instructions.")],
@@ -1698,7 +2317,7 @@ async def test_runner_uses_public_agent_for_call_model_input_filter() -> None:
 
     agent = SandboxAgent(
         name="sandbox",
-        model=FakeModel(initial_output=[get_final_output_message("done")]),
+        model=ScriptedModel(steps=[[get_final_output_message("done")]]),
         instructions="Base instructions.",
         capabilities=[_RecordingCapability(instruction_text="Capability instructions.")],
     )
@@ -1729,7 +2348,7 @@ async def test_runner_streamed_uses_public_agent_for_call_model_input_filter() -
 
     agent = SandboxAgent(
         name="sandbox",
-        model=FakeModel(initial_output=[get_final_output_message("done")]),
+        model=ScriptedModel(steps=[[get_final_output_message("done")]]),
         instructions="Base instructions.",
         capabilities=[_RecordingCapability(instruction_text="Capability instructions.")],
     )
@@ -1754,9 +2373,9 @@ async def test_runner_streamed_uses_public_agent_for_call_model_input_filter() -
 
 @pytest.mark.asyncio
 async def test_runner_reuses_prepared_sandbox_agent_across_turns_for_tool_choice_reset() -> None:
-    model = FakeModel()
+    model = ScriptedModel()
     tool = get_function_tool("capability_tool", "ok")
-    model.add_multiple_turn_outputs(
+    model.extend(
         [
             [get_function_tool_call("capability_tool", json.dumps({}))],
             [get_final_output_message("done")],
@@ -1775,15 +2394,15 @@ async def test_runner_reuses_prepared_sandbox_agent_across_turns_for_tool_choice
     result = await Runner.run(agent, "hello", run_config=_sandbox_run_config(client))
 
     assert result.final_output == "done"
-    assert model.first_turn_args is not None
-    assert model.first_turn_args["model_settings"].tool_choice == "required"
-    assert model.last_turn_args["model_settings"].tool_choice is None
+    assert bool(model.calls)
+    assert model.calls[0].model_settings.tool_choice == "required"
+    assert model.calls[-1].model_settings.tool_choice is None
 
 
 @pytest.mark.asyncio
 async def test_runner_rebuilds_sandbox_resources_for_handoff_target_agent() -> None:
-    triage_model = FakeModel()
-    worker_model = FakeModel(initial_output=[get_final_output_message("done")])
+    triage_model = ScriptedModel()
+    worker_model = ScriptedModel(steps=[[get_final_output_message("done")]])
     client = _ManifestSessionClient()
     triage_manifest = Manifest(entries={"README.md": File(content=b"Triage workspace")})
     worker_manifest = Manifest(entries={"README.md": File(content=b"Worker workspace")})
@@ -1802,7 +2421,7 @@ async def test_runner_rebuilds_sandbox_resources_for_handoff_target_agent() -> N
         capabilities=[_ManifestInstructionsCapability()],
         handoffs=[worker],
     )
-    triage_model.turn_outputs = [[get_handoff_tool_call(worker)]]
+    triage_model.enqueue([get_handoff_tool_call(worker)])
 
     result = await Runner.run(
         triage,
@@ -1818,8 +2437,8 @@ async def test_runner_rebuilds_sandbox_resources_for_handoff_target_agent() -> N
         client.created_manifests[0].entries["README.md"]
         != client.created_manifests[1].entries["README.md"]
     )
-    assert worker_model.first_turn_args is not None
-    assert worker_model.first_turn_args["system_instructions"] == (
+    assert bool(worker_model.calls)
+    assert worker_model.calls[0].system_instructions == (
         f"{get_default_sandbox_instructions()}\n\n"
         "# Agent instructions\n\n"
         "Worker instructions.\n\n"
@@ -1829,10 +2448,99 @@ async def test_runner_rebuilds_sandbox_resources_for_handoff_target_agent() -> N
     )
 
 
+@pytest.mark.parametrize("streamed", [False, True], ids=["non_streamed", "streamed"])
+@pytest.mark.asyncio
+async def test_context_rewrite_releases_removed_nested_history_ownership(streamed: bool) -> None:
+    triage_model = ScriptedModel()
+    worker_model = ScriptedModel(steps=[[get_final_output_message("done")]])
+    client = _ManifestSessionClient()
+    worker = SandboxAgent(
+        name="worker",
+        model=worker_model,
+        default_manifest=Manifest(),
+        capabilities=[_DropContextTextCapability("handoff message")],
+    )
+    triage = SandboxAgent(
+        name="triage",
+        model=triage_model,
+        default_manifest=Manifest(),
+        capabilities=[],
+        handoffs=[worker],
+    )
+    triage_model.extend(
+        [[get_final_output_message("handoff message"), get_handoff_tool_call(worker)]]
+    )
+    run_config = RunConfig(
+        sandbox=SandboxRunConfig(client=client),
+        nest_handoff_history=True,
+    )
+
+    result: RunResult | RunResultStreaming
+    if streamed:
+        result = Runner.run_streamed(triage, "route this", run_config=run_config)
+        async for _ in result.stream_events():
+            pass
+    else:
+        result = await Runner.run(triage, "route this", run_config=run_config)
+
+    replay_texts = [
+        _extract_user_text(cast(dict[str, object], item))
+        for item in result.to_input_list()
+        if isinstance(item, dict) and "content" in item
+    ]
+    assert replay_texts.count("handoff message") == 1
+
+
+@pytest.mark.parametrize("streamed", [False, True], ids=["non_streamed", "streamed"])
+@pytest.mark.asyncio
+async def test_context_rebuild_retains_unambiguous_nested_history_ownership(
+    streamed: bool,
+) -> None:
+    triage_model = ScriptedModel()
+    worker_model = ScriptedModel(steps=[[get_final_output_message("done")]])
+    client = _ManifestSessionClient()
+    worker = SandboxAgent(
+        name="worker",
+        model=worker_model,
+        default_manifest=Manifest(),
+        capabilities=[_RebuildContextWithoutPrivateMetadataCapability()],
+    )
+    triage = SandboxAgent(
+        name="triage",
+        model=triage_model,
+        default_manifest=Manifest(),
+        capabilities=[],
+        handoffs=[worker],
+    )
+    triage_model.extend(
+        [[get_final_output_message("handoff message"), get_handoff_tool_call(worker)]]
+    )
+    run_config = RunConfig(
+        sandbox=SandboxRunConfig(client=client),
+        nest_handoff_history=True,
+    )
+
+    result: RunResult | RunResultStreaming
+    if streamed:
+        result = Runner.run_streamed(triage, "route this", run_config=run_config)
+        async for _ in result.stream_events():
+            pass
+    else:
+        result = await Runner.run(triage, "route this", run_config=run_config)
+
+    replay_texts = [
+        _extract_user_text(cast(dict[str, object], item))
+        for item in result.to_input_list()
+        if isinstance(item, dict) and "content" in item
+    ]
+    assert replay_texts.count("handoff message") == 1
+    assert result._nested_history_owned_session_item_refs
+
+
 @pytest.mark.asyncio
 async def test_runner_resumed_handoff_materializes_manifest_for_new_sandbox_agent() -> None:
-    triage_model = FakeModel()
-    worker_model = FakeModel(initial_output=[get_final_output_message("done")])
+    triage_model = ScriptedModel()
+    worker_model = ScriptedModel(steps=[[get_final_output_message("done")]])
     client = _ManifestSessionClient()
 
     @function_tool(name_override="approval_tool", needs_approval=True)
@@ -1857,7 +2565,7 @@ async def test_runner_resumed_handoff_materializes_manifest_for_new_sandbox_agen
         capabilities=[_ManifestInstructionsCapability()],
         handoffs=[worker],
     )
-    triage_model.add_multiple_turn_outputs(
+    triage_model.extend(
         [
             [get_function_tool_call("approval_tool", json.dumps({}), call_id="call_resume")],
             [get_handoff_tool_call(worker)],
@@ -1883,8 +2591,8 @@ async def test_runner_resumed_handoff_materializes_manifest_for_new_sandbox_agen
     assert resumed.final_output == "done"
     assert len(client.created_manifests) == 2
     assert client.created_manifests[1] is not None
-    assert worker_model.first_turn_args is not None
-    assert worker_model.first_turn_args["system_instructions"] == (
+    assert bool(worker_model.calls)
+    assert worker_model.calls[0].system_instructions == (
         f"{get_default_sandbox_instructions()}\n\n"
         "# Agent instructions\n\n"
         "Worker instructions.\n\n"
@@ -1995,14 +2703,17 @@ async def test_unix_local_client_delete_unmounts_nested_mounts_deepest_first(
     assert order == [root / "outer" / "child", root / "outer"]
 
 
+@pytest.mark.parametrize("redacted", [True, False], ids=["redacted", "diagnostic"])
 @pytest.mark.asyncio
 async def test_unix_local_client_delete_skips_rmtree_when_unmount_fails(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    redacted: bool,
 ) -> None:
     client = UnixLocalSandboxClient()
     manifest = _unix_local_manifest(
         entries={
-            "remote": S3Mount(
+            "SECRET_REMOTE_MOUNT": S3Mount(
                 bucket="bucket",
                 mount_strategy=InContainerMountStrategy(pattern=MountpointMountPattern()),
             ),
@@ -2019,7 +2730,7 @@ async def test_unix_local_client_delete_skips_rmtree_when_unmount_fails(
         base_dir: Path,
     ) -> None:
         _ = (self, session, dest, base_dir)
-        raise RuntimeError("busy")
+        raise RuntimeError("SECRET_UNMOUNT_ERROR")
 
     def _fake_rmtree(path: Path, ignore_errors: bool = False) -> None:
         _ = (path, ignore_errors)
@@ -2028,11 +2739,33 @@ async def test_unix_local_client_delete_skips_rmtree_when_unmount_fails(
 
     monkeypatch.setattr(S3Mount, "unmount", _failing_unmount)
     monkeypatch.setattr(shutil, "rmtree", _fake_rmtree)
+    monkeypatch.setattr(_debug, "DONT_LOG_TOOL_DATA", redacted)
+    caplog.set_level(logging.WARNING)
 
     await client.delete(session)
 
     assert rmtree_called is False
     assert workspace_root.exists()
+
+    record = next(
+        record
+        for record in caplog.records
+        if "Failed to unmount UnixLocal workspace mount" in logging.Formatter().format(record)
+    )
+    mount_path = str(workspace_root / "SECRET_REMOTE_MOUNT")
+    if redacted:
+        assert record.msg == "%s"
+        assert record.args == ("Failed to unmount UnixLocal workspace mount before deleting root",)
+        assert record.exc_info is None
+        assert record.exc_text is None
+        assert "openai_agents_diagnostic_context" not in record.__dict__
+        assert mount_path not in logging.Formatter().format(record)
+        assert "SECRET_UNMOUNT_ERROR" not in logging.Formatter().format(record)
+    else:
+        assert record.__dict__["openai_agents_diagnostic_context"] == {"mount_path": mount_path}
+        assert record.exc_info is not None
+        assert record.exc_info[1] is not None
+        assert "SECRET_UNMOUNT_ERROR" in logging.Formatter().format(record)
 
     shutil.rmtree(workspace_root, ignore_errors=True)
 
@@ -2076,20 +2809,23 @@ async def test_unix_local_persist_workspace_excludes_mounted_directory_contents(
 
 
 @pytest.mark.asyncio
-async def test_runner_allows_fresh_unix_local_sessions_without_options() -> None:
+async def test_runner_allows_fresh_sessions_for_clients_with_default_options() -> None:
     agent = SandboxAgent(
         name="sandbox",
-        model=FakeModel(initial_output=[get_final_output_message("done")]),
+        model=ScriptedModel(steps=[[get_final_output_message("done")]]),
         instructions="Base instructions.",
+        default_manifest=Manifest(),
     )
+    client = _ManifestSessionClient()
 
     result = await Runner.run(
         agent,
         "hello",
-        run_config=_unix_local_run_config(),
+        run_config=RunConfig(sandbox=SandboxRunConfig(client=client)),
     )
 
     assert result.final_output == "done"
+    assert len(client.created_manifests) == 1
 
 
 @pytest.mark.asyncio
@@ -2110,14 +2846,15 @@ async def test_unix_local_client_delete_preserves_caller_owned_workspace_root() 
 @pytest.mark.asyncio
 async def test_unix_local_runner_cleanup_preserves_resumed_caller_owned_workspace_root() -> None:
     workspace_root = Path(tempfile.mkdtemp(prefix="resumed-owned-"))
-    state = UnixLocalSandboxSessionState(
-        session_id=uuid.uuid4(),
+    client = UnixLocalSandboxClient()
+    created = await client.create(
         manifest=_unix_local_manifest(root=str(workspace_root)),
-        snapshot=NoopSnapshot(id=str(uuid.uuid4())),
+        options=None,
     )
+    state = cast(UnixLocalSandboxSessionState, created.state)
     agent = SandboxAgent(
         name="sandbox",
-        model=FakeModel(initial_output=[get_final_output_message("done")]),
+        model=ScriptedModel(steps=[[get_final_output_message("done")]]),
         instructions="Base instructions.",
     )
 
@@ -2217,7 +2954,7 @@ async def test_runner_streamed_ignores_sandbox_cleanup_failures_after_success() 
     client = _FakeClient(session)
     agent = SandboxAgent(
         name="sandbox",
-        model=FakeModel(initial_output=[get_final_output_message("done")]),
+        model=ScriptedModel(steps=[[get_final_output_message("done")]]),
         instructions="Base instructions.",
     )
 
@@ -2235,7 +2972,7 @@ async def test_runner_omits_sandbox_resume_state_when_cleanup_fails() -> None:
     client = _FakeClient(session)
     agent = SandboxAgent(
         name="sandbox",
-        model=FakeModel(initial_output=[get_final_output_message("done")]),
+        model=ScriptedModel(steps=[[get_final_output_message("done")]]),
         instructions="Base instructions.",
     )
 
@@ -2254,7 +2991,7 @@ async def test_runner_clears_sandbox_session_from_non_streamed_results_after_cle
     client = _FakeClient(session)
     agent = SandboxAgent(
         name="sandbox",
-        model=FakeModel(initial_output=[get_final_output_message("done")]),
+        model=ScriptedModel(steps=[[get_final_output_message("done")]]),
         instructions="Base instructions.",
     )
 
@@ -2270,7 +3007,7 @@ async def test_runner_streamed_cleans_sandbox_once_after_stream_completion() -> 
     client = _FakeClient(session)
     agent = SandboxAgent(
         name="sandbox",
-        model=FakeModel(initial_output=[get_final_output_message("done")]),
+        model=ScriptedModel(steps=[[get_final_output_message("done")]]),
         instructions="Base instructions.",
     )
 
@@ -2301,7 +3038,7 @@ async def test_runner_uses_public_agent_for_non_streaming_output_guardrails() ->
 
     agent = SandboxAgent(
         name="sandbox",
-        model=FakeModel(initial_output=[get_final_output_message("done")]),
+        model=ScriptedModel(steps=[[get_final_output_message("done")]]),
         instructions="Base instructions.",
         capabilities=[_RecordingCapability(instruction_text="Capability instructions.")],
         output_guardrails=[OutputGuardrail(guardrail_function=output_guardrail)],
@@ -2322,7 +3059,7 @@ async def test_runner_streamed_immediate_cancel_skips_waiting_for_sandbox_cleanu
     client = _FakeClient(session)
     agent = SandboxAgent(
         name="sandbox",
-        model=FakeModel(initial_output=[get_final_output_message("done")]),
+        model=ScriptedModel(steps=[[get_final_output_message("done")]]),
         instructions="Base instructions.",
     )
 
@@ -2347,8 +3084,8 @@ async def test_runner_streamed_run_loop_task_waits_for_sandbox_cleanup_and_persi
     stop_gate = asyncio.Event()
     session = _PersistingStopSession(Manifest(), stop_gate)
     client = _FakeClient(session)
-    model = FakeModel()
-    model.add_multiple_turn_outputs(
+    model = ScriptedModel()
+    model.extend(
         [
             [get_final_output_message("done")],
             [get_final_output_message("again")],
@@ -2405,6 +3142,7 @@ async def test_runner_rejects_unix_local_manifest_user_and_group_provisioning() 
 
 
 @pytest.mark.asyncio
+@pytest.mark.requires_native_macos_sandbox
 async def test_runner_persists_workspace_and_tool_choice_state_across_sandbox_resume() -> None:
     client = UnixLocalSandboxClient()
     file_capability = _SessionFileCapability()
@@ -2413,8 +3151,8 @@ async def test_runner_persists_workspace_and_tool_choice_state_across_sandbox_re
     def approval_tool() -> str:
         return "approved"
 
-    model = FakeModel()
-    model.add_multiple_turn_outputs(
+    model = ScriptedModel()
+    model.extend(
         [
             [
                 get_function_tool_call(
@@ -2464,8 +3202,8 @@ async def test_runner_persists_workspace_and_tool_choice_state_across_sandbox_re
     }
 
     state_json = state.to_json()
-    resumed_model = FakeModel()
-    resumed_model.add_multiple_turn_outputs(
+    resumed_model = ScriptedModel()
+    resumed_model.extend(
         [
             [
                 get_function_tool_call(
@@ -2495,7 +3233,7 @@ async def test_runner_persists_workspace_and_tool_choice_state_across_sandbox_re
     )
 
     assert resumed.final_output == "done"
-    assert resumed_model.last_turn_args["model_settings"].tool_choice is None
+    assert resumed_model.calls[-1].model_settings.tool_choice is None
     assert any(
         isinstance(item, ToolCallOutputItem)
         and item.output == "persist me"
@@ -2505,6 +3243,7 @@ async def test_runner_persists_workspace_and_tool_choice_state_across_sandbox_re
 
 
 @pytest.mark.asyncio
+@pytest.mark.requires_native_macos_sandbox
 async def test_runner_restores_all_sandbox_agents_from_run_state_across_handoffs() -> None:
     client = UnixLocalSandboxClient()
     file_capability = _SessionFileCapability()
@@ -2513,8 +3252,8 @@ async def test_runner_restores_all_sandbox_agents_from_run_state_across_handoffs
     def approval_tool() -> str:
         return "approved"
 
-    triage_model = FakeModel()
-    worker_model = FakeModel()
+    triage_model = ScriptedModel()
+    worker_model = ScriptedModel()
     worker = SandboxAgent(
         name="worker",
         model=worker_model,
@@ -2529,7 +3268,7 @@ async def test_runner_restores_all_sandbox_agents_from_run_state_across_handoffs
         handoffs=[worker],
     )
     worker.handoffs = [triage]
-    triage_model.add_multiple_turn_outputs(
+    triage_model.extend(
         [
             [
                 get_function_tool_call(
@@ -2541,7 +3280,7 @@ async def test_runner_restores_all_sandbox_agents_from_run_state_across_handoffs
             [get_handoff_tool_call(worker)],
         ]
     )
-    worker_model.add_multiple_turn_outputs(
+    worker_model.extend(
         [
             [get_function_tool_call("approval_tool", json.dumps({}), call_id="call_approval")],
         ]
@@ -2563,8 +3302,8 @@ async def test_runner_restores_all_sandbox_agents_from_run_state_across_handoffs
     assert set(sessions_by_agent) == {triage.name, worker.name}
 
     state_json = state.to_json()
-    resumed_triage_model = FakeModel()
-    resumed_worker_model = FakeModel()
+    resumed_triage_model = ScriptedModel()
+    resumed_worker_model = ScriptedModel()
     resumed_worker = SandboxAgent(
         name="worker",
         model=resumed_worker_model,
@@ -2579,8 +3318,8 @@ async def test_runner_restores_all_sandbox_agents_from_run_state_across_handoffs
         handoffs=[resumed_worker],
     )
     resumed_worker.handoffs = [resumed_triage]
-    resumed_worker_model.add_multiple_turn_outputs([[get_handoff_tool_call(resumed_triage)]])
-    resumed_triage_model.add_multiple_turn_outputs(
+    resumed_worker_model.extend([[get_handoff_tool_call(resumed_triage)]])
+    resumed_triage_model.extend(
         [
             [
                 get_function_tool_call(
@@ -2611,6 +3350,7 @@ async def test_runner_restores_all_sandbox_agents_from_run_state_across_handoffs
 
 
 @pytest.mark.asyncio
+@pytest.mark.requires_native_macos_sandbox
 async def test_runner_serializes_unique_sandbox_resume_keys_for_duplicate_agent_names() -> None:
     client = UnixLocalSandboxClient()
     file_capability = _SessionFileCapability()
@@ -2619,8 +3359,8 @@ async def test_runner_serializes_unique_sandbox_resume_keys_for_duplicate_agent_
     def approval_tool() -> str:
         return "approved"
 
-    first_model = FakeModel()
-    second_model = FakeModel()
+    first_model = ScriptedModel()
+    second_model = ScriptedModel()
     first = SandboxAgent(
         name="sandbox",
         model=first_model,
@@ -2635,7 +3375,7 @@ async def test_runner_serializes_unique_sandbox_resume_keys_for_duplicate_agent_
     )
     first.handoffs = [second]
     second.handoffs = [first]
-    first_model.add_multiple_turn_outputs(
+    first_model.extend(
         [
             [
                 get_function_tool_call(
@@ -2644,7 +3384,7 @@ async def test_runner_serializes_unique_sandbox_resume_keys_for_duplicate_agent_
                     call_id="call_write",
                 )
             ],
-            [get_handoff_tool_call(second)],
+            [get_handoff_tool_call(second, call_id="handoff_to_second")],
             [
                 get_function_tool_call(
                     "read_file",
@@ -2655,10 +3395,10 @@ async def test_runner_serializes_unique_sandbox_resume_keys_for_duplicate_agent_
             [get_final_output_message("done")],
         ]
     )
-    second_model.add_multiple_turn_outputs(
+    second_model.extend(
         [
             [get_function_tool_call("approval_tool", json.dumps({}), call_id="call_approval")],
-            [get_handoff_tool_call(first)],
+            [get_handoff_tool_call(first, call_id="handoff_to_first")],
         ]
     )
 
@@ -2694,7 +3434,7 @@ def test_duplicate_name_sandbox_identity_map_uses_capability_and_manifest_config
     def _make_agent(readme: bytes, capability_text: str) -> SandboxAgent[None]:
         return SandboxAgent(
             name="sandbox",
-            model=FakeModel(),
+            model=ScriptedModel(),
             instructions="Base instructions.",
             default_manifest=Manifest(entries={"README.md": File(content=readme)}),
             capabilities=[_RecordingCapability(instruction_text=capability_text)],
@@ -2730,8 +3470,8 @@ def test_duplicate_name_sandbox_identity_map_uses_capability_and_manifest_config
 async def test_session_manager_reserves_current_duplicate_resume_key_for_current_agent() -> None:
     manifest = Manifest(entries={"README.md": File(content=b"duplicate resume")})
     client = _FakeClient(_FakeSession(manifest))
-    first = SandboxAgent(name="sandbox", model=FakeModel(), instructions="First.")
-    second = SandboxAgent(name="sandbox", model=FakeModel(), instructions="Second.")
+    first = SandboxAgent(name="sandbox", model=ScriptedModel(), instructions="First.")
+    second = SandboxAgent(name="sandbox", model=ScriptedModel(), instructions="Second.")
     first.handoffs = [second]
     second.handoffs = [first]
     first_session_state = client.serialize_session_state(
@@ -2777,9 +3517,9 @@ async def test_session_manager_reserves_current_duplicate_resume_key_for_current
 
 def test_session_manager_generates_collision_free_resume_keys_for_literal_suffix_names() -> None:
     client = _FakeClient(_FakeSession(Manifest()))
-    first = SandboxAgent(name="sandbox", model=FakeModel(), instructions="First.")
-    literal_suffix = SandboxAgent(name="sandbox#2", model=FakeModel(), instructions="Literal.")
-    second = SandboxAgent(name="sandbox", model=FakeModel(), instructions="Second.")
+    first = SandboxAgent(name="sandbox", model=ScriptedModel(), instructions="First.")
+    literal_suffix = SandboxAgent(name="sandbox#2", model=ScriptedModel(), instructions="Literal.")
+    second = SandboxAgent(name="sandbox", model=ScriptedModel(), instructions="Second.")
     first.handoffs = [literal_suffix, second]
     literal_suffix.handoffs = [first, second]
     second.handoffs = [first, literal_suffix]
@@ -2803,7 +3543,7 @@ def test_session_manager_generates_collision_free_resume_keys_for_literal_suffix
 async def test_session_manager_passes_concurrency_limits_from_run_config(
     source: str,
 ) -> None:
-    agent = SandboxAgent(name="worker", model=FakeModel(), instructions="Worker.")
+    agent = SandboxAgent(name="worker", model=ScriptedModel(), instructions="Worker.")
     live_session = _FakeSession(Manifest())
     client = _FakeClient(live_session)
 
@@ -2857,7 +3597,7 @@ async def test_session_manager_passes_concurrency_limits_from_run_config(
 async def test_session_manager_passes_archive_limits_from_run_config(
     source: str,
 ) -> None:
-    agent = SandboxAgent(name="worker", model=FakeModel(), instructions="Worker.")
+    agent = SandboxAgent(name="worker", model=ScriptedModel(), instructions="Worker.")
     live_session = _FakeSession(Manifest())
     client = _FakeClient(live_session)
     archive_limits = SandboxArchiveLimits(
@@ -2902,7 +3642,7 @@ async def test_session_manager_passes_archive_limits_from_run_config(
 
 @pytest.mark.asyncio
 async def test_session_manager_default_archive_limits_preserves_no_resource_limits() -> None:
-    agent = SandboxAgent(name="worker", model=FakeModel(), instructions="Worker.")
+    agent = SandboxAgent(name="worker", model=ScriptedModel(), instructions="Worker.")
     live_session = _FakeSession(Manifest())
     client = _FakeClient(live_session)
     manager = SandboxRuntimeSessionManager(
@@ -2919,7 +3659,7 @@ async def test_session_manager_default_archive_limits_preserves_no_resource_limi
 
 @pytest.mark.asyncio
 async def test_session_manager_rejects_invalid_archive_limits() -> None:
-    agent = SandboxAgent(name="worker", model=FakeModel(), instructions="Worker.")
+    agent = SandboxAgent(name="worker", model=ScriptedModel(), instructions="Worker.")
     client = _FakeClient(_FakeSession(Manifest()))
     limits = SandboxArchiveLimits(max_input_bytes=1)
     limits.max_input_bytes = 0
@@ -2959,7 +3699,7 @@ async def test_session_manager_rejects_invalid_concurrency_limits(
     limits: SandboxConcurrencyLimits,
     message: str,
 ) -> None:
-    agent = SandboxAgent(name="worker", model=FakeModel(), instructions="Worker.")
+    agent = SandboxAgent(name="worker", model=ScriptedModel(), instructions="Worker.")
     client = _FakeClient(_FakeSession(Manifest()))
     manager = SandboxRuntimeSessionManager(
         starting_agent=agent,
@@ -2983,8 +3723,8 @@ async def test_session_manager_rejects_invalid_concurrency_limits(
 async def test_session_manager_preserves_untouched_run_state_sessions_on_cleanup() -> None:
     manifest = Manifest(entries={"README.md": File(content=b"duplicate resume")})
     client = _FakeClient(_FakeSession(manifest))
-    triage = SandboxAgent(name="triage", model=FakeModel(), instructions="Triage.")
-    worker = SandboxAgent(name="worker", model=FakeModel(), instructions="Worker.")
+    triage = SandboxAgent(name="triage", model=ScriptedModel(), instructions="Triage.")
+    worker = SandboxAgent(name="worker", model=ScriptedModel(), instructions="Worker.")
     triage.handoffs = [worker]
     worker.handoffs = [triage]
     triage_session_state = client.serialize_session_state(
@@ -3042,7 +3782,12 @@ async def test_session_manager_reapplies_capability_manifest_mutations_on_resume
 ) -> None:
     client = _FakeClient(_FakeSession(Manifest()))
     capability = _ManifestMutationCapability()
-    agent = SandboxAgent(name="worker", model=FakeModel(), instructions="Worker.")
+    agent = SandboxAgent(
+        name="worker",
+        model=ScriptedModel(),
+        instructions="Worker.",
+        default_manifest=Manifest(),
+    )
     session_state = TestSessionState(
         manifest=Manifest(),
         snapshot=NoopSnapshot(id="resume"),
@@ -3096,6 +3841,261 @@ async def test_session_manager_reapplies_capability_manifest_mutations_on_resume
     assert session.state.manifest.entries["cap.txt"] == File(content=b"capability")
     assert client.resume_state is not None
     assert client.resume_state.manifest.entries["cap.txt"] == File(content=b"capability")
+    assert capability.process_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_session_manager_rebinds_persisted_path_grants_from_current_manifest(
+    tmp_path: Path,
+) -> None:
+    trusted_manifest = Manifest(
+        extra_path_grants=(
+            SandboxPathGrant(
+                path="/mnt/shared-data",
+                host_path=str(tmp_path),
+                read_only=True,
+            ),
+        )
+    )
+    client = _FakeClient(_FakeSession(Manifest()))
+    agent = SandboxAgent(
+        name="worker",
+        model=ScriptedModel(),
+        instructions="Worker.",
+        default_manifest=trusted_manifest,
+    )
+    session_state = TestSessionState(
+        manifest=trusted_manifest,
+        snapshot=NoopSnapshot(id="resume"),
+    )
+    serialized_state = client.serialize_session_state(session_state)
+    run_state = cast(
+        RunState[Any, Agent[Any]],
+        RunState(
+            context=RunContextWrapper(context={}),
+            original_input="hello",
+            starting_agent=agent,
+        ),
+    )
+    run_state._current_agent = agent
+    run_state._sandbox = {
+        "backend_id": client.backend_id,
+        "current_agent_key": agent.name,
+        "current_agent_name": agent.name,
+        "session_state": serialized_state,
+        "sessions_by_agent": {
+            agent.name: {
+                "agent_name": agent.name,
+                "session_state": serialized_state,
+            }
+        },
+    }
+    manager = SandboxRuntimeSessionManager(
+        starting_agent=agent,
+        sandbox_config=SandboxRunConfig(client=client, options={"image": "sandbox"}),
+        run_state=run_state,
+    )
+
+    manager.acquire_agent(agent)
+    await manager.ensure_session(
+        agent=agent,
+        capabilities=[],
+        is_resumed_state=True,
+    )
+
+    assert client.resume_state is not None
+    assert client.resume_state.manifest.extra_path_grants == trusted_manifest.extra_path_grants
+    assert client.resume_state.path_grants_require_rebind == ()
+
+
+@pytest.mark.asyncio
+async def test_session_manager_rebinds_redacted_external_mount_authority() -> None:
+    trusted_manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="example-bucket",
+                access_key_id="example-access-key",
+                secret_access_key="example-secret-key",
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            )
+        }
+    )
+    client = _FakeClient(_FakeSession(Manifest()))
+    client.backend_id = "docker"
+    agent = SandboxAgent(
+        name="worker",
+        model=ScriptedModel(),
+        instructions="Worker.",
+        default_manifest=trusted_manifest,
+    )
+    session_state = TestSessionState(
+        manifest=trusted_manifest,
+        snapshot=NoopSnapshot(id="resume"),
+    )
+    serialized_state = client.serialize_session_state(session_state)
+    assert serialized_state[REDACTED_MOUNT_AUTHORITY_KEY] is True
+    run_state = cast(
+        RunState[Any, Agent[Any]],
+        RunState(
+            context=RunContextWrapper(context={}),
+            original_input="hello",
+            starting_agent=agent,
+        ),
+    )
+    run_state._current_agent = agent
+    run_state._sandbox = {
+        "backend_id": client.backend_id,
+        "current_agent_key": agent.name,
+        "current_agent_name": agent.name,
+        "session_state": serialized_state,
+        "sessions_by_agent": {
+            agent.name: {
+                "agent_name": agent.name,
+                "session_state": serialized_state,
+            }
+        },
+    }
+    manager = SandboxRuntimeSessionManager(
+        starting_agent=agent,
+        sandbox_config=SandboxRunConfig(client=client, options={"image": "sandbox"}),
+        run_state=run_state,
+    )
+
+    manager.acquire_agent(agent)
+    await manager.ensure_session(
+        agent=agent,
+        capabilities=[],
+        is_resumed_state=True,
+    )
+
+    assert client.resume_state is not None
+    rebound_mount = client.resume_state.manifest.entries["data"]
+    assert isinstance(rebound_mount, S3Mount)
+    assert rebound_mount.access_key_id == "example-access-key"
+    assert rebound_mount.secret_access_key == "example-secret-key"
+    assert client.resume_state.mount_authority_redacted is False
+    assert client.resume_state.mount_authority_rebound is True
+    persisted = manager.serialize_resume_state()
+    assert persisted is not None
+    assert "example-access-key" not in repr(persisted)
+    assert "example-secret-key" not in repr(persisted)
+
+
+@pytest.mark.asyncio
+async def test_session_manager_rebinds_capability_host_path_grant_once(
+    tmp_path: Path,
+) -> None:
+    host_grant = SandboxPathGrant(
+        path="/mnt/shared-data",
+        host_path=str(tmp_path),
+        read_only=True,
+    )
+    capability = _ManifestPathGrantsCapability((host_grant,))
+    client = _FakeClient(_FakeSession(Manifest()))
+    agent = SandboxAgent(
+        name="worker",
+        model=ScriptedModel(),
+        instructions="Worker.",
+        default_manifest=Manifest(),
+    )
+    session_state = TestSessionState(
+        manifest=Manifest(extra_path_grants=(host_grant,)),
+        snapshot=NoopSnapshot(id="resume"),
+    )
+    serialized_state = client.serialize_session_state(session_state)
+    run_state = cast(
+        RunState[Any, Agent[Any]],
+        RunState(
+            context=RunContextWrapper(context={}),
+            original_input="hello",
+            starting_agent=agent,
+        ),
+    )
+    run_state._current_agent = agent
+    run_state._sandbox = {
+        "backend_id": client.backend_id,
+        "current_agent_key": agent.name,
+        "current_agent_name": agent.name,
+        "session_state": serialized_state,
+        "sessions_by_agent": {
+            agent.name: {
+                "agent_name": agent.name,
+                "session_state": serialized_state,
+            }
+        },
+    }
+    manager = SandboxRuntimeSessionManager(
+        starting_agent=agent,
+        sandbox_config=SandboxRunConfig(client=client, options={"image": "sandbox"}),
+        run_state=run_state,
+    )
+
+    manager.acquire_agent(agent)
+    await manager.ensure_session(
+        agent=agent,
+        capabilities=[capability],
+        is_resumed_state=True,
+    )
+
+    assert capability.process_calls == 1
+    assert client.resume_state is not None
+    assert client.resume_state.manifest.extra_path_grants == (host_grant,)
+    assert client.resume_state.path_grants_require_rebind == ()
+
+
+@pytest.mark.asyncio
+async def test_session_manager_rejects_unmarked_serialized_host_path(
+    tmp_path: Path,
+) -> None:
+    client = _FakeClient(_FakeSession(Manifest()))
+    agent = SandboxAgent(name="worker", model=ScriptedModel(), instructions="Worker.")
+    serialized_state = TestSessionState(
+        manifest=Manifest(
+            extra_path_grants=(
+                SandboxPathGrant(
+                    path="/mnt/shared-data",
+                    host_path=str(tmp_path),
+                ),
+            )
+        ),
+        snapshot=NoopSnapshot(id="resume"),
+    ).model_dump(mode="json")
+    run_state = cast(
+        RunState[Any, Agent[Any]],
+        RunState(
+            context=RunContextWrapper(context={}),
+            original_input="hello",
+            starting_agent=agent,
+        ),
+    )
+    run_state._current_agent = agent
+    run_state._sandbox = {
+        "backend_id": client.backend_id,
+        "current_agent_key": agent.name,
+        "current_agent_name": agent.name,
+        "session_state": serialized_state,
+        "sessions_by_agent": {
+            agent.name: {
+                "agent_name": agent.name,
+                "session_state": serialized_state,
+            }
+        },
+    }
+    manager = SandboxRuntimeSessionManager(
+        starting_agent=agent,
+        sandbox_config=SandboxRunConfig(client=client, options={"image": "sandbox"}),
+        run_state=run_state,
+    )
+
+    manager.acquire_agent(agent)
+    with pytest.raises(ValueError, match="requires current trusted host_path"):
+        await manager.ensure_session(
+            agent=agent,
+            capabilities=[],
+            is_resumed_state=True,
+        )
+
+    assert client.resume_state is None
 
 
 @pytest.mark.asyncio
@@ -3104,7 +4104,7 @@ async def test_session_manager_adds_run_as_user_on_resume() -> None:
     run_as = User(name="sandbox-user")
     agent = SandboxAgent(
         name="worker",
-        model=FakeModel(),
+        model=ScriptedModel(),
         instructions="Worker.",
         run_as=run_as,
     )
@@ -3150,7 +4150,7 @@ async def test_session_manager_applies_capability_manifest_mutations_with_sessio
     source: str,
 ) -> None:
     capability = _ManifestMutationCapability()
-    agent = SandboxAgent(name="worker", model=FakeModel(), instructions="Worker.")
+    agent = SandboxAgent(name="worker", model=ScriptedModel(), instructions="Worker.")
     run_state: RunState[Any, Agent[Any]] | None = None
 
     if source == "live_session":
@@ -3202,7 +4202,7 @@ async def test_session_manager_applies_capability_manifest_mutations_with_sessio
 async def test_session_manager_starts_stopped_injected_session_with_manifest_mutation() -> None:
     live_session = _LiveSessionDeltaRecorder(Manifest())
     capability = _ManifestMutationCapability()
-    agent = SandboxAgent(name="worker", model=FakeModel(), instructions="Worker.")
+    agent = SandboxAgent(name="worker", model=ScriptedModel(), instructions="Worker.")
     manager = SandboxRuntimeSessionManager(
         starting_agent=agent,
         sandbox_config=SandboxRunConfig(session=live_session),
@@ -3227,11 +4227,250 @@ async def test_session_manager_starts_stopped_injected_session_with_manifest_mut
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("authority_source", ["current_manifest", "capability"])
+async def test_session_manager_rejects_unsafe_stopped_injected_session_manifest(
+    authority_source: str,
+) -> None:
+    unsafe_mount = S3Mount(
+        bucket="example-bucket",
+        access_key_id="example-access-key",
+        secret_access_key="example-secret-key",
+        mount_strategy=InContainerMountStrategy(pattern=RcloneMountPattern()),
+    )
+    initial_manifest = (
+        Manifest(entries={"remote": unsafe_mount})
+        if authority_source == "current_manifest"
+        else Manifest()
+    )
+    capabilities: list[Capability] = (
+        [_CredentialedMountCapability()] if authority_source == "capability" else []
+    )
+    live_session = _LiveSessionDeltaRecorder(initial_manifest)
+    agent = SandboxAgent(name="worker", model=ScriptedModel(), instructions="Worker.")
+    manager = SandboxRuntimeSessionManager(
+        starting_agent=agent,
+        sandbox_config=SandboxRunConfig(session=live_session),
+        run_state=None,
+    )
+
+    manager.acquire_agent(agent)
+    with pytest.raises(MountConfigError, match="mount-scoped credentials cannot be exposed"):
+        await manager.ensure_session(
+            agent=agent,
+            capabilities=capabilities,
+            is_resumed_state=False,
+        )
+
+    assert live_session.start_calls == 0
+    assert live_session.running_calls == 0
+    assert live_session.applied_entry_batches == []
+    if authority_source == "current_manifest":
+        assert live_session.state.manifest.entries == {"remote": unsafe_mount}
+    else:
+        assert live_session.state.manifest.entries == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("manifest_source", ["run_config", "agent_default"])
+async def test_session_manager_redacts_capability_failure_with_external_mount_authority(
+    manifest_source: str,
+) -> None:
+    sentinel = "manager-capability-secret"
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="example-bucket",
+                access_key_id="example-access-key",
+                secret_access_key=sentinel,
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            )
+        }
+    )
+    client = _FakeClient(_FakeSession(Manifest()))
+    agent = SandboxAgent(
+        name="worker",
+        model=ScriptedModel(),
+        instructions="Worker.",
+        default_manifest=manifest if manifest_source == "agent_default" else None,
+    )
+    manager = SandboxRuntimeSessionManager(
+        starting_agent=agent,
+        sandbox_config=SandboxRunConfig(
+            client=client,
+            manifest=manifest if manifest_source == "run_config" else None,
+            options={"image": "sandbox"},
+        ),
+        run_state=None,
+    )
+
+    manager.acquire_agent(agent)
+    with pytest.raises(RuntimeError, match="protected mount configuration") as exc:
+        await manager.ensure_session(
+            agent=agent,
+            capabilities=[_ManifestFailureCapability()],
+            is_resumed_state=False,
+        )
+
+    assert client.create_kwargs is None
+    assert sentinel not in str(exc.value)
+    traceback = exc.value.__traceback__
+    while traceback is not None:
+        frame_path = Path(traceback.tb_frame.f_code.co_filename).as_posix()
+        if "/src/agents/" in frame_path:
+            assert sentinel not in repr(traceback.tb_frame.f_locals)
+        traceback = traceback.tb_next
+
+
+@pytest.mark.asyncio
+async def test_session_manager_redacts_authority_added_before_capability_failure() -> None:
+    sentinel = "capability-added-mount-secret"
+    client = _FakeClient(_FakeSession(Manifest()))
+    agent = SandboxAgent(name="worker", model=ScriptedModel(), instructions="Worker.")
+    manager = SandboxRuntimeSessionManager(
+        starting_agent=agent,
+        sandbox_config=SandboxRunConfig(
+            client=client,
+            manifest=Manifest(),
+            options={"image": "sandbox"},
+        ),
+        run_state=None,
+    )
+
+    manager.acquire_agent(agent)
+    with pytest.raises(RuntimeError, match="protected mount configuration") as exc:
+        await manager.ensure_session(
+            agent=agent,
+            capabilities=[_ManifestMutationFailureCapability(sentinel)],
+            is_resumed_state=False,
+        )
+
+    assert client.create_kwargs is None
+    assert sentinel not in str(exc.value)
+    assert exc.value.__cause__ is None
+    assert exc.value.__context__ is None
+    traceback = exc.value.__traceback__
+    while traceback is not None:
+        frame_path = Path(traceback.tb_frame.f_code.co_filename).as_posix()
+        if "/src/agents/" in frame_path:
+            assert sentinel not in repr(traceback.tb_frame.f_locals)
+        traceback = traceback.tb_next
+
+
+@pytest.mark.parametrize(
+    ("authority_timing", "error_kind", "expected_type", "expected_args"),
+    [
+        ("existing", "system_exit", SystemExit, (1,)),
+        ("added", "keyboard_interrupt", KeyboardInterrupt, ()),
+    ],
+)
+def test_process_manifest_preserves_value_free_process_control_with_authority(
+    authority_timing: str,
+    error_kind: str,
+    expected_type: type[BaseException],
+    expected_args: tuple[object, ...],
+) -> None:
+    sentinel = f"process-manifest-{authority_timing}-{error_kind}-secret"
+    source_error: BaseException = (
+        SystemExit(sentinel) if error_kind == "system_exit" else KeyboardInterrupt(sentinel)
+    )
+
+    class ProcessControlCapability(Capability):
+        type: str = "process-control"
+
+        def process_manifest(self, manifest: Manifest) -> Manifest:
+            if authority_timing == "added":
+                manifest.entries["data"] = S3Mount(
+                    bucket="example-bucket",
+                    access_key_id="example-access-key",
+                    secret_access_key=sentinel,
+                    mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+                )
+            raise source_error
+
+    manifest = Manifest()
+    if authority_timing == "existing":
+        manifest.entries["data"] = S3Mount(
+            bucket="example-bucket",
+            access_key_id="example-access-key",
+            secret_access_key=sentinel,
+            mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+        )
+
+    with pytest.raises(expected_type) as exc_info:
+        SandboxRuntimeSessionManager._process_manifest(
+            [ProcessControlCapability()],
+            manifest,
+        )
+
+    assert type(exc_info.value) is expected_type
+    assert exc_info.value.args == expected_args
+    assert exc_info.value is not source_error
+    assert source_error.args == ()
+    assert source_error.__traceback__ is None
+    assert sentinel not in repr(exc_info.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "processed_grants",
+    [
+        (
+            SandboxPathGrant(
+                path="/mnt/shared-data",
+                host_path="/native/new",
+                read_only=True,
+            ),
+        ),
+        (
+            SandboxPathGrant(path="/mnt/shared-data"),
+            SandboxPathGrant(
+                path="/mnt/shared-data",
+                host_path="/native/old",
+                read_only=True,
+            ),
+        ),
+    ],
+    ids=["changed-host-source", "mixed-duplicate-target"],
+)
+async def test_session_manager_rejects_stopped_injected_session_host_mount_changes(
+    processed_grants: tuple[SandboxPathGrant, ...],
+) -> None:
+    current_grants = (
+        SandboxPathGrant(
+            path="/mnt/shared-data",
+            host_path="/native/old",
+            read_only=True,
+        ),
+    )
+    live_session = _LiveSessionDeltaRecorder(
+        Manifest(extra_path_grants=current_grants),
+    )
+    capability = _ManifestPathGrantsCapability(processed_grants)
+    agent = SandboxAgent(name="worker", model=ScriptedModel(), instructions="Worker.")
+    manager = SandboxRuntimeSessionManager(
+        starting_agent=agent,
+        sandbox_config=SandboxRunConfig(session=live_session),
+        run_state=None,
+    )
+
+    manager.acquire_agent(agent)
+    with pytest.raises(ValueError, match="host-backed `manifest.extra_path_grants`"):
+        await manager.ensure_session(
+            agent=agent,
+            capabilities=[capability],
+            is_resumed_state=False,
+        )
+
+    assert live_session.start_calls == 0
+    assert live_session.state.manifest.extra_path_grants == current_grants
+
+
+@pytest.mark.asyncio
 async def test_session_manager_materializes_running_injected_session_manifest_mutation() -> None:
     live_session = _LiveSessionDeltaRecorder(Manifest())
     live_session._running = True
     capability = _ManifestMutationCapability()
-    agent = SandboxAgent(name="worker", model=FakeModel(), instructions="Worker.")
+    agent = SandboxAgent(name="worker", model=ScriptedModel(), instructions="Worker.")
     manager = SandboxRuntimeSessionManager(
         starting_agent=agent,
         sandbox_config=SandboxRunConfig(session=live_session),
@@ -3259,11 +4498,36 @@ async def test_session_manager_materializes_running_injected_session_manifest_mu
 
 
 @pytest.mark.asyncio
+async def test_session_manager_validates_running_manifest_update_before_materialization() -> None:
+    inner = _RejectingLiveSessionDeltaRecorder(Manifest())
+    inner._running = True
+    live_session = SandboxSession(inner)
+    capability = _ManifestMutationCapability()
+    agent = SandboxAgent(name="worker", model=ScriptedModel(), instructions="Worker.")
+    manager = SandboxRuntimeSessionManager(
+        starting_agent=agent,
+        sandbox_config=SandboxRunConfig(session=live_session),
+        run_state=None,
+    )
+
+    manager.acquire_agent(agent)
+    with pytest.raises(RuntimeError, match="live manifest update rejected"):
+        await manager.ensure_session(
+            agent=agent,
+            capabilities=[capability],
+            is_resumed_state=False,
+        )
+
+    assert inner.applied_entry_batches == []
+    assert live_session.state.manifest.entries == {}
+
+
+@pytest.mark.asyncio
 async def test_session_manager_retries_running_injected_session_delta_apply_after_failure() -> None:
     live_session = _LiveSessionDeltaRecorder(Manifest(), fail_entry_batch_times=1)
     live_session._running = True
     capability = _ManifestMutationCapability()
-    agent = SandboxAgent(name="worker", model=FakeModel(), instructions="Worker.")
+    agent = SandboxAgent(name="worker", model=ScriptedModel(), instructions="Worker.")
     manager = SandboxRuntimeSessionManager(
         starting_agent=agent,
         sandbox_config=SandboxRunConfig(session=live_session),
@@ -3303,7 +4567,7 @@ async def test_session_manager_retries_running_injected_session_delta_apply_afte
 async def test_session_manager_skips_rematerialization_for_unchanged_running_session() -> None:
     live_session = _LiveSessionDeltaRecorder(Manifest())
     live_session._running = True
-    agent = SandboxAgent(name="worker", model=FakeModel(), instructions="Worker.")
+    agent = SandboxAgent(name="worker", model=ScriptedModel(), instructions="Worker.")
     manager = SandboxRuntimeSessionManager(
         starting_agent=agent,
         sandbox_config=SandboxRunConfig(session=live_session),
@@ -3332,7 +4596,7 @@ async def test_session_manager_skips_rematerialization_for_unchanged_running_ses
 async def test_session_manager_rejects_running_injected_session_account_mutation() -> None:
     live_session = _LiveSessionDeltaRecorder(Manifest())
     live_session._running = True
-    agent = SandboxAgent(name="worker", model=FakeModel(), instructions="Worker.")
+    agent = SandboxAgent(name="worker", model=ScriptedModel(), instructions="Worker.")
     manager = SandboxRuntimeSessionManager(
         starting_agent=agent,
         sandbox_config=SandboxRunConfig(session=live_session),
@@ -3355,7 +4619,7 @@ async def test_session_manager_rejects_running_injected_session_account_mutation
 @pytest.mark.asyncio
 async def test_session_manager_preserves_existing_payload_when_no_sandbox_session_is_used() -> None:
     client = _FakeClient(_FakeSession(Manifest()))
-    agent = SandboxAgent(name="sandbox", model=FakeModel(), instructions="Base instructions.")
+    agent = SandboxAgent(name="sandbox", model=ScriptedModel(), instructions="Base instructions.")
     run_state: RunState[Any, Agent[Any]] = cast(
         RunState[Any, Agent[Any]],
         RunState(
@@ -3391,7 +4655,7 @@ async def test_session_manager_preserves_existing_payload_when_no_sandbox_sessio
 
 @pytest.mark.asyncio
 async def test_session_manager_omits_existing_payload_for_injected_live_session() -> None:
-    agent = SandboxAgent(name="sandbox", model=FakeModel(), instructions="Base instructions.")
+    agent = SandboxAgent(name="sandbox", model=ScriptedModel(), instructions="Base instructions.")
     live_session = _FakeSession(Manifest())
     run_state: RunState[Any, Agent[Any]] = cast(
         RunState[Any, Agent[Any]],
@@ -3432,9 +4696,9 @@ async def test_session_manager_omits_existing_payload_for_injected_live_session(
 async def test_session_manager_uses_run_state_starting_agent_for_duplicate_resume_keys() -> None:
     manifest = Manifest(entries={"README.md": File(content=b"duplicate resume")})
     client = _FakeClient(_FakeSession(manifest))
-    first = SandboxAgent(name="sandbox", model=FakeModel(), instructions="First.")
-    second = SandboxAgent(name="sandbox", model=FakeModel(), instructions="Second.")
-    approver = Agent(name="approver", model=FakeModel(), instructions="Approve.", handoffs=[])
+    first = SandboxAgent(name="sandbox", model=ScriptedModel(), instructions="First.")
+    second = SandboxAgent(name="sandbox", model=ScriptedModel(), instructions="Second.")
+    approver = Agent(name="approver", model=ScriptedModel(), instructions="Approve.", handoffs=[])
     approver.handoffs = [second, first]
     first.handoffs = [second]
     second.handoffs = [approver]
@@ -3487,7 +4751,7 @@ async def test_session_manager_restores_duplicate_name_sessions_when_only_sandbo
     def _make_agent(readme: bytes, capability_text: str) -> SandboxAgent[None]:
         return SandboxAgent(
             name="sandbox",
-            model=FakeModel(),
+            model=ScriptedModel(),
             instructions="Base instructions.",
             default_manifest=Manifest(entries={"README.md": File(content=readme)}),
             capabilities=[_RecordingCapability(instruction_text=capability_text)],
@@ -3560,6 +4824,7 @@ async def test_session_manager_restores_duplicate_name_sessions_when_only_sandbo
 
 
 @pytest.mark.asyncio
+@pytest.mark.requires_native_macos_sandbox
 async def test_runner_restores_duplicate_name_sandbox_sessions_after_json_roundtrip() -> None:
     client = UnixLocalSandboxClient()
     file_capability = _SessionFileCapability()
@@ -3568,8 +4833,8 @@ async def test_runner_restores_duplicate_name_sandbox_sessions_after_json_roundt
     def approval_tool() -> str:
         return "approved"
 
-    first_model = FakeModel()
-    second_model = FakeModel()
+    first_model = ScriptedModel()
+    second_model = ScriptedModel()
     first = SandboxAgent(
         name="sandbox",
         model=first_model,
@@ -3584,7 +4849,7 @@ async def test_runner_restores_duplicate_name_sandbox_sessions_after_json_roundt
     )
     first.handoffs = [second]
     second.handoffs = [first]
-    first_model.add_multiple_turn_outputs(
+    first_model.extend(
         [
             [
                 get_function_tool_call(
@@ -3593,10 +4858,10 @@ async def test_runner_restores_duplicate_name_sandbox_sessions_after_json_roundt
                     call_id="call_write",
                 )
             ],
-            [get_handoff_tool_call(second)],
+            [get_handoff_tool_call(second, call_id="handoff_to_second")],
         ]
     )
-    second_model.add_multiple_turn_outputs(
+    second_model.extend(
         [[get_function_tool_call("approval_tool", json.dumps({}), call_id="call_approval")]]
     )
 
@@ -3609,8 +4874,8 @@ async def test_runner_restores_duplicate_name_sandbox_sessions_after_json_roundt
     state = first_run.to_state()
     state_json = state.to_json()
 
-    resumed_first_model = FakeModel()
-    resumed_second_model = FakeModel()
+    resumed_first_model = ScriptedModel()
+    resumed_second_model = ScriptedModel()
     resumed_first = SandboxAgent(
         name="sandbox",
         model=resumed_first_model,
@@ -3625,8 +4890,10 @@ async def test_runner_restores_duplicate_name_sandbox_sessions_after_json_roundt
     )
     resumed_first.handoffs = [resumed_second]
     resumed_second.handoffs = [resumed_first]
-    resumed_second_model.add_multiple_turn_outputs([[get_handoff_tool_call(resumed_first)]])
-    resumed_first_model.add_multiple_turn_outputs(
+    resumed_second_model.extend(
+        [[get_handoff_tool_call(resumed_first, call_id="handoff_to_first")]]
+    )
+    resumed_first_model.extend(
         [
             [
                 get_function_tool_call(
@@ -3657,6 +4924,7 @@ async def test_runner_restores_duplicate_name_sandbox_sessions_after_json_roundt
 
 
 @pytest.mark.asyncio
+@pytest.mark.requires_native_macos_sandbox
 async def test_runner_restores_legacy_current_sandbox_payload_after_json_roundtrip() -> None:
     client = UnixLocalSandboxClient()
 
@@ -3664,8 +4932,8 @@ async def test_runner_restores_legacy_current_sandbox_payload_after_json_roundtr
     def approval_tool() -> str:
         return "approved"
 
-    initial_model = FakeModel()
-    initial_model.add_multiple_turn_outputs(
+    initial_model = ScriptedModel()
+    initial_model.extend(
         [
             [
                 get_function_tool_call(
@@ -3698,8 +4966,8 @@ async def test_runner_restores_legacy_current_sandbox_payload_after_json_roundtr
         "sessions_by_agent": {str(id(agent)): session_state},
     }
 
-    resumed_model = FakeModel()
-    resumed_model.add_multiple_turn_outputs(
+    resumed_model = ScriptedModel()
+    resumed_model.extend(
         [
             [
                 get_function_tool_call(
@@ -3735,6 +5003,7 @@ async def test_runner_restores_legacy_current_sandbox_payload_after_json_roundtr
 
 
 @pytest.mark.asyncio
+@pytest.mark.requires_native_macos_sandbox
 @pytest.mark.skipif(
     sys.platform != "darwin" or shutil.which("sandbox-exec") is None,
     reason="sandbox-exec is only available on macOS when installed",
@@ -3919,6 +5188,115 @@ def test_unix_local_confined_exec_command_allows_common_darwin_interpreter_roots
     assert '(allow file-write* (subpath "/opt/homebrew"))' not in profile
 
 
+def test_unix_local_confined_exec_command_allows_python_virtual_environment_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    host_project_root = tmp_path / "host-project"
+    virtual_env_root = host_project_root / ".venv"
+    virtual_env_bin = virtual_env_root / "bin"
+    virtual_env_bin.mkdir(parents=True)
+    (virtual_env_root / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+    python_executable = virtual_env_bin / "python"
+    python_executable.write_text("", encoding="utf-8")
+    session = UnixLocalSandboxSession.from_state(
+        UnixLocalSandboxSessionState(
+            session_id=uuid.uuid4(),
+            manifest=_unix_local_manifest(root=str(workspace_root)),
+            snapshot=NoopSnapshot(id="darwin-virtual-environment"),
+            workspace_root_owned=False,
+        )
+    )
+    unix_local = cast(Any, unix_local_module)
+    path_env = str(virtual_env_bin)
+
+    def _fake_which(name: str, path: str | None = None) -> str | None:
+        if name == "sandbox-exec":
+            return "/usr/bin/sandbox-exec"
+        if name == "python":
+            assert path == path_env
+            return str(python_executable)
+        return None
+
+    monkeypatch.setattr(unix_local.sys, "platform", "darwin")
+    monkeypatch.setattr(unix_local.shutil, "which", _fake_which)
+    monkeypatch.setenv("PATH", path_env)
+
+    command = session._confined_exec_command(
+        command_parts=["python", "-V"],
+        workspace_root=workspace_root,
+        env={"PATH": path_env},
+    )
+    profile_lines = set(command[2].splitlines())
+
+    assert (
+        f'(allow file-read-data file-read-metadata (subpath "{virtual_env_root}"))' in profile_lines
+    )
+    assert (
+        f'(allow file-read-data file-read-metadata (subpath "{host_project_root}"))'
+        not in profile_lines
+    )
+    assert f'(allow file-write* (subpath "{virtual_env_root}"))' not in profile_lines
+
+
+def test_unix_local_confined_exec_command_does_not_expand_manifest_virtual_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    host_project_root = tmp_path / "host-project"
+    virtual_env_root = host_project_root / ".venv"
+    virtual_env_bin = virtual_env_root / "bin"
+    virtual_env_bin.mkdir(parents=True)
+    (virtual_env_root / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+    python_executable = virtual_env_bin / "python"
+    python_executable.write_text("", encoding="utf-8")
+    session = UnixLocalSandboxSession.from_state(
+        UnixLocalSandboxSessionState(
+            session_id=uuid.uuid4(),
+            manifest=_unix_local_manifest(root=str(workspace_root)),
+            snapshot=NoopSnapshot(id="darwin-manifest-virtual-environment"),
+            workspace_root_owned=False,
+        )
+    )
+    unix_local = cast(Any, unix_local_module)
+    manifest_path = str(virtual_env_bin)
+
+    def _fake_which(name: str, path: str | None = None) -> str | None:
+        if name == "sandbox-exec":
+            return "/usr/bin/sandbox-exec"
+        if name == "python":
+            assert path == manifest_path
+            return str(python_executable)
+        return None
+
+    monkeypatch.setattr(unix_local.sys, "platform", "darwin")
+    monkeypatch.setattr(unix_local.shutil, "which", _fake_which)
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+    command = session._confined_exec_command(
+        command_parts=["python", "-V"],
+        workspace_root=workspace_root,
+        env={"PATH": manifest_path},
+    )
+    profile_lines = set(command[2].splitlines())
+
+    assert (
+        f'(allow file-read-data file-read-metadata (subpath "{virtual_env_bin}"))' in profile_lines
+    )
+    assert (
+        f'(allow file-read-data file-read-metadata (subpath "{virtual_env_root}"))'
+        not in profile_lines
+    )
+    assert (
+        f'(allow file-read-data file-read-metadata (subpath "{host_project_root}"))'
+        not in profile_lines
+    )
+
+
 def test_unix_local_darwin_exec_profile_allows_extra_path_grants(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspace"
     read_write_root = tmp_path / "read-write"
@@ -4029,7 +5407,7 @@ async def test_sandbox_run_persists_only_new_session_input_items() -> None:
             }
         ]
     )
-    model = FakeModel(initial_output=[get_final_output_message("done")])
+    model = ScriptedModel(steps=[[get_final_output_message("done")]])
     agent = SandboxAgent(
         name="sandbox",
         model=model,
@@ -4057,8 +5435,8 @@ async def test_sandbox_run_persists_only_new_session_input_items() -> None:
 
 @pytest.mark.asyncio
 async def test_runner_streamed_emits_public_agent_for_tool_and_reasoning_events() -> None:
-    model = FakeModel()
-    model.add_multiple_turn_outputs(
+    model = ScriptedModel()
+    model.extend(
         [
             [
                 _get_reasoning_item(),
@@ -4113,7 +5491,7 @@ def test_capability_clone_deep_copies_nested_object_state() -> None:
 
 def test_capability_clone_preserves_session_field_identity() -> None:
     capability = Shell()
-    session = _FakeSession(Manifest())
+    session = scripted_sandbox_session()
     capability.bind(session)
 
     cloned = capability.clone()
@@ -4122,6 +5500,43 @@ def test_capability_clone_preserves_session_field_identity() -> None:
     assert cloned.session is session
     assert capability.model_dump() == {"type": "shell"}
     assert cloned.model_dump() == {"type": "shell"}
+
+
+@pytest.mark.asyncio
+async def test_capability_clone_preserves_function_tool_invoker_owner() -> None:
+    original_tool = _StatefulFunctionTool("original")
+    capability = _ToolStateCapability(tool=original_tool)
+
+    cloned = cast(_ToolStateCapability, capability.clone())
+    cloned_tool = cast(_StatefulFunctionTool, cloned.tool)
+    cloned_tool.state = "cloned"
+
+    assert cloned_tool is not original_tool
+    assert getattr(cloned_tool.on_invoke_tool, "__self__", None) is cloned_tool
+    assert (
+        await cloned_tool.on_invoke_tool(
+            ToolContext(
+                None,
+                tool_name=cloned_tool.name,
+                tool_call_id="1",
+                tool_arguments="{}",
+            ),
+            "{}",
+        )
+        == "cloned"
+    )
+    assert (
+        await original_tool.on_invoke_tool(
+            ToolContext(
+                None,
+                tool_name=original_tool.name,
+                tool_call_id="2",
+                tool_arguments="{}",
+            ),
+            "{}",
+        )
+        == "original"
+    )
 
 
 @pytest.mark.asyncio
@@ -4139,6 +5554,135 @@ async def test_apply_manifest_raises_on_account_provisioning_failures() -> None:
     assert exc_info.value.context["stdout"] == "attempted useradd"
     assert exc_info.value.context["stderr"] == "missing useradd"
     assert exc_info.value.message == "stdout: attempted useradd\nstderr: missing useradd"
+
+
+@pytest.mark.asyncio
+async def test_apply_manifest_rejects_mount_authority_before_materialization() -> None:
+    sentinel = "live-apply-secret"
+    session = _ManifestApplyProbeSession(
+        Manifest(
+            entries={
+                "data": S3Mount(
+                    bucket="example-bucket",
+                    access_key_id="example-access-key",
+                    secret_access_key=sentinel,
+                    mount_strategy=InContainerMountStrategy(pattern=RcloneMountPattern()),
+                )
+            }
+        )
+    )
+
+    with pytest.raises(MountConfigError, match="mount-scoped credentials cannot be exposed") as exc:
+        await session.apply_manifest()
+
+    assert session.materialize_calls == 0
+    traceback = exc.value.__traceback__
+    while traceback is not None:
+        module_name = traceback.tb_frame.f_globals.get("__name__", "")
+        if isinstance(module_name, str) and module_name.startswith("agents."):
+            assert sentinel not in repr(traceback.tb_frame.f_locals)
+        traceback = traceback.tb_next
+
+
+@pytest.mark.asyncio
+async def test_start_workspace_rejects_mount_authority_before_materialization() -> None:
+    session = _ManifestApplyProbeSession(
+        Manifest(
+            entries={
+                "data": S3Mount(
+                    bucket="example-bucket",
+                    access_key_id="example-access-key",
+                    secret_access_key="start-workspace-secret",
+                    mount_strategy=InContainerMountStrategy(pattern=RcloneMountPattern()),
+                )
+            }
+        )
+    )
+
+    with pytest.raises(MountConfigError, match="mount-scoped credentials cannot be exposed"):
+        await BaseSandboxSession.start(session)
+
+    assert session.materialize_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_session_start_redacts_external_mount_operation_failure() -> None:
+    sentinel = "protected-start-secret"
+    session = _FailingBackendStartSession(
+        Manifest(
+            entries={
+                "data": S3Mount(
+                    bucket="example-bucket",
+                    access_key_id="example-access-key",
+                    secret_access_key=sentinel,
+                    mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+                )
+            }
+        )
+    )
+    cast(Any, session.state).type = "docker"
+
+    with pytest.raises(RuntimeError, match="protected mount configuration") as exc:
+        await BaseSandboxSession.start(session)
+
+    assert sentinel not in str(exc.value)
+    traceback = exc.value.__traceback__
+    while traceback is not None:
+        frame_path = Path(traceback.tb_frame.f_code.co_filename).as_posix()
+        if "/src/agents/" in frame_path:
+            assert sentinel not in repr(traceback.tb_frame.f_locals)
+        traceback = traceback.tb_next
+
+
+@pytest.mark.asyncio
+async def test_session_stop_redacts_external_mount_snapshot_failure() -> None:
+    sentinel = "protected-stop-secret"
+    session = _FailingSnapshotSession(
+        Manifest(
+            entries={
+                "data": S3Mount(
+                    bucket="example-bucket",
+                    access_key_id="example-access-key",
+                    secret_access_key=sentinel,
+                    mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+                )
+            }
+        )
+    )
+    cast(Any, session.state).type = "docker"
+
+    with pytest.raises(RuntimeError, match="protected mount configuration") as exc:
+        await BaseSandboxSession.stop(session)
+
+    assert session.persist_calls == 1
+    assert sentinel not in str(exc.value)
+    traceback = exc.value.__traceback__
+    while traceback is not None:
+        frame_path = Path(traceback.tb_frame.f_code.co_filename).as_posix()
+        if "/src/agents/" in frame_path:
+            assert sentinel not in repr(traceback.tb_frame.f_locals)
+        traceback = traceback.tb_next
+
+
+@pytest.mark.asyncio
+async def test_session_stop_rejects_mutated_unsafe_mount_before_snapshot_work() -> None:
+    session = _FailingSnapshotSession(
+        Manifest(
+            entries={
+                "data": S3Mount(
+                    bucket="example-bucket",
+                    access_key_id="example-access-key",
+                    secret_access_key="mutated-stop-secret",
+                    mount_strategy=InContainerMountStrategy(pattern=RcloneMountPattern()),
+                )
+            }
+        )
+    )
+
+    with pytest.raises(MountConfigError, match="mount-scoped credentials cannot be exposed"):
+        await BaseSandboxSession.stop(session)
+
+    assert session.persist_calls == 0
 
 
 @pytest.mark.asyncio
@@ -4330,7 +5874,7 @@ async def test_prepare_agent_rechecks_session_liveness_before_reusing_cached_age
     client = _FakeClient(session)
     agent = SandboxAgent(
         name="sandbox",
-        model=FakeModel(initial_output=[get_final_output_message("done")]),
+        model=ScriptedModel(steps=[[get_final_output_message("done")]]),
         instructions="Base instructions.",
     )
     runtime = SandboxRuntime(
@@ -4362,13 +5906,199 @@ async def test_prepare_agent_rechecks_session_liveness_before_reusing_cached_age
 
 
 @pytest.mark.asyncio
+async def test_prepare_agent_revalidates_cwd_after_restarting_cached_session() -> None:
+    session = _CwdProbeSession(Manifest())
+    client = _FakeClient(session)
+    agent = SandboxAgent(
+        name="sandbox",
+        model=ScriptedModel(steps=[[get_final_output_message("done")]]),
+        run_as="sandbox-user",
+    )
+    runtime = SandboxRuntime(
+        starting_agent=agent,
+        run_config=RunConfig(
+            sandbox=SandboxRunConfig(
+                client=client,
+                options={"image": "sandbox"},
+                cwd="tasks/a",
+            )
+        ),
+        run_state=None,
+    )
+    context_wrapper = RunContextWrapper(context=None)
+
+    await runtime.prepare_agent(
+        current_agent=agent,
+        current_input="hello",
+        context_wrapper=context_wrapper,
+        is_resumed_state=False,
+    )
+    session._running = False
+    session.accessible = False
+
+    with pytest.raises(
+        UserError,
+        match=r"Sandbox working directory `tasks/a` does not exist or is not accessible",
+    ):
+        await runtime.prepare_agent(
+            current_agent=agent,
+            current_input="hello again",
+            context_wrapper=context_wrapper,
+            is_resumed_state=False,
+        )
+
+    assert session.start_calls == 2
+    assert session.cwd_probe_calls == [
+        (("test", "-d", "/workspace/tasks/a"), False, User(name="sandbox-user")),
+        (("test", "-x", "/workspace/tasks/a"), False, User(name="sandbox-user")),
+        (("test", "-d", "/workspace/tasks/a"), False, User(name="sandbox-user")),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_prepare_agent_revalidates_cwd_when_cached_agent_run_as_changes() -> None:
+    session = _CwdProbeSession(Manifest())
+    client = _FakeClient(session)
+    agent = SandboxAgent(
+        name="sandbox",
+        model=ScriptedModel(steps=[[get_final_output_message("done")]]),
+        run_as="first-user",
+    )
+    runtime = SandboxRuntime(
+        starting_agent=agent,
+        run_config=RunConfig(
+            sandbox=SandboxRunConfig(
+                client=client,
+                options={"image": "sandbox"},
+                cwd="tasks/a",
+            )
+        ),
+        run_state=None,
+    )
+    context_wrapper = RunContextWrapper(context=None)
+
+    await runtime.prepare_agent(
+        current_agent=agent,
+        current_input="hello",
+        context_wrapper=context_wrapper,
+        is_resumed_state=False,
+    )
+    agent.run_as = "second-user"
+    session.accessible = False
+    session.cwd_probe_calls.clear()
+
+    with pytest.raises(
+        UserError,
+        match=r"Sandbox working directory `tasks/a` does not exist or is not accessible",
+    ):
+        await runtime.prepare_agent(
+            current_agent=agent,
+            current_input="hello again",
+            context_wrapper=context_wrapper,
+            is_resumed_state=False,
+        )
+
+    assert session.cwd_probe_calls == [
+        (
+            ("test", "-d", "/workspace/tasks/a"),
+            False,
+            User(name="second-user"),
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_prepare_agent_rematerializes_cached_tools_when_run_as_changes() -> None:
+    session = _CwdProbeSession(Manifest())
+    client = _FakeClient(session)
+    run_as = User(name="first-user")
+    agent = SandboxAgent(
+        name="sandbox",
+        model=ScriptedModel(steps=[[get_final_output_message("done")]]),
+        capabilities=[Shell(), Filesystem()],
+        run_as=run_as,
+    )
+    runtime = SandboxRuntime(
+        starting_agent=agent,
+        run_config=RunConfig(
+            sandbox=SandboxRunConfig(
+                client=client,
+                options={"image": "sandbox"},
+                cwd="tasks/a",
+            )
+        ),
+        run_state=None,
+    )
+    context_wrapper = RunContextWrapper(context=None)
+
+    first = await runtime.prepare_agent(
+        current_agent=agent,
+        current_input="first",
+        context_wrapper=context_wrapper,
+        is_resumed_state=False,
+    )
+    first_agent = cast(SandboxAgent[Any], first.bindings.execution_agent)
+    first_capabilities = list(first_agent.capabilities)
+    first_shell = next(tool for tool in first_agent.tools if isinstance(tool, ExecCommandTool))
+    first_view = next(tool for tool in first_agent.tools if isinstance(tool, ViewImageTool))
+    first_patch = next(
+        tool for tool in first_agent.tools if isinstance(tool, SandboxApplyPatchTool)
+    )
+    assert first_shell.user == User(name="first-user")
+    assert first_view.user == User(name="first-user")
+    assert first_patch.editor.user == User(name="first-user")
+
+    run_as.name = "second-user"
+    second = await runtime.prepare_agent(
+        current_agent=agent,
+        current_input="second",
+        context_wrapper=context_wrapper,
+        is_resumed_state=False,
+    )
+    second_agent = cast(SandboxAgent[Any], second.bindings.execution_agent)
+
+    assert second_agent is not first_agent
+    assert all(
+        second_capability is first_capability
+        for second_capability, first_capability in zip(
+            second_agent.capabilities,
+            first_capabilities,
+            strict=True,
+        )
+    )
+    second_shell = next(tool for tool in second_agent.tools if isinstance(tool, ExecCommandTool))
+    second_view = next(tool for tool in second_agent.tools if isinstance(tool, ViewImageTool))
+    second_patch = next(
+        tool for tool in second_agent.tools if isinstance(tool, SandboxApplyPatchTool)
+    )
+    assert second_shell.user == User(name="second-user")
+    assert second_view.user == User(name="second-user")
+    assert second_patch.editor.user == User(name="second-user")
+
+    third = await runtime.prepare_agent(
+        current_agent=agent,
+        current_input="third",
+        context_wrapper=context_wrapper,
+        is_resumed_state=False,
+    )
+
+    assert third.bindings.execution_agent is second_agent
+    assert session.cwd_probe_calls[-4:] == [
+        (("test", "-d", "/workspace/tasks/a"), False, User(name="second-user")),
+        (("test", "-x", "/workspace/tasks/a"), False, User(name="second-user")),
+        (("test", "-d", "/workspace/tasks/a"), False, User(name="second-user")),
+        (("test", "-x", "/workspace/tasks/a"), False, User(name="second-user")),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_prepare_agent_binds_run_as_to_cloned_capabilities() -> None:
     session = _FakeSession(Manifest())
     client = _FakeClient(session)
     capability = _RecordingCapability()
     agent = SandboxAgent(
         name="sandbox",
-        model=FakeModel(initial_output=[get_final_output_message("done")]),
+        model=ScriptedModel(steps=[[get_final_output_message("done")]]),
         capabilities=[capability],
         run_as="sandbox-user",
     )
@@ -4393,12 +6123,114 @@ async def test_prepare_agent_binds_run_as_to_cloned_capabilities() -> None:
 
 
 @pytest.mark.asyncio
+async def test_prepare_agent_binds_and_validates_run_workspace_scope() -> None:
+    session = _CwdProbeSession(Manifest())
+    client = _FakeClient(session)
+    capability = _RecordingCapability()
+    agent = SandboxAgent(
+        name="sandbox",
+        model=ScriptedModel(steps=[[get_final_output_message("done")]]),
+        capabilities=[capability],
+        run_as="sandbox-user",
+    )
+    runtime = SandboxRuntime(
+        starting_agent=agent,
+        run_config=RunConfig(
+            sandbox=SandboxRunConfig(
+                client=client,
+                options={"image": "sandbox"},
+                cwd="tasks/a",
+            )
+        ),
+        run_state=None,
+    )
+
+    prepared = await runtime.prepare_agent(
+        current_agent=agent,
+        current_input="hello",
+        context_wrapper=RunContextWrapper(context=None),
+        is_resumed_state=False,
+    )
+
+    execution_agent = cast(SandboxAgent[Any], prepared.bindings.execution_agent)
+    prepared_capability = cast(_RecordingCapability, execution_agent.capabilities[0])
+    assert capability.workspace_scope.cwd is None
+    assert prepared_capability.workspace_scope.cwd == PurePosixPath("tasks/a")
+    assert session.cwd_probe_calls == [
+        (("test", "-d", "/workspace/tasks/a"), False, User(name="sandbox-user")),
+        (("test", "-x", "/workspace/tasks/a"), False, User(name="sandbox-user")),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_prepare_agent_serializes_cwd_probe_with_posix_sandbox_semantics() -> None:
+    session = _WindowsPathCwdProbeSession(Manifest())
+    client = _FakeClient(session)
+    agent = SandboxAgent(name="sandbox", model=ScriptedModel())
+    runtime = SandboxRuntime(
+        starting_agent=agent,
+        run_config=RunConfig(
+            sandbox=SandboxRunConfig(
+                client=client,
+                options={"image": "sandbox"},
+                cwd="tasks/a",
+            )
+        ),
+        run_state=None,
+    )
+    await runtime.prepare_agent(
+        current_agent=agent,
+        current_input="hello",
+        context_wrapper=RunContextWrapper(context=None),
+        is_resumed_state=False,
+    )
+
+    assert session.cwd_probe_calls == [
+        (("test", "-d", "/workspace/tasks/a"), False, None),
+        (("test", "-x", "/workspace/tasks/a"), False, None),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_prepare_agent_rejects_inaccessible_run_workspace_scope() -> None:
+    session = _CwdProbeSession(Manifest(), accessible=False)
+    client = _FakeClient(session)
+    agent = SandboxAgent(name="sandbox", model=ScriptedModel())
+    runtime = SandboxRuntime(
+        starting_agent=agent,
+        run_config=RunConfig(
+            sandbox=SandboxRunConfig(
+                client=client,
+                options={"image": "sandbox"},
+                cwd="tasks/missing",
+            )
+        ),
+        run_state=None,
+    )
+
+    with pytest.raises(
+        UserError,
+        match=r"Sandbox working directory `tasks/missing` does not exist or is not accessible",
+    ):
+        await runtime.prepare_agent(
+            current_agent=agent,
+            current_input="hello",
+            context_wrapper=RunContextWrapper(context=None),
+            is_resumed_state=False,
+        )
+
+    assert session.cwd_probe_calls == [
+        (("test", "-d", "/workspace/tasks/missing"), False, None),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_prepare_agent_processes_context_with_bound_cached_capabilities() -> None:
     session = _FakeSession(Manifest())
     client = _FakeClient(session)
     agent = SandboxAgent(
         name="sandbox",
-        model=FakeModel(initial_output=[get_final_output_message("done")]),
+        model=ScriptedModel(steps=[[get_final_output_message("done")]]),
         capabilities=[_ProcessContextSessionCapability()],
     )
     runtime = SandboxRuntime(
@@ -4441,7 +6273,7 @@ async def test_prepare_agent_starts_new_live_session_even_when_backend_reports_r
     client = _FakeClient(session)
     agent = SandboxAgent(
         name="sandbox",
-        model=FakeModel(initial_output=[get_final_output_message("done")]),
+        model=ScriptedModel(steps=[[get_final_output_message("done")]]),
         instructions="Base instructions.",
     )
     runtime = SandboxRuntime(
@@ -4466,7 +6298,7 @@ async def test_sandbox_runtime_emits_high_level_sdk_spans() -> None:
     client = _FakeClient(session)
     agent = SandboxAgent(
         name="sandbox",
-        model=FakeModel(initial_output=[get_final_output_message("done")]),
+        model=ScriptedModel(steps=[[get_final_output_message("done")]]),
         instructions="Base instructions.",
     )
     runtime = SandboxRuntime(
@@ -4532,8 +6364,8 @@ async def test_runner_uses_public_agent_for_non_function_tool_outputs() -> None:
         type="local_shell_call",
     )
 
-    model = FakeModel()
-    model.add_multiple_turn_outputs(
+    model = ScriptedModel()
+    model.extend(
         [
             [local_shell_call],
             [get_final_output_message("done")],
@@ -4567,13 +6399,13 @@ async def test_runner_uses_public_agent_for_non_function_tool_outputs() -> None:
 
 @pytest.mark.asyncio
 async def test_sandbox_agent_as_tool_uses_runner_sandbox_prep() -> None:
-    child_model = FakeModel(initial_output=[get_final_output_message("child done")])
-    parent_model = FakeModel(
-        initial_output=[
-            get_function_tool_call("delegate_to_child", json.dumps({"input": "check sandbox"}))
+    child_model = ScriptedModel(steps=[[get_final_output_message("child done")]])
+    parent_model = ScriptedModel(
+        steps=[
+            [get_function_tool_call("delegate_to_child", json.dumps({"input": "check sandbox"}))]
         ]
     )
-    parent_model.set_next_output([get_final_output_message("parent done")])
+    parent_model.enqueue([get_final_output_message("parent done")])
 
     capability = _RecordingCapability(instruction_text="Use the sandbox carefully.")
     manifest = Manifest(entries={"README.md": File(content=b"Use repo-safe commands only.")})
@@ -4602,16 +6434,16 @@ async def test_sandbox_agent_as_tool_uses_runner_sandbox_prep() -> None:
 
     assert result.final_output == "parent done"
     assert capability.bound_session is None
-    assert child_model.first_turn_args is not None
-    child_input = child_model.first_turn_args["input"]
+    assert bool(child_model.calls)
+    child_input = child_model.calls[0].input
     assert isinstance(child_input, list)
     assert _extract_user_text(child_input[0]) == "check sandbox"
 
 
 @pytest.mark.asyncio
 async def test_runner_reapplies_sandbox_prep_on_handoff() -> None:
-    triage_model = FakeModel()
-    worker_model = FakeModel(initial_output=[get_final_output_message("done")])
+    triage_model = ScriptedModel()
+    worker_model = ScriptedModel(steps=[[get_final_output_message("done")]])
     manifest = Manifest(entries={"README.md": File(content=b"Shared repo instructions.")})
     session = _FakeSession(manifest)
     client = _FakeClient(session)
@@ -4633,7 +6465,7 @@ async def test_runner_reapplies_sandbox_prep_on_handoff() -> None:
         capabilities=[capability_one],
         handoffs=[worker],
     )
-    triage_model.turn_outputs = [[get_handoff_tool_call(worker)]]
+    triage_model.enqueue([get_handoff_tool_call(worker)])
 
     result = await Runner.run(
         triage,
@@ -4644,8 +6476,8 @@ async def test_runner_reapplies_sandbox_prep_on_handoff() -> None:
     assert result.final_output == "done"
     assert capability_one.bound_session is None
     assert capability_two.bound_session is None
-    assert worker_model.first_turn_args is not None
-    assert worker_model.first_turn_args["system_instructions"] == (
+    assert bool(worker_model.calls)
+    assert worker_model.calls[0].system_instructions == (
         f"{get_default_sandbox_instructions()}\n\n"
         "# Agent instructions\n\n"
         "Worker instructions.\n\n"
@@ -4661,12 +6493,12 @@ async def test_prepare_agent_uses_active_sandbox_agent_memory_capability_for_han
     client = _FakeClient(session)
     triage = SandboxAgent(
         name="triage",
-        model=FakeModel(),
+        model=ScriptedModel(),
         capabilities=[Memory(), Filesystem(), Shell()],
     )
     reviewer = SandboxAgent(
         name="reviewer",
-        model=FakeModel(),
+        model=ScriptedModel(),
         capabilities=[Memory(generate=None), Filesystem(), Shell()],
     )
     runtime = SandboxRuntime(
@@ -4699,11 +6531,11 @@ async def test_prepare_agent_enables_memory_when_handoff_target_adds_capability(
     client = _FakeClient(session)
     triage = SandboxAgent(
         name="triage",
-        model=FakeModel(),
+        model=ScriptedModel(),
     )
     worker = SandboxAgent(
         name="worker",
-        model=FakeModel(),
+        model=ScriptedModel(),
         capabilities=[Memory(), Filesystem(), Shell()],
     )
     runtime = SandboxRuntime(
@@ -4732,7 +6564,7 @@ async def test_prepare_agent_enables_memory_when_handoff_target_adds_capability(
 
 @pytest.mark.asyncio
 async def test_runner_restores_sandbox_from_run_state() -> None:
-    model = FakeModel()
+    model = ScriptedModel()
 
     @function_tool(name_override="approval_tool", needs_approval=True)
     def approval_tool() -> str:
@@ -4748,7 +6580,7 @@ async def test_runner_restores_sandbox_from_run_state() -> None:
         tools=[approval_tool],
         default_manifest=manifest,
     )
-    model.add_multiple_turn_outputs(
+    model.extend(
         [
             [get_function_tool_call("approval_tool", json.dumps({}), call_id="call_resume")],
             [get_final_output_message("done")],
@@ -4778,7 +6610,7 @@ async def test_runner_restores_sandbox_from_run_state() -> None:
 
 @pytest.mark.asyncio
 async def test_runner_rejects_concurrent_reuse_of_same_sandbox_agent() -> None:
-    model = FakeModel(initial_output=[get_final_output_message("done")])
+    model = ScriptedModel(steps=[[get_final_output_message("done")]])
     start_gate = asyncio.Event()
     session = _FakeSession(Manifest(), start_gate=start_gate)
     client = _FakeClient(session)
@@ -4820,8 +6652,8 @@ async def test_runner_isolates_shared_capabilities_per_run() -> None:
     )
     client_one = _FakeClient(session_one)
     client_two = _FakeClient(session_two)
-    model_one = FakeModel(initial_output=[get_final_output_message("done one")])
-    model_two = FakeModel(initial_output=[get_final_output_message("done two")])
+    model_one = ScriptedModel(steps=[[get_final_output_message("done one")]])
+    model_two = ScriptedModel(steps=[[get_final_output_message("done two")]])
     agent_one = SandboxAgent(
         name="sandbox-one",
         model=model_one,
@@ -4850,9 +6682,9 @@ async def test_runner_isolates_shared_capabilities_per_run() -> None:
 
     assert first_result.final_output == "done one"
     assert second_result.final_output == "done two"
-    assert model_one.first_turn_args is not None
-    assert model_two.first_turn_args is not None
-    assert model_one.first_turn_args["system_instructions"] == (
+    assert bool(model_one.calls)
+    assert bool(model_two.calls)
+    assert model_one.calls[0].system_instructions == (
         f"{get_default_sandbox_instructions()}\n\n"
         "# Agent instructions\n\n"
         "Base instructions.\n\n"
@@ -4860,7 +6692,7 @@ async def test_runner_isolates_shared_capabilities_per_run() -> None:
         "Session one instructions.\n\n"
         f"{runtime_agent_preparation_module._filesystem_instructions(session_one.state.manifest)}"
     )
-    assert model_two.first_turn_args["system_instructions"] == (
+    assert model_two.calls[0].system_instructions == (
         f"{get_default_sandbox_instructions()}\n\n"
         "# Agent instructions\n\n"
         "Base instructions.\n\n"
@@ -4873,7 +6705,7 @@ async def test_runner_isolates_shared_capabilities_per_run() -> None:
 
 @pytest.mark.asyncio
 async def test_runner_deep_clones_capability_runtime_state() -> None:
-    model = FakeModel(initial_output=[get_final_output_message("done")])
+    model = ScriptedModel(steps=[[get_final_output_message("done")]])
     session = _FakeSession(Manifest(entries={"README.md": File(content=b"hello")}))
     client = _FakeClient(session)
 
@@ -4904,7 +6736,7 @@ async def test_runner_deep_clones_capability_runtime_state() -> None:
 
 @pytest.mark.asyncio
 async def test_runner_keeps_public_agent_identity_for_hooks_and_streaming() -> None:
-    model = FakeModel(initial_output=[get_final_output_message("done")])
+    model = ScriptedModel(steps=[[get_final_output_message("done")]])
     session = _FakeSession(Manifest())
     client = _FakeClient(session)
     run_hooks = _RecordingRunHooks()
@@ -4935,7 +6767,7 @@ async def test_runner_keeps_public_agent_identity_for_hooks_and_streaming() -> N
     assert agent_hooks.llm_ended_agents == [agent]
     assert all(item.agent is agent for item in result.new_items)
 
-    streamed_model = FakeModel(initial_output=[get_final_output_message("streamed done")])
+    streamed_model = ScriptedModel(steps=[[get_final_output_message("streamed done")]])
     streamed_session = _FakeSession(Manifest())
     streamed_client = _FakeClient(streamed_session)
     streamed_run_hooks = _RecordingRunHooks()

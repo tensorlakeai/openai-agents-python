@@ -12,6 +12,11 @@ from typing import Any, cast
 
 import pytest
 from openai.types.responses import ResponseFunctionToolCall
+from openai.types.responses.response_computer_tool_call import (
+    ActionScreenshot,
+    PendingSafetyCheck,
+    ResponseComputerToolCall,
+)
 from openai.types.responses.response_output_item import McpApprovalRequest
 from openai.types.responses.response_output_message import ResponseOutputMessage
 from openai.types.responses.response_output_refusal import ResponseOutputRefusal
@@ -21,10 +26,13 @@ from agents import (
     Agent,
     AgentBase,
     ApplyPatchTool,
+    ComputerTool,
     FunctionTool,
     HostedMCPTool,
     MCPApprovalRequestItem,
     MCPApprovalResponseItem,
+    MCPToolApprovalFunctionResult,
+    MCPToolApprovalRequest,
     MessageOutputItem,
     ModelBehaviorError,
     ModelRefusalError,
@@ -52,7 +60,7 @@ from agents import (
     trace,
 )
 from agents._public_agent import set_public_agent
-from agents.run_internal import run_loop, turn_resolution
+from agents.run_internal import run_loop, tool_execution, turn_resolution
 from agents.run_internal.agent_bindings import bind_execution_agent, bind_public_agent
 from agents.run_internal.run_loop import (
     NextStepFinalOutput,
@@ -94,6 +102,11 @@ from .utils.hitl import (
     make_shell_call,
     reject_tool_call,
 )
+
+# Deadlock detector for the parent-cancellation tests below. It is deliberately far larger
+# than any bound the runtime itself applies (see `_FUNCTION_TOOL_CANCELLED_DRAIN_SECONDS`),
+# so it cannot become the behavioral assertion.
+_CANCELLATION_HANG_GUARD_SECONDS = 5.0
 
 
 def _function_spans() -> list[dict[str, Any]]:
@@ -551,8 +564,8 @@ async def test_multiple_tool_calls():
     response = ModelResponse(
         output=[
             get_text_message("Hello, world!"),
-            get_function_tool_call("test_1"),
-            get_function_tool_call("test_2"),
+            get_function_tool_call("test_1", call_id="test-1"),
+            get_function_tool_call("test_2", call_id="test-2"),
         ],
         usage=Usage(),
         response_id=None,
@@ -1528,6 +1541,57 @@ async def test_function_tool_disabled_before_execution_fails_before_starting_sib
 
 
 @pytest.mark.asyncio
+async def test_function_tool_enablement_error_cancels_sibling_checks_before_execution() -> None:
+    slow_check_count = 0
+    failing_check_count = 0
+    slow_started = asyncio.Event()
+    slow_cancelled = asyncio.Event()
+    slow_finished = asyncio.Event()
+
+    async def slow_enabled(_ctx: RunContextWrapper[Any], _agent: AgentBase[Any]) -> bool:
+        nonlocal slow_check_count
+        slow_check_count += 1
+        if slow_check_count == 1:
+            return True
+        slow_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            slow_cancelled.set()
+            raise
+        finally:
+            slow_finished.set()
+        return True
+
+    async def failing_enabled(_ctx: RunContextWrapper[Any], _agent: AgentBase[Any]) -> bool:
+        nonlocal failing_check_count
+        failing_check_count += 1
+        if failing_check_count == 1:
+            return True
+        await slow_started.wait()
+        raise RuntimeError("enablement failed")
+
+    slow_tool = function_tool(lambda: "slow", name_override="slow_tool", is_enabled=slow_enabled)
+    failing_tool = function_tool(
+        lambda: "failing",
+        name_override="failing_tool",
+        is_enabled=failing_enabled,
+    )
+    agent = Agent(name="test", tools=[slow_tool, failing_tool])
+    response = ModelResponse(
+        output=[get_function_tool_call("slow_tool", "{}", call_id="call-1")],
+        usage=Usage(),
+        response_id=None,
+    )
+
+    with pytest.raises(RuntimeError, match="enablement failed"):
+        await get_execute_result(agent, response)
+
+    assert slow_cancelled.is_set()
+    assert slow_finished.is_set()
+
+
+@pytest.mark.asyncio
 async def test_execute_function_tool_calls_allows_non_agent_function_tool() -> None:
     @function_tool(name_override="synthetic_tool")
     def synthetic_tool() -> str:
@@ -2038,15 +2102,23 @@ async def test_multiple_tool_calls_surface_post_invoke_failure_unblocked_during_
 
 
 @pytest.mark.asyncio
-async def test_multiple_tool_calls_surface_sleeping_post_invoke_failure_before_sibling_error():
+async def test_multiple_tool_calls_surface_sleeping_post_invoke_failure_before_sibling_error(
+    monkeypatch: pytest.MonkeyPatch,
+):
     loop = asyncio.get_running_loop()
     original_handler = loop.get_exception_handler()
     unhandled_contexts: list[dict[str, Any]] = []
+    post_invoke_started = asyncio.Event()
+
+    # Widen the post-invoke drain budget so the guardrail delay below stays well inside
+    # it. Otherwise a scheduling hiccup, not the runtime, decides which failure wins.
+    monkeypatch.setattr(tool_execution, "_FUNCTION_TOOL_POST_INVOKE_WAIT_SECONDS", 5.0)
 
     @tool_output_guardrail
     async def sleeping_tripwire_guardrail(
         _data: ToolOutputGuardrailData,
     ) -> ToolGuardrailFunctionOutput:
+        post_invoke_started.set()
         await asyncio.sleep(0.05)
         return ToolGuardrailFunctionOutput.raise_exception(output_info={"status": "sleep-tripwire"})
 
@@ -2054,6 +2126,8 @@ async def test_multiple_tool_calls_surface_sleeping_post_invoke_failure_before_s
         return "ok"
 
     async def _error_tool() -> str:
+        # Fail only once the sibling guardrail is provably in its post-invoke phase.
+        await post_invoke_started.wait()
         raise ValueError("boom")
 
     ok_tool = function_tool(
@@ -2084,7 +2158,7 @@ async def test_multiple_tool_calls_surface_sleeping_post_invoke_failure_before_s
     loop.set_exception_handler(_exception_handler)
     try:
         with pytest.raises(ToolOutputGuardrailTripwireTriggered):
-            await asyncio.wait_for(get_execute_result(agent, response), timeout=0.2)
+            await asyncio.wait_for(get_execute_result(agent, response), timeout=10)
         gc.collect()
         await asyncio.sleep(0)
     finally:
@@ -2099,13 +2173,18 @@ async def test_multiple_tool_calls_surface_sleeping_post_invoke_failure_before_s
 
 @pytest.mark.asyncio
 async def test_multiple_tool_calls_do_not_wait_indefinitely_for_sleeping_post_invoke_sibling():
+    post_invoke_started = asyncio.Event()
+    release_guardrail = asyncio.Event()
     guardrail_finished = asyncio.Event()
 
     @tool_output_guardrail
-    async def long_sleeping_guardrail(
+    async def blocked_post_invoke_guardrail(
         _data: ToolOutputGuardrailData,
     ) -> ToolGuardrailFunctionOutput:
-        await asyncio.sleep(0.3)
+        post_invoke_started.set()
+        # Outlast the post-invoke drain budget by construction: only the test can
+        # release this guardrail, and it does so after the sibling error propagated.
+        await release_guardrail.wait()
         guardrail_finished.set()
         return ToolGuardrailFunctionOutput.allow(output_info="done")
 
@@ -2113,13 +2192,15 @@ async def test_multiple_tool_calls_do_not_wait_indefinitely_for_sleeping_post_in
         return "ok"
 
     async def _error_tool() -> str:
+        # Fail only once the sibling guardrail is provably in its post-invoke phase.
+        await post_invoke_started.wait()
         raise ValueError("boom")
 
     ok_tool = function_tool(
         _ok_tool,
         name_override="ok_tool",
         failure_error_function=None,
-        tool_output_guardrails=[long_sleeping_guardrail],
+        tool_output_guardrails=[blocked_post_invoke_guardrail],
     )
     error_tool = function_tool(
         _error_tool,
@@ -2137,10 +2218,17 @@ async def test_multiple_tool_calls_do_not_wait_indefinitely_for_sleeping_post_in
         response_id=None,
     )
 
-    with pytest.raises(UserError, match="Error running tool error_tool: boom"):
-        await asyncio.wait_for(get_execute_result(agent, response), timeout=0.2)
+    try:
+        with pytest.raises(UserError, match="Error running tool error_tool: boom"):
+            await asyncio.wait_for(get_execute_result(agent, response), timeout=5)
+    finally:
+        # Release the detached guardrail even when the assertion fails so the test
+        # cannot leave a blocked task behind.
+        release_guardrail.set()
 
-    await asyncio.wait_for(guardrail_finished.wait(), timeout=0.5)
+    # The post-invoke sibling was still pending when the failure surfaced, and it
+    # must remain able to finish in the background.
+    await asyncio.wait_for(guardrail_finished.wait(), timeout=5)
 
 
 @pytest.mark.asyncio
@@ -2305,6 +2393,7 @@ async def test_multiple_tool_calls_drain_completed_fatal_failures_before_raising
 @pytest.mark.asyncio
 @pytest.mark.parametrize("delay_ticks", [1, 6, 20])
 async def test_multiple_tool_calls_raise_late_fatal_sibling_exception_after_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
     delay_ticks: int,
 ):
     class ToolAborted(BaseException):
@@ -2312,6 +2401,10 @@ async def test_multiple_tool_calls_raise_late_fatal_sibling_exception_after_canc
 
     sibling_ready = asyncio.Event()
     sibling_cancelled = asyncio.Event()
+
+    # Keep the cancelled-sibling drain open long enough for every parametrized
+    # scheduling step. This test covers failure arbitration, not the default budget.
+    monkeypatch.setattr(tool_execution, "_FUNCTION_TOOL_CANCELLED_DRAIN_SECONDS", 5.0)
 
     async def _error_tool_1() -> str:
         await sibling_ready.wait()
@@ -2350,7 +2443,7 @@ async def test_multiple_tool_calls_raise_late_fatal_sibling_exception_after_canc
     )
 
     with pytest.raises(ToolAborted, match=f"boom-{delay_ticks}"):
-        await asyncio.wait_for(get_execute_result(agent, response), timeout=0.2)
+        await asyncio.wait_for(get_execute_result(agent, response), timeout=5)
 
     assert sibling_cancelled.is_set()
 
@@ -2459,11 +2552,13 @@ async def test_multiple_tool_calls_report_late_cleanup_exception_from_cancelled_
 
     loop.set_exception_handler(_exception_handler)
     try:
-        with pytest.raises(UserError, match="Error running tool error_tool: boom"):
-            await asyncio.wait_for(get_execute_result(agent, response), timeout=0.2)
+        try:
+            with pytest.raises(UserError, match="Error running tool error_tool: boom"):
+                await asyncio.wait_for(get_execute_result(agent, response), timeout=5)
 
-        assert cleanup_blocked.is_set()
-        release_cleanup.set()
+            assert cleanup_blocked.is_set()
+        finally:
+            release_cleanup.set()
         await asyncio.wait_for(cleanup_finished.wait(), timeout=0.2)
         await asyncio.wait_for(late_cleanup_reported.wait(), timeout=0.5)
     finally:
@@ -2534,11 +2629,22 @@ async def test_multiple_tool_calls_cancel_pending_tasks_when_parent_cancelled():
 
 
 @pytest.mark.asyncio
-async def test_parent_cancellation_does_not_wait_for_tool_cleanup():
+async def test_parent_cancellation_does_not_wait_for_tool_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+):
     tool_started = asyncio.Event()
     cleanup_started = asyncio.Event()
     cleanup_finished = asyncio.Event()
     allow_cleanup_exit = asyncio.Event()
+
+    settle_calls: list[set[asyncio.Task[Any]]] = []
+    original_settle = tool_execution._settle_pending_function_tool_tasks
+
+    async def _recording_settle(*args: Any, **kwargs: Any) -> tuple[Any, set[asyncio.Task[Any]]]:
+        settle_calls.append(set(kwargs["pending_tasks"]))
+        return await original_settle(*args, **kwargs)
+
+    monkeypatch.setattr(tool_execution, "_settle_pending_function_tool_tasks", _recording_settle)
 
     async def _slow_cancel_tool() -> str:
         tool_started.set()
@@ -2565,15 +2671,20 @@ async def test_parent_cancellation_does_not_wait_for_tool_cleanup():
     )
 
     execution_task = asyncio.create_task(get_execute_result(agent, response))
-    await asyncio.wait_for(tool_started.wait(), timeout=0.2)
+    await asyncio.wait_for(tool_started.wait(), timeout=_CANCELLATION_HANG_GUARD_SECONDS)
 
     execution_task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(execution_task, timeout=0.1)
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(execution_task, timeout=_CANCELLATION_HANG_GUARD_SECONDS)
 
-    await asyncio.wait_for(cleanup_started.wait(), timeout=0.2)
-    allow_cleanup_exit.set()
-    await asyncio.wait_for(cleanup_finished.wait(), timeout=0.2)
+        await asyncio.wait_for(cleanup_started.wait(), timeout=_CANCELLATION_HANG_GUARD_SECONDS)
+        assert settle_calls == []
+        assert not cleanup_finished.is_set()
+    finally:
+        allow_cleanup_exit.set()
+
+    await asyncio.wait_for(cleanup_finished.wait(), timeout=_CANCELLATION_HANG_GUARD_SECONDS)
 
 
 @pytest.mark.asyncio
@@ -2605,19 +2716,50 @@ async def test_parent_cancellation_wins_when_shield_raises_after_tool_finishes(
 
 
 @pytest.mark.asyncio
-async def test_parent_cancellation_does_not_report_tool_failure_as_background_error():
+async def test_parent_cancellation_does_not_report_tool_failure_as_background_error(
+    monkeypatch: pytest.MonkeyPatch,
+):
     loop = asyncio.get_running_loop()
     original_handler = loop.get_exception_handler()
     reported_contexts: list[dict[str, Any]] = []
     tool_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    allow_cleanup_failure = asyncio.Event()
+    background_callback_ran = asyncio.Event()
+    background_task: asyncio.Task[Any] | None = None
+    background_exception: UserError | None = None
 
     def _exception_handler(_loop: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
         reported_contexts.append(context)
 
+    original_consume = tool_execution._consume_function_tool_task_result
+
+    def _recording_consume(task: asyncio.Task[Any], **kwargs: Any) -> None:
+        nonlocal background_task, background_exception
+        try:
+            original_consume(task, **kwargs)
+        finally:
+            if not task.cancelled():
+                exception = task.exception()
+                if (
+                    isinstance(exception, UserError)
+                    and str(exception) == "Error running tool failing_tool: boom"
+                ):
+                    background_task = task
+                    background_exception = exception
+                    background_callback_ran.set()
+
+    monkeypatch.setattr(tool_execution, "_consume_function_tool_task_result", _recording_consume)
+
     async def _failing_tool() -> str:
         tool_started.set()
-        await asyncio.sleep(0)
-        raise ValueError("boom")
+        try:
+            await asyncio.Future()
+            return "unreachable"
+        except asyncio.CancelledError:
+            cleanup_started.set()
+            await allow_cleanup_failure.wait()
+            raise ValueError("boom") from None
 
     tool = function_tool(
         _failing_tool,
@@ -2634,23 +2776,25 @@ async def test_parent_cancellation_does_not_report_tool_failure_as_background_er
     loop.set_exception_handler(_exception_handler)
     try:
         execution_task = asyncio.create_task(get_execute_result(agent, response))
-        await asyncio.wait_for(tool_started.wait(), timeout=0.2)
+        await asyncio.wait_for(tool_started.wait(), timeout=_CANCELLATION_HANG_GUARD_SECONDS)
 
         execution_task.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await execution_task
+            await asyncio.wait_for(execution_task, timeout=_CANCELLATION_HANG_GUARD_SECONDS)
 
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
+        await asyncio.wait_for(cleanup_started.wait(), timeout=_CANCELLATION_HANG_GUARD_SECONDS)
+        allow_cleanup_failure.set()
+        await asyncio.wait_for(
+            background_callback_ran.wait(), timeout=_CANCELLATION_HANG_GUARD_SECONDS
+        )
     finally:
+        allow_cleanup_failure.set()
         loop.set_exception_handler(original_handler)
 
+    assert background_task is not None
+    assert background_exception is not None
     assert not any(
-        context.get("message")
-        == "Background function tool task raised during cancellation cleanup after failure "
-        "propagation."
-        and isinstance(context.get("exception"), UserError)
-        and str(context["exception"]) == "Error running tool failing_tool: boom"
+        context.get("task") is background_task and context.get("exception") is background_exception
         for context in reported_contexts
     )
 
@@ -2934,6 +3078,14 @@ def make_processed_response(
     )
 
 
+def test_processed_response_reports_interruptions() -> None:
+    processed_response = make_processed_response(
+        interruptions=[cast(ToolApprovalItem, object())],
+    )
+
+    assert processed_response.has_interruptions() is True
+
+
 async def get_execute_result(
     agent: Agent[Any],
     response: ModelResponse,
@@ -3037,6 +3189,51 @@ def _apply_patch_tool_approval_run() -> ToolApprovalRun:
     )
 
 
+@pytest.mark.parametrize("tool_kind", ["shell", "apply_patch"])
+@pytest.mark.asyncio
+async def test_empty_action_call_id_fails_before_approval_callback(tool_kind: str) -> None:
+    approval_calls: list[str] = []
+
+    async def approve(_context: RunContextWrapper[Any], _item: ToolApprovalItem) -> Any:
+        approval_calls.append(tool_kind)
+        return {"approve": True}
+
+    if tool_kind == "shell":
+        shell_tool = ShellTool(
+            executor=lambda _request: "output",
+            needs_approval=True,
+            on_approval=approve,
+        )
+        agent = make_agent(tools=[shell_tool])
+        tool_call = cast(dict[str, Any], make_shell_call(""))
+        tool_call["id"] = "item-shell"
+        processed_response = make_processed_response(
+            shell_calls=[ToolRunShellCall(tool_call=tool_call, shell_tool=shell_tool)]
+        )
+    else:
+        apply_patch_tool = ApplyPatchTool(
+            editor=RecordingEditor(),
+            needs_approval=True,
+            on_approval=approve,
+        )
+        agent = make_agent(tools=[apply_patch_tool])
+        tool_call = cast(dict[str, Any], make_apply_patch_dict(""))
+        tool_call["id"] = "item-apply"
+        processed_response = make_processed_response(
+            apply_patch_calls=[
+                ToolRunApplyPatchCall(
+                    tool_call=tool_call,
+                    apply_patch_tool=apply_patch_tool,
+                )
+            ]
+        )
+
+    with pytest.raises(ModelBehaviorError, match="non-empty string call ID"):
+        await run_execute_with_processed_response(agent, processed_response)
+
+    assert approval_calls == []
+
+
 @pytest.mark.parametrize(
     "setup_fn",
     [
@@ -3134,12 +3331,14 @@ async def test_execute_tools_runs_hosted_mcp_callback_when_present():
         on_approval_request=lambda request: {"approve": True},
     )
     agent = make_agent(tools=[mcp_tool])
-    request_item = McpApprovalRequest(
+    program_caller = {"type": "program", "caller_id": "program-1"}
+    request_item = McpApprovalRequest.model_construct(
         id="mcp-approval-1",
         type="mcp_approval_request",
         server_label="test_mcp_server",
         arguments="{}",
         name="list_repo_languages",
+        caller=program_caller,
     )
     processed_response = make_processed_response(
         new_items=[MCPApprovalRequestItem(raw_item=request_item, agent=agent)],
@@ -3154,8 +3353,86 @@ async def test_execute_tools_runs_hosted_mcp_callback_when_present():
     result = await run_execute_with_processed_response(agent, processed_response)
 
     assert not isinstance(result.next_step, NextStepInterruption)
-    assert any(isinstance(item, MCPApprovalResponseItem) for item in result.new_step_items)
+    responses = [
+        item for item in result.new_step_items if isinstance(item, MCPApprovalResponseItem)
+    ]
+    assert responses
+    assert responses[0].raw_item.get("caller") == program_caller
     assert not result.processed_response or not result.processed_response.interruptions
+
+
+@pytest.mark.parametrize("with_callback", [False, True], ids=["manual", "callback"])
+@pytest.mark.asyncio
+async def test_execute_tools_omits_completed_mcp_approval_request_replay(
+    with_callback: bool,
+) -> None:
+    """A committed MCP approval replay must not emit a request or invoke its callback."""
+    callback_calls = 0
+
+    def approve_request(_request: MCPToolApprovalRequest) -> MCPToolApprovalFunctionResult:
+        nonlocal callback_calls
+        callback_calls += 1
+        return {"approve": True}
+
+    mcp_tool = HostedMCPTool(
+        tool_config={
+            "type": "mcp",
+            "server_label": "test_mcp_server",
+            "server_url": "https://example.com",
+            "require_approval": "always",
+        },
+        on_approval_request=approve_request if with_callback else None,
+    )
+    agent = make_agent(tools=[mcp_tool])
+    request_item = McpApprovalRequest(
+        id="mcp-approval-replay",
+        type="mcp_approval_request",
+        server_label="test_mcp_server",
+        arguments='{"path":"src"}',
+        name="list_files",
+    )
+    context_wrapper = make_context_wrapper()
+    context_wrapper.approve_tool(
+        ToolApprovalItem(
+            agent=agent,
+            raw_item=request_item,
+            tool_name="list_files",
+        )
+    )
+    context_wrapper._mark_tool_call_completed(
+        {
+            "type": "mcp_approval_response",
+            "approval_request_id": request_item.id,
+            "approve": True,
+        }
+    )
+    processed_response = make_processed_response(
+        new_items=[MCPApprovalRequestItem(raw_item=request_item, agent=agent)],
+        mcp_approval_requests=[
+            ToolRunMCPApprovalRequest(
+                request_item=request_item,
+                mcp_tool=mcp_tool,
+            )
+        ],
+    )
+
+    result = await run_loop.execute_tools_and_side_effects(
+        bindings=_bind_agent(agent),
+        original_input="test",
+        pre_step_items=[],
+        new_response=ModelResponse(output=[], usage=Usage(), response_id="resp"),
+        processed_response=processed_response,
+        output_schema=None,
+        hooks=RunHooks(),
+        context_wrapper=context_wrapper,
+        run_config=RunConfig(),
+    )
+
+    assert callback_calls == 0
+    assert not any(
+        isinstance(item, MCPApprovalRequestItem | MCPApprovalResponseItem)
+        for item in result.new_step_items
+    )
 
 
 @pytest.mark.asyncio
@@ -3253,6 +3530,437 @@ async def test_execute_tools_surfaces_hosted_mcp_interruptions_without_callback(
     )
 
 
+def test_manual_hosted_mcp_approval_does_not_reuse_stale_pending_identity():
+    server_b = HostedMCPTool(
+        tool_config={
+            "type": "mcp",
+            "server_label": "server-b",
+            "server_url": "https://server-b.example/mcp",
+        }
+    )
+    agent = make_agent(tools=[server_b])
+    pending_a = ToolApprovalItem(
+        agent=agent,
+        raw_item=McpApprovalRequest(
+            id="shared-request",
+            type="mcp_approval_request",
+            server_label="server-a",
+            arguments="{}",
+            name="lookup_account",
+        ),
+    )
+    current_b = McpApprovalRequest(
+        id="shared-request",
+        type="mcp_approval_request",
+        server_label="server-b",
+        arguments="{}",
+        name="lookup_account",
+    )
+    request_run = ToolRunMCPApprovalRequest(request_item=current_b, mcp_tool=server_b)
+    context_wrapper = make_context_wrapper()
+    context_wrapper._rebuild_approvals(  # noqa: SLF001
+        {"lookup_account": {"approved": ["shared-request"], "rejected": []}}
+    )
+    context_wrapper._allow_legacy_approval_binding_reconstruction = True  # noqa: SLF001
+
+    with pytest.raises(ModelBehaviorError, match="unique call ID"):
+        tool_execution.collect_manual_mcp_approvals(
+            agent=agent,
+            requests=[request_run],
+            context_wrapper=context_wrapper,
+            existing_pending_by_call_id={"shared-request": pending_a},
+        )
+
+
+def test_hosted_mcp_approval_does_not_reuse_legacy_name_for_a_different_current_tool():
+    server = HostedMCPTool(
+        tool_config={
+            "type": "mcp",
+            "server_label": "server-a",
+            "server_url": "https://server-a.example/mcp",
+        }
+    )
+    agent = make_agent(tools=[server])
+    pending_lookup = ToolApprovalItem(
+        agent=agent,
+        raw_item={
+            "type": "hosted_tool_call",
+            "provider_data": {
+                "type": "mcp_approval_request",
+                "id": "shared-request",
+                "server_label": "server-a",
+            },
+        },
+        tool_name="lookup_account",
+    )
+    current_delete = McpApprovalRequest(
+        id="shared-request",
+        type="mcp_approval_request",
+        server_label="server-a",
+        arguments="{}",
+        name="delete_account",
+    )
+    request_run = ToolRunMCPApprovalRequest(request_item=current_delete, mcp_tool=server)
+    context_wrapper = make_context_wrapper()
+    context_wrapper._rebuild_approvals(  # noqa: SLF001
+        {"lookup_account": {"approved": ["shared-request"], "rejected": []}}
+    )
+
+    responses, pending = tool_execution.collect_manual_mcp_approvals(
+        agent=agent,
+        requests=[request_run],
+        context_wrapper=context_wrapper,
+        existing_pending_by_call_id={"shared-request": pending_lookup},
+    )
+
+    assert responses == []
+    assert len(pending) == 1
+    assert pending[0].raw_item is current_delete
+
+
+def test_manual_hosted_mcp_approval_uses_current_scoped_decision_after_identity_conflict():
+    server_b = HostedMCPTool(
+        tool_config={
+            "type": "mcp",
+            "server_label": "server-b",
+            "server_url": "https://server-b.example/mcp",
+        }
+    )
+    agent = make_agent(tools=[server_b])
+    pending_a = ToolApprovalItem(
+        agent=agent,
+        raw_item=McpApprovalRequest(
+            id="shared-request",
+            type="mcp_approval_request",
+            server_label="server-a",
+            arguments="{}",
+            name="lookup_account",
+        ),
+    )
+    current_b = McpApprovalRequest(
+        id="shared-request",
+        type="mcp_approval_request",
+        server_label="server-b",
+        arguments="{}",
+        name="lookup_account",
+    )
+    current_b_approval = ToolApprovalItem(agent=agent, raw_item=current_b)
+    context_wrapper = make_context_wrapper()
+    context_wrapper.approve_tool(current_b_approval, always_approve=True)
+
+    approved, pending = tool_execution.collect_manual_mcp_approvals(
+        agent=agent,
+        requests=[ToolRunMCPApprovalRequest(request_item=current_b, mcp_tool=server_b)],
+        context_wrapper=context_wrapper,
+        existing_pending_by_call_id={"shared-request": pending_a},
+    )
+
+    assert pending == []
+    assert len(approved) == 1
+    assert approved[0].raw_item["approve"] is True
+
+
+@pytest.mark.asyncio
+async def test_resolve_interrupted_turn_uses_current_scoped_hosted_mcp_decision():
+    server_b = HostedMCPTool(
+        tool_config={
+            "type": "mcp",
+            "server_label": "server-b",
+            "server_url": "https://server-b.example/mcp",
+        }
+    )
+    agent = make_agent(tools=[server_b])
+    pending_a = ToolApprovalItem(
+        agent=agent,
+        raw_item=McpApprovalRequest(
+            id="shared-request",
+            type="mcp_approval_request",
+            server_label="server-a",
+            arguments="{}",
+            name="lookup_account",
+        ),
+    )
+    current_b = McpApprovalRequest(
+        id="shared-request",
+        type="mcp_approval_request",
+        server_label="server-b",
+        arguments="{}",
+        name="lookup_account",
+    )
+    context_wrapper = make_context_wrapper()
+    context_wrapper.approve_tool(
+        ToolApprovalItem(agent=agent, raw_item=current_b),
+        always_approve=True,
+    )
+    processed_response = make_processed_response(
+        new_items=[MCPApprovalRequestItem(raw_item=current_b, agent=agent)],
+        mcp_approval_requests=[
+            ToolRunMCPApprovalRequest(request_item=current_b, mcp_tool=server_b)
+        ],
+    )
+
+    result = await turn_resolution.resolve_interrupted_turn(
+        bindings=_bind_agent(agent),
+        original_input="test",
+        original_pre_step_items=[pending_a],
+        new_response=ModelResponse(output=[], usage=Usage(), response_id="resp"),
+        processed_response=processed_response,
+        hooks=RunHooks(),
+        context_wrapper=context_wrapper,
+        run_config=RunConfig(),
+    )
+
+    assert not isinstance(result.next_step, NextStepInterruption)
+    responses = [
+        item
+        for item in result.new_step_items
+        if isinstance(item, MCPApprovalResponseItem)
+        and item.raw_item.get("approval_request_id") == "shared-request"
+    ]
+    assert len(responses) == 1
+    assert all(item.raw_item["approve"] is True for item in responses)
+    assert not any(
+        isinstance(item, ToolApprovalItem)
+        and getattr(item.raw_item, "server_label", None) == "server-a"
+        for item in result.new_step_items
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_interrupted_turn_keeps_callback_owned_hosted_mcp_request_out_of_pending():
+    callback_tool = HostedMCPTool(
+        tool_config={
+            "type": "mcp",
+            "server_label": "server-a",
+            "server_url": "https://server-a.example/mcp",
+        },
+        on_approval_request=lambda request: {"approve": True},
+    )
+    agent = make_agent(tools=[callback_tool])
+    request = McpApprovalRequest(
+        id="callback-request",
+        type="mcp_approval_request",
+        server_label="server-a",
+        arguments="{}",
+        name="lookup_account",
+    )
+    pending = ToolApprovalItem(agent=agent, raw_item=request)
+    processed_response = make_processed_response(
+        new_items=[MCPApprovalRequestItem(raw_item=request, agent=agent)],
+        mcp_approval_requests=[
+            ToolRunMCPApprovalRequest(request_item=request, mcp_tool=callback_tool)
+        ],
+    )
+
+    result = await turn_resolution.resolve_interrupted_turn(
+        bindings=_bind_agent(agent),
+        original_input="test",
+        original_pre_step_items=[pending],
+        new_response=ModelResponse(output=[], usage=Usage(), response_id="resp"),
+        processed_response=processed_response,
+        hooks=RunHooks(),
+        context_wrapper=make_context_wrapper(),
+        run_config=RunConfig(),
+    )
+
+    assert not isinstance(result.next_step, NextStepInterruption)
+    responses = [
+        item
+        for item in result.new_step_items
+        if isinstance(item, MCPApprovalResponseItem)
+        and item.raw_item.get("approval_request_id") == "callback-request"
+    ]
+    assert len(responses) == 1
+    assert responses[0].raw_item["approve"] is True
+    assert not any(isinstance(item, ToolApprovalItem) for item in result.pre_step_items)
+    assert not any(isinstance(item, ToolApprovalItem) for item in result.new_step_items)
+
+
+def test_manual_hosted_mcp_approval_rejects_incomplete_exact_call_decision():
+    server_a = HostedMCPTool(
+        tool_config={
+            "type": "mcp",
+            "server_label": "server-a",
+            "server_url": "https://server-a.example/mcp",
+        }
+    )
+    agent = make_agent(tools=[server_a])
+    pending_unknown = ToolApprovalItem(
+        agent=agent,
+        raw_item={
+            "type": "hosted_tool_call",
+            "provider_data": {
+                "type": "mcp_approval_request",
+                "id": "shared-request",
+                "name": "lookup_account",
+            },
+        },
+    )
+    context_wrapper = make_context_wrapper()
+
+    with pytest.raises(ModelBehaviorError, match="canonical invocation identity"):
+        context_wrapper.approve_tool(pending_unknown)
+
+
+def test_manual_hosted_mcp_approval_reprompts_for_partial_pending_identity():
+    server_a = HostedMCPTool(
+        tool_config={
+            "type": "mcp",
+            "server_label": "server-a",
+            "server_url": "https://server-a.example/mcp",
+        }
+    )
+    agent = make_agent(tools=[server_a])
+    pending_partial = ToolApprovalItem(
+        agent=agent,
+        raw_item={
+            "type": "hosted_tool_call",
+            "provider_data": {
+                "type": "mcp_approval_request",
+                "id": "shared-request",
+                "name": "lookup_account",
+            },
+        },
+        tool_name="lookup_account",
+    )
+    current = McpApprovalRequest(
+        id="shared-request",
+        type="mcp_approval_request",
+        server_label="server-a",
+        arguments="{}",
+        name="lookup_account",
+    )
+    context_wrapper = make_context_wrapper()
+    context_wrapper._rebuild_hosted_mcp_approvals(  # noqa: SLF001
+        [
+            {
+                "identity": {
+                    "type": "server_tool",
+                    "server_label": "server-a",
+                    "tool_name": "lookup_account",
+                },
+                "decision": {"approved": True, "rejected": []},
+            }
+        ]
+    )
+    context_wrapper._allow_legacy_approval_binding_reconstruction = True  # noqa: SLF001
+
+    approved, pending = tool_execution.collect_manual_mcp_approvals(
+        agent=agent,
+        requests=[ToolRunMCPApprovalRequest(request_item=current, mcp_tool=server_a)],
+        context_wrapper=context_wrapper,
+        existing_pending_by_call_id={"shared-request": pending_partial},
+    )
+
+    assert approved == []
+    assert len(pending) == 1
+    assert pending[0].raw_item is current
+
+
+def test_manual_hosted_mcp_approval_does_not_apply_legacy_exact_without_pending():
+    server_b = HostedMCPTool(
+        tool_config={
+            "type": "mcp",
+            "server_label": "server-b",
+            "server_url": "https://server-b.example/mcp",
+        }
+    )
+    agent = make_agent(tools=[server_b])
+    current = McpApprovalRequest(
+        id="shared-request",
+        type="mcp_approval_request",
+        server_label="server-b",
+        arguments="{}",
+        name="lookup_account",
+    )
+    context_wrapper = make_context_wrapper()
+    context_wrapper._rebuild_approvals(  # noqa: SLF001
+        {"lookup_account": {"approved": ["shared-request"], "rejected": []}}
+    )
+
+    approved, pending = tool_execution.collect_manual_mcp_approvals(
+        agent=agent,
+        requests=[ToolRunMCPApprovalRequest(request_item=current, mcp_tool=server_b)],
+        context_wrapper=context_wrapper,
+    )
+
+    assert approved == []
+    assert len(pending) == 1
+    assert pending[0].raw_item is current
+
+
+def test_resolve_interrupted_turn_rejects_incomplete_pending_decision():
+    server_a = HostedMCPTool(
+        tool_config={
+            "type": "mcp",
+            "server_label": "server-a",
+            "server_url": "https://server-a.example/mcp",
+        }
+    )
+    agent = make_agent(tools=[server_a])
+    pending_partial = ToolApprovalItem(
+        agent=agent,
+        raw_item={
+            "type": "hosted_tool_call",
+            "provider_data": {
+                "type": "mcp_approval_request",
+                "id": "shared-request",
+                "name": "lookup_account",
+            },
+        },
+        tool_name="lookup_account",
+    )
+    context_wrapper = make_context_wrapper()
+    context_wrapper._rebuild_approvals(  # noqa: SLF001
+        {"lookup_account": {"approved": ["shared-request"], "rejected": []}}
+    )
+    with pytest.raises(ModelBehaviorError, match="canonical invocation identity"):
+        context_wrapper.reject_tool(pending_partial, rejection_message="new exact denial")
+
+
+def test_incomplete_current_hosted_mcp_request_does_not_reuse_scoped_pending_identity():
+    server_a = HostedMCPTool(
+        tool_config={
+            "type": "mcp",
+            "server_label": "server-a",
+            "server_url": "https://server-a.example/mcp",
+        }
+    )
+    agent = make_agent(tools=[server_a])
+    pending_complete = ToolApprovalItem(
+        agent=agent,
+        raw_item=McpApprovalRequest(
+            id="shared-request",
+            type="mcp_approval_request",
+            server_label="server-a",
+            arguments="{}",
+            name="lookup_account",
+        ),
+    )
+    current_incomplete = McpApprovalRequest.model_construct(
+        id="shared-request",
+        type="mcp_approval_request",
+        arguments="{}",
+    )
+    request_run = ToolRunMCPApprovalRequest(
+        request_item=current_incomplete,
+        mcp_tool=server_a,
+    )
+    context_wrapper = make_context_wrapper()
+    context_wrapper.approve_tool(pending_complete, always_approve=True)
+
+    approved, manual_pending = tool_execution.collect_manual_mcp_approvals(
+        agent=agent,
+        requests=[request_run],
+        context_wrapper=context_wrapper,
+        existing_pending_by_call_id={"shared-request": pending_complete},
+    )
+
+    assert approved == []
+    assert len(manual_pending) == 1
+    assert manual_pending[0].raw_item is current_incomplete
+
+
 @pytest.mark.asyncio
 async def test_execute_tools_uses_public_agent_for_hosted_mcp_interruptions():
     """Hosted MCP approval items should expose the public agent when execution uses a clone."""
@@ -3325,12 +4033,14 @@ async def test_resolve_interrupted_turn_uses_public_agent_for_resumed_hosted_mcp
     public_agent = make_agent(tools=[mcp_tool])
     execution_agent = public_agent.clone()
     set_public_agent(execution_agent, public_agent)
-    request_item = McpApprovalRequest(
+    program_caller = {"type": "program", "caller_id": "program-resume"}
+    request_item = McpApprovalRequest.model_construct(
         id="mcp-approval-resume-public-agent",
         type="mcp_approval_request",
         server_label="test_mcp_server",
         arguments="{}",
         name="list_repo_languages",
+        caller=program_caller,
     )
     approval_item = ToolApprovalItem(
         agent=public_agent,
@@ -3368,6 +4078,7 @@ async def test_resolve_interrupted_turn_uses_public_agent_for_resumed_hosted_mcp
     ]
     assert responses
     assert all(item.agent is public_agent for item in responses)
+    assert all(item.raw_item.get("caller") == program_caller for item in responses)
 
 
 @pytest.mark.asyncio
@@ -3379,8 +4090,12 @@ async def test_execute_handoffs_uses_public_agent_for_ignored_extra_handoffs():
     public_agent = Agent(name="triage", handoffs=[first_target, second_target])
     execution_agent = public_agent.clone()
     set_public_agent(execution_agent, public_agent)
+    first_call = cast(ResponseFunctionToolCall, get_handoff_tool_call(first_target))
+    first_call.call_id = "handoff-alpha"
+    second_call = cast(ResponseFunctionToolCall, get_handoff_tool_call(second_target))
+    second_call.call_id = "handoff-beta"
     response = ModelResponse(
-        output=[get_handoff_tool_call(first_target), get_handoff_tool_call(second_target)],
+        output=[first_call, second_call],
         usage=Usage(),
         response_id="resp",
     )
@@ -3550,3 +4265,365 @@ async def test_execute_tools_emits_hosted_mcp_rejection_reason_from_explicit_mes
     assert responses[0].raw_item["approve"] is False
     assert responses[0].raw_item["approval_request_id"] == "mcp-approval-reject-reason"
     assert responses[0].raw_item["reason"] == "Denied by policy"
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_plan_cancels_sibling_category_on_failure() -> None:
+    from agents.run_internal.tool_planning import ToolExecutionPlan, _execute_tool_plan
+
+    from .test_computer_tool_lifecycle import FakeComputer
+
+    shell_started = asyncio.Event()
+    shell_cancelled = asyncio.Event()
+    shell_finished = asyncio.Event()
+
+    async def blocking_executor(_request: Any) -> str:
+        shell_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            shell_cancelled.set()
+            raise
+        finally:
+            shell_finished.set()
+        return "unreachable"
+
+    async def reject_once_shell_is_running(_data: Any) -> bool:
+        await shell_started.wait()
+        return False
+
+    shell_tool = ShellTool(executor=blocking_executor)
+    computer_tool = ComputerTool(
+        computer=FakeComputer(), on_safety_check=reject_once_shell_is_running
+    )
+    agent: Agent[Any] = Agent(name="test", tools=[shell_tool, computer_tool])
+    plan = ToolExecutionPlan(
+        shell_calls=[
+            ToolRunShellCall(
+                tool_call=cast(Any, make_shell_call("shell-1", commands=["sleep 1000"])),
+                shell_tool=shell_tool,
+            )
+        ],
+        computer_actions=[
+            ToolRunComputerAction(
+                tool_call=ResponseComputerToolCall(
+                    id="computer-1",
+                    type="computer_call",
+                    call_id="computer-1",
+                    action=ActionScreenshot(type="screenshot"),
+                    pending_safety_checks=[
+                        PendingSafetyCheck(id="sc-1", code="malicious", message="nope")
+                    ],
+                    status="completed",
+                ),
+                computer_tool=computer_tool,
+            )
+        ],
+    )
+
+    with pytest.raises(UserError, match="safety check was not acknowledged"):
+        await _execute_tool_plan(
+            plan=plan,
+            bindings=bind_public_agent(agent),
+            hooks=RunHooks[Any](),
+            context_wrapper=RunContextWrapper(context=None),
+            run_config=RunConfig(),
+        )
+
+    assert shell_cancelled.is_set()
+    assert shell_finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_plan_drains_function_tools_on_sibling_failure() -> None:
+    from agents.run_internal.tool_planning import ToolExecutionPlan, _execute_tool_plan
+
+    from .test_computer_tool_lifecycle import FakeComputer
+
+    tool_started = asyncio.Event()
+    tool_cancelled = asyncio.Event()
+    tool_unwound = asyncio.Event()
+
+    @function_tool
+    async def slow_tool() -> str:
+        tool_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            tool_cancelled.set()
+            await asyncio.sleep(0)
+            tool_unwound.set()
+            raise
+        return "unreachable"
+
+    async def reject_once_tool_is_running(_data: Any) -> bool:
+        await tool_started.wait()
+        return False
+
+    computer_tool = ComputerTool(
+        computer=FakeComputer(), on_safety_check=reject_once_tool_is_running
+    )
+    agent: Agent[Any] = Agent(name="test", tools=[slow_tool, computer_tool])
+    plan = ToolExecutionPlan(
+        function_runs=[
+            ToolRunFunction(
+                tool_call=ResponseFunctionToolCall(
+                    id="fn-1",
+                    call_id="fn-1",
+                    name="slow_tool",
+                    arguments="{}",
+                    type="function_call",
+                ),
+                function_tool=cast(Any, slow_tool),
+            )
+        ],
+        computer_actions=[
+            ToolRunComputerAction(
+                tool_call=ResponseComputerToolCall(
+                    id="computer-1",
+                    type="computer_call",
+                    call_id="computer-1",
+                    action=ActionScreenshot(type="screenshot"),
+                    pending_safety_checks=[
+                        PendingSafetyCheck(id="sc-1", code="malicious", message="nope")
+                    ],
+                    status="completed",
+                ),
+                computer_tool=computer_tool,
+            )
+        ],
+    )
+
+    with pytest.raises(UserError, match="safety check was not acknowledged"):
+        await _execute_tool_plan(
+            plan=plan,
+            bindings=bind_public_agent(agent),
+            hooks=RunHooks[Any](),
+            context_wrapper=RunContextWrapper(context=None),
+            run_config=RunConfig(),
+        )
+
+    assert tool_cancelled.is_set()
+    assert tool_unwound.is_set()
+
+
+class _SlowToolEndHooks(RunHooks[Any]):
+    def __init__(self, started: asyncio.Event, finished: asyncio.Event) -> None:
+        self.started = started
+        self.finished = finished
+
+    async def on_tool_end(self, context: Any, agent: Any, tool: Any, result: Any) -> None:
+        self.started.set()
+        await asyncio.sleep(0.05)
+        self.finished.set()
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_plan_preserves_function_tool_post_invoke_work() -> None:
+    from agents.run_internal.tool_planning import ToolExecutionPlan, _execute_tool_plan
+
+    from .test_computer_tool_lifecycle import FakeComputer
+
+    post_invoke_started = asyncio.Event()
+    post_invoke_finished = asyncio.Event()
+
+    @function_tool
+    async def quick_tool() -> str:
+        return "ok"
+
+    async def reject_once_post_invoke_is_running(_data: Any) -> bool:
+        await post_invoke_started.wait()
+        return False
+
+    computer_tool = ComputerTool(
+        computer=FakeComputer(), on_safety_check=reject_once_post_invoke_is_running
+    )
+    agent: Agent[Any] = Agent(name="test", tools=[quick_tool, computer_tool])
+    plan = ToolExecutionPlan(
+        function_runs=[
+            ToolRunFunction(
+                tool_call=ResponseFunctionToolCall(
+                    id="fn-1",
+                    call_id="fn-1",
+                    name="quick_tool",
+                    arguments="{}",
+                    type="function_call",
+                ),
+                function_tool=cast(Any, quick_tool),
+            )
+        ],
+        computer_actions=[
+            ToolRunComputerAction(
+                tool_call=ResponseComputerToolCall(
+                    id="computer-1",
+                    type="computer_call",
+                    call_id="computer-1",
+                    action=ActionScreenshot(type="screenshot"),
+                    pending_safety_checks=[
+                        PendingSafetyCheck(id="sc-1", code="malicious", message="nope")
+                    ],
+                    status="completed",
+                ),
+                computer_tool=computer_tool,
+            )
+        ],
+    )
+
+    with pytest.raises(UserError, match="safety check was not acknowledged"):
+        await _execute_tool_plan(
+            plan=plan,
+            bindings=bind_public_agent(agent),
+            hooks=_SlowToolEndHooks(post_invoke_started, post_invoke_finished),
+            context_wrapper=RunContextWrapper(context=None),
+            run_config=RunConfig(),
+        )
+
+    assert post_invoke_started.is_set()
+    assert post_invoke_finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_plan_parent_cancellation_does_not_wait_for_function_cleanup() -> None:
+    from agents.run_internal.tool_planning import ToolExecutionPlan, _execute_tool_plan
+
+    tool_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+    allow_cleanup_exit = asyncio.Event()
+
+    @function_tool
+    async def slow_tool() -> str:
+        tool_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cleanup_started.set()
+            await allow_cleanup_exit.wait()
+            cleanup_finished.set()
+            raise
+        return "unreachable"
+
+    agent: Agent[Any] = Agent(name="test", tools=[slow_tool])
+    plan = ToolExecutionPlan(
+        function_runs=[
+            ToolRunFunction(
+                tool_call=ResponseFunctionToolCall(
+                    id="fn-1",
+                    call_id="fn-1",
+                    name="slow_tool",
+                    arguments="{}",
+                    type="function_call",
+                ),
+                function_tool=cast(Any, slow_tool),
+            )
+        ]
+    )
+    execution_task = asyncio.create_task(
+        _execute_tool_plan(
+            plan=plan,
+            bindings=bind_public_agent(agent),
+            hooks=RunHooks[Any](),
+            context_wrapper=RunContextWrapper(context=None),
+            run_config=RunConfig(),
+        )
+    )
+    await tool_started.wait()
+
+    execution_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(execution_task, timeout=0.1)
+
+    await cleanup_started.wait()
+    allow_cleanup_exit.set()
+    await cleanup_finished.wait()
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_plan_parent_cancellation_interrupts_sibling_failure_drain() -> None:
+    from agents.run_internal.tool_planning import ToolExecutionPlan, _execute_tool_plan
+
+    from .test_computer_tool_lifecycle import FakeComputer
+
+    tool_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    allow_cleanup_exit = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+    loop_errors: list[dict[str, object]] = []
+    loop = asyncio.get_running_loop()
+    previous_exception_handler = loop.get_exception_handler()
+
+    @function_tool
+    async def slow_tool() -> str:
+        tool_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cleanup_started.set()
+            await allow_cleanup_exit.wait()
+            cleanup_finished.set()
+            raise RuntimeError("late cleanup failure") from None
+        return "unreachable"
+
+    async def reject_once_tool_is_running(_data: Any) -> bool:
+        await tool_started.wait()
+        return False
+
+    computer_tool = ComputerTool(
+        computer=FakeComputer(), on_safety_check=reject_once_tool_is_running
+    )
+    agent: Agent[Any] = Agent(name="test", tools=[slow_tool, computer_tool])
+    plan = ToolExecutionPlan(
+        function_runs=[
+            ToolRunFunction(
+                tool_call=ResponseFunctionToolCall(
+                    id="fn-1",
+                    call_id="fn-1",
+                    name="slow_tool",
+                    arguments="{}",
+                    type="function_call",
+                ),
+                function_tool=cast(Any, slow_tool),
+            )
+        ],
+        computer_actions=[
+            ToolRunComputerAction(
+                tool_call=ResponseComputerToolCall(
+                    id="computer-1",
+                    type="computer_call",
+                    call_id="computer-1",
+                    action=ActionScreenshot(type="screenshot"),
+                    pending_safety_checks=[
+                        PendingSafetyCheck(id="sc-1", code="malicious", message="nope")
+                    ],
+                    status="completed",
+                ),
+                computer_tool=computer_tool,
+            )
+        ],
+    )
+
+    loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+    try:
+        execution_task = asyncio.create_task(
+            _execute_tool_plan(
+                plan=plan,
+                bindings=bind_public_agent(agent),
+                hooks=RunHooks[Any](),
+                context_wrapper=RunContextWrapper(context=None),
+                run_config=RunConfig(),
+            )
+        )
+        await cleanup_started.wait()
+
+        execution_task.cancel()
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await execution_task
+        finally:
+            allow_cleanup_exit.set()
+        await asyncio.wait_for(cleanup_finished.wait(), timeout=1.0)
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_exception_handler)
+
+    assert loop_errors == []

@@ -2,16 +2,25 @@
 
 from __future__ import annotations
 
+import asyncio
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from openai.types.responses.response_output_item import Program, ProgramOutput
 
-from agents import Agent, Runner, TResponseInputItem
+from agents import (
+    Agent,
+    ProgrammaticToolCallingTool,
+    Runner,
+    TResponseInputItem,
+    function_tool,
+)
 from agents.memory.openai_conversations_session import (
     OpenAIConversationsSession,
     start_openai_conversations_session,
 )
-from tests.fake_model import FakeModel
+from agents.testing import ScriptedModel
 from tests.test_responses import get_text_message
 
 
@@ -37,8 +46,8 @@ def mock_openai_client():
 
 @pytest.fixture
 def agent() -> Agent:
-    """Fixture for a basic agent with a fake model."""
-    return Agent(name="test", model=FakeModel())
+    """Fixture for a basic agent with a scripted model."""
+    return Agent(name="test", model=ScriptedModel())
 
 
 class TestStartOpenAIConversationsSession:
@@ -71,6 +80,21 @@ class TestStartOpenAIConversationsSession:
                 assert conversation_id == "default_client_id"
                 mock_get_default.assert_called_once()
                 mock_default_client.conversations.create.assert_called_once_with(items=[])
+
+    @pytest.mark.asyncio
+    async def test_start_preserves_falsy_default_client(self):
+        mock_default_client = AsyncMock()
+        mock_default_client.__bool__.return_value = False
+        mock_default_client.conversations.create.return_value = MagicMock(id="default_client_id")
+
+        with patch(
+            "agents.memory.openai_conversations_session.get_default_openai_client",
+            return_value=mock_default_client,
+        ):
+            conversation_id = await start_openai_conversations_session(None)
+
+        assert conversation_id == "default_client_id"
+        mock_default_client.conversations.create.assert_awaited_once_with(items=[])
 
     @pytest.mark.asyncio
     async def test_start_with_none_client_fallback(self):
@@ -195,6 +219,20 @@ class TestOpenAIConversationsSessionBasicOperations:
     """Test basic CRUD operations with simple mocking."""
 
     @pytest.mark.asyncio
+    async def test_get_items_zero_limit_returns_empty_without_api_call(self, mock_openai_client):
+        """A zero history limit must not be forwarded to the Conversations API."""
+        mock_openai_client.conversations.items.list = MagicMock(
+            side_effect=AssertionError("items.list must not receive limit=0")
+        )
+        session = OpenAIConversationsSession(openai_client=mock_openai_client)
+
+        assert await session.get_items(limit=0) == []
+
+        mock_openai_client.conversations.create.assert_awaited_once_with(items=[])
+        assert session.session_id == "test_conversation_id"
+        mock_openai_client.conversations.items.list.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_add_items_simple(self, mock_openai_client):
         """Test adding items to the conversation."""
         session = OpenAIConversationsSession(
@@ -227,6 +265,31 @@ class TestOpenAIConversationsSessionBasicOperations:
         mock_openai_client.conversations.items.create.assert_called_once_with(
             conversation_id="test_conversation_id", items=items
         )
+
+    @pytest.mark.asyncio
+    async def test_add_items_empty_does_not_create_session(self, mock_openai_client):
+        """Test that add_items with no items does not create a remote conversation."""
+        session = OpenAIConversationsSession(openai_client=mock_openai_client)
+
+        await session.add_items([])
+
+        mock_openai_client.conversations.create.assert_not_called()
+        mock_openai_client.conversations.items.create.assert_not_called()
+        with pytest.raises(ValueError, match="add_items\\(\\) with a non-empty list"):
+            _ = session.session_id
+
+    @pytest.mark.asyncio
+    async def test_add_items_empty_keeps_existing_session_id(self, mock_openai_client):
+        """Test that add_items with no items leaves an initialized session untouched."""
+        session = OpenAIConversationsSession(
+            conversation_id="test_id", openai_client=mock_openai_client
+        )
+
+        await session.add_items([])
+
+        mock_openai_client.conversations.create.assert_not_called()
+        mock_openai_client.conversations.items.create.assert_not_called()
+        assert session.session_id == "test_id"
 
     @pytest.mark.asyncio
     async def test_pop_item_with_items(self, mock_openai_client):
@@ -274,18 +337,106 @@ class TestOpenAIConversationsSessionBasicOperations:
         assert session._session_id is None
 
     @pytest.mark.asyncio
-    async def test_clear_session_creates_session_id_first(self, mock_openai_client):
-        """Test that clear_session creates session_id if it doesn't exist."""
+    async def test_clear_session_uninitialized_does_not_create_session(self, mock_openai_client):
+        """Test that clear_session on an uninitialized session does not call create or delete."""
         session = OpenAIConversationsSession(openai_client=mock_openai_client)
 
         await session.clear_session()
 
-        # Should create conversation first, then delete it
-        mock_openai_client.conversations.create.assert_called_once_with(items=[])
-        mock_openai_client.conversations.delete.assert_called_once_with(
-            conversation_id="test_conversation_id"
-        )
+        mock_openai_client.conversations.create.assert_not_called()
+        mock_openai_client.conversations.delete.assert_not_called()
         assert session._session_id is None
+
+    @pytest.mark.asyncio
+    async def test_clear_session_uninitialized_no_api_calls_on_create_failure(
+        self, mock_openai_client
+    ):
+        """Test that clear_session on an uninitialized session succeeds even if create raises."""
+        mock_openai_client.conversations.create.side_effect = RuntimeError("API connection error")
+        session = OpenAIConversationsSession(openai_client=mock_openai_client)
+
+        await session.clear_session()
+
+        mock_openai_client.conversations.create.assert_not_called()
+        mock_openai_client.conversations.delete.assert_not_called()
+        assert session._session_id is None
+
+    @pytest.mark.asyncio
+    async def test_clear_session_failed_delete_retains_session_id(self, mock_openai_client):
+        """Test that a failed delete retains the session ID for potential retries."""
+        mock_openai_client.conversations.delete.side_effect = RuntimeError("Delete failed")
+        session = OpenAIConversationsSession(
+            conversation_id="test_id", openai_client=mock_openai_client
+        )
+
+        with pytest.raises(RuntimeError, match="Delete failed"):
+            await session.clear_session()
+
+        assert session._session_id == "test_id"
+
+    @pytest.mark.asyncio
+    async def test_clear_session_retry_after_failed_delete(self, mock_openai_client):
+        """Test that retrying clear_session after a failed delete targets the same ID
+        without calling create.
+        """
+        mock_openai_client.conversations.delete.side_effect = [
+            RuntimeError("Transient delete error"),
+            None,
+        ]
+        session = OpenAIConversationsSession(
+            conversation_id="test_id", openai_client=mock_openai_client
+        )
+
+        with pytest.raises(RuntimeError, match="Transient delete error"):
+            await session.clear_session()
+
+        assert session._session_id == "test_id"
+
+        # Retry clear_session
+        await session.clear_session()
+
+        mock_openai_client.conversations.create.assert_not_called()
+        assert mock_openai_client.conversations.delete.call_count == 2
+        mock_openai_client.conversations.delete.assert_called_with(conversation_id="test_id")
+        assert session._session_id is None
+
+    @pytest.mark.asyncio
+    async def test_clear_session_concurrent_get_does_not_clobber_new_session_id(
+        self, mock_openai_client
+    ):
+        """Test that a concurrent _get_session_id during clear_session waits for lock
+        and preserves new ID.
+        """
+
+        session = OpenAIConversationsSession(
+            conversation_id="old_id", openai_client=mock_openai_client
+        )
+        mock_openai_client.conversations.create.return_value = MagicMock(id="new_id")
+
+        delete_started = asyncio.Event()
+        allow_delete_finish = asyncio.Event()
+
+        async def slow_delete(*args: Any, **kwargs: Any) -> Any:
+            delete_started.set()
+            await allow_delete_finish.wait()
+            return None
+
+        mock_openai_client.conversations.delete.side_effect = slow_delete
+
+        clear_task = asyncio.create_task(session.clear_session())
+        await delete_started.wait()
+
+        # Concurrently attempt _get_session_id() while clear_session is deleting
+        get_task = asyncio.create_task(session._get_session_id())
+
+        # Allow delete to complete
+        allow_delete_finish.set()
+        await clear_task
+        new_id = await get_task
+
+        assert new_id == "new_id"
+        assert session._session_id == "new_id"
+        mock_openai_client.conversations.create.assert_called_once_with(items=[])
 
 
 class TestOpenAIConversationsSessionRunnerIntegration:
@@ -300,8 +451,8 @@ class TestOpenAIConversationsSessionRunnerIntegration:
         with patch.object(session, "get_items", return_value=[]):
             with patch.object(session, "add_items") as mock_add_items:
                 # Run the agent
-                assert isinstance(agent.model, FakeModel)
-                agent.model.set_next_output([get_text_message("San Francisco")])
+                assert isinstance(agent.model, ScriptedModel)
+                agent.model.enqueue([get_text_message("San Francisco")])
 
                 result = await Runner.run(
                     agent, "What city is the Golden Gate Bridge in?", session=session
@@ -326,20 +477,80 @@ class TestOpenAIConversationsSessionRunnerIntegration:
         with patch.object(session, "get_items", return_value=conversation_history):
             with patch.object(session, "add_items"):
                 # Second turn - should have access to previous conversation
-                assert isinstance(agent.model, FakeModel)
-                agent.model.set_next_output([get_text_message("California")])
+                assert isinstance(agent.model, ScriptedModel)
+                agent.model.enqueue([get_text_message("California")])
 
                 result = await Runner.run(agent, "What state is it in?", session=session)
 
                 assert result.final_output == "California"
 
                 # Verify that the model received the conversation history
-                last_input = agent.model.last_turn_args["input"]
+                last_input = agent.model.calls[-1].input
                 assert len(last_input) > 1  # Should include previous messages
 
                 # Check that previous conversation is included
                 input_contents = [str(item.get("content", "")) for item in last_input]
                 assert any("Golden Gate Bridge" in content for content in input_contents)
+
+    @pytest.mark.asyncio
+    async def test_runner_persists_program_item_ids(self, mock_openai_client):
+        """Program items keep the id the Conversations create-item schema requires."""
+        model = ScriptedModel()
+        model.extend(
+            [
+                [
+                    Program(
+                        id="program_item",
+                        call_id="call_program",
+                        code='lookup_inventory(sku="A-1")',
+                        fingerprint="fingerprint",
+                        type="program",
+                    ),
+                ],
+                [
+                    ProgramOutput(
+                        id="program_output_item",
+                        call_id="call_program",
+                        result='{"sku":"A-1","available_units":42}',
+                        status="completed",
+                        type="program_output",
+                    ),
+                    get_text_message("done"),
+                ],
+            ]
+        )
+
+        @function_tool(allowed_callers=["programmatic"])
+        def lookup_inventory(sku: str) -> str:
+            return sku
+
+        program_agent = Agent(
+            name="inventory",
+            model=model,
+            tools=[ProgrammaticToolCallingTool(), lookup_inventory],
+        )
+        session = OpenAIConversationsSession(openai_client=mock_openai_client)
+
+        saved: list[TResponseInputItem] = []
+
+        async def record(items: list[TResponseInputItem]) -> None:
+            saved.extend(items)
+
+        with patch.object(session, "get_items", return_value=[]):
+            with patch.object(session, "add_items", side_effect=record):
+                result = await Runner.run(program_agent, "Check inventory", session=session)
+
+        assert result.final_output == "done"
+
+        saved_items = {
+            item["type"]: item
+            for item in cast(list[dict[str, Any]], saved)
+            if isinstance(item, dict) and "type" in item
+        }
+        assert saved_items["program"]["id"] == "program_item"
+        assert saved_items["program_output"]["id"] == "program_output_item"
+        # Item types whose id the Conversations schema leaves optional stay stripped.
+        assert "id" not in saved_items["message"]
 
 
 class TestOpenAIConversationsSessionErrorHandling:
@@ -355,6 +566,12 @@ class TestOpenAIConversationsSessionErrorHandling:
 
         with pytest.raises(Exception, match="API Error"):
             await session._get_session_id()
+
+        mock_openai_client.conversations.create.side_effect = None
+        mock_openai_client.conversations.create.return_value = MagicMock(id="retry_id")
+
+        assert await session._get_session_id() == "retry_id"
+        assert mock_openai_client.conversations.create.call_count == 2
 
     @pytest.mark.asyncio
     async def test_api_failure_during_add_items(self, mock_openai_client):
@@ -444,6 +661,79 @@ class TestOpenAIConversationsSessionConcurrentAccess:
         # Conversation should only be created once
         mock_openai_client.conversations.create.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_concurrent_first_writes_share_one_conversation(self, mock_openai_client):
+        """Test that concurrent first writes cannot split session history."""
+        create_started = asyncio.Event()
+        release_create = asyncio.Event()
+        creation_count = 0
+
+        async def create_conversation(*, items):
+            nonlocal creation_count
+            creation_count += 1
+            conversation_id = f"conversation_{creation_count}"
+            create_started.set()
+            await release_create.wait()
+            return MagicMock(id=conversation_id)
+
+        mock_openai_client.conversations.create.side_effect = create_conversation
+        session = OpenAIConversationsSession(openai_client=mock_openai_client)
+        first_items: list[TResponseInputItem] = [{"role": "user", "content": "First message"}]
+        second_items: list[TResponseInputItem] = [{"role": "user", "content": "Second message"}]
+
+        first_write = asyncio.create_task(session.add_items(first_items))
+        await create_started.wait()
+        second_write = asyncio.create_task(session.add_items(second_items))
+        await asyncio.sleep(0)
+        release_create.set()
+        await asyncio.gather(first_write, second_write)
+
+        mock_openai_client.conversations.create.assert_called_once_with(items=[])
+        writes = mock_openai_client.conversations.items.create.call_args_list
+        assert len(writes) == 2
+        assert {call.kwargs["conversation_id"] for call in writes} == {session.session_id}
+
+    @pytest.mark.asyncio
+    async def test_concurrent_first_write_recovers_after_creation_failure(self, mock_openai_client):
+        """Test that a waiting writer recovers when the first initializer fails."""
+        first_create_started = asyncio.Event()
+        release_first_create = asyncio.Event()
+        creation_count = 0
+
+        async def create_conversation(*, items):
+            nonlocal creation_count
+            creation_count += 1
+            if creation_count == 1:
+                first_create_started.set()
+                await release_first_create.wait()
+                raise RuntimeError("Conversation creation failed")
+            return MagicMock(id="surviving_conversation")
+
+        mock_openai_client.conversations.create.side_effect = create_conversation
+        session = OpenAIConversationsSession(openai_client=mock_openai_client)
+        failed_items: list[TResponseInputItem] = [{"role": "user", "content": "Failed writer"}]
+        surviving_items: list[TResponseInputItem] = [
+            {"role": "user", "content": "Surviving writer"}
+        ]
+
+        failed_write = asyncio.create_task(session.add_items(failed_items))
+        await first_create_started.wait()
+        surviving_write = asyncio.create_task(session.add_items(surviving_items))
+        await asyncio.sleep(0)
+
+        mock_openai_client.conversations.create.assert_called_once_with(items=[])
+        release_first_create.set()
+
+        with pytest.raises(RuntimeError, match="Conversation creation failed"):
+            await failed_write
+        await surviving_write
+
+        assert mock_openai_client.conversations.create.call_count == 2
+        mock_openai_client.conversations.items.create.assert_called_once_with(
+            conversation_id="surviving_conversation", items=surviving_items
+        )
+        assert session.session_id == "surviving_conversation"
+
 
 # ============================================================================
 # SessionSettings Tests
@@ -473,3 +763,14 @@ class TestOpenAIConversationsSessionSettings:
 
         assert session.session_settings is not None
         assert session.session_settings.limit == 5
+
+    def test_session_settings_constructor_normalizes_dictionary(self, mock_openai_client):
+        from agents.memory import SessionSettings
+
+        session = OpenAIConversationsSession(
+            openai_client=mock_openai_client,
+            session_settings={"limit": 0},
+        )
+
+        assert isinstance(session.session_settings, SessionSettings)
+        assert session.session_settings.limit == 0

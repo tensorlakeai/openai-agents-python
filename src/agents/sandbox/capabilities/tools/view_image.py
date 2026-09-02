@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import mimetypes
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -11,9 +10,10 @@ from pydantic import BaseModel, Field
 
 from ....run_context import RunContextWrapper
 from ....tool import FunctionTool, ToolOutputImage
-from ...errors import WorkspaceReadNotFoundError
+from ...errors import InvalidManifestPathError, WorkspaceReadNotFoundError
 from ...session.base_sandbox_session import BaseSandboxSession
 from ...types import User
+from ...workspace_paths import SandboxWorkspaceScope, coerce_posix_path, sandbox_path_str
 
 _MAX_IMAGE_BYTES = 10 * 1024 * 1024
 _MAX_IMAGE_SIZE_LABEL = "10MB"
@@ -38,9 +38,8 @@ def _detect_image_mime_type(path: Path, payload: bytes) -> str | None:
     if snippet.startswith(b"<svg") or (snippet.startswith(b"<?xml") and b"<svg" in snippet):
         return "image/svg+xml"
 
-    guessed_type, _ = mimetypes.guess_type(path.name)
-    if isinstance(guessed_type, str) and guessed_type.startswith("image/"):
-        return guessed_type
+    if path.suffix.lower() in {".svg", ".svgz"}:
+        return "image/svg+xml"
     return None
 
 
@@ -63,7 +62,10 @@ def _coerce_payload_bytes(payload: object) -> bytes:
 
 class ViewImageArgs(BaseModel):
     path: str = Field(
-        description="Path to the image file. Absolute and relative workspace paths are supported.",
+        description=(
+            "Path to the image file. Workspace paths and explicitly granted sandbox paths are "
+            "supported."
+        ),
         min_length=1,
     )
 
@@ -73,10 +75,17 @@ class ViewImageTool(FunctionTool):
     tool_name: ClassVar[str] = "view_image"
     args_model: ClassVar[type[ViewImageArgs]] = ViewImageArgs
     tool_description: ClassVar[str] = (
-        "Loads an image from the sandbox workspace and returns it as a structured image output."
+        "Loads an image from the sandbox workspace or an explicitly granted sandbox path and "
+        "returns it as a structured image output."
     )
     session: BaseSandboxSession = field(init=False, repr=False, compare=False)
     user: str | User | None = field(default=None, init=False, repr=False, compare=False)
+    workspace_scope: SandboxWorkspaceScope = field(
+        default_factory=SandboxWorkspaceScope,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __init__(
         self,
@@ -86,9 +95,11 @@ class ViewImageTool(FunctionTool):
         needs_approval: (
             bool | Callable[[RunContextWrapper[Any], dict[str, Any], str], Awaitable[bool]]
         ) = False,
+        workspace_scope: SandboxWorkspaceScope | None = None,
     ) -> None:
         self.session = session
         self.user = user
+        self.workspace_scope = workspace_scope or SandboxWorkspaceScope()
         super().__init__(
             name=self.tool_name,
             description=self.tool_description,
@@ -102,10 +113,18 @@ class ViewImageTool(FunctionTool):
         return await self.run(self.args_model.model_validate_json(raw_input))
 
     async def run(self, args: ViewImageArgs) -> ToolOutputImage | str:
-        input_path = Path(args.path)
+        input_path = args.path
+        scoped_path = self.workspace_scope.anchor(coerce_posix_path(input_path))
         path_policy = self.session._workspace_path_policy()
-        resolved_path = path_policy.absolute_workspace_path(input_path)
-        display_path = path_policy.relative_path(input_path).as_posix()
+        resolved_path = path_policy.normalize_path(scoped_path)
+        try:
+            workspace_relative_path = path_policy.relative_path(scoped_path)
+            display_path = self.workspace_scope.display_path(
+                original_path=scoped_path,
+                workspace_relative_path=workspace_relative_path,
+            ).as_posix()
+        except InvalidManifestPathError:
+            display_path = sandbox_path_str(resolved_path)
 
         try:
             file_obj = await self.session.read(resolved_path, user=self.user)

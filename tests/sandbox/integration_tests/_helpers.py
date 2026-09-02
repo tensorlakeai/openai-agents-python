@@ -145,10 +145,12 @@ class MockExternalTools:
 def install_mock_external_tools(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    *,
+    writable_root: Path,
 ) -> MockExternalTools:
     bin_dir = tmp_path / "mock-bin"
     bin_dir.mkdir()
-    log_path = tmp_path / "mock-tool-calls.tsv"
+    log_path = writable_root / "mock-tool-calls.tsv"
     log_path.write_text("", encoding="utf-8")
 
     for name in MOCK_TOOL_NAMES:
@@ -200,27 +202,20 @@ def build_manifest_with_all_entry_types(*, workspace_root: Path, source_root: Pa
             "repo": GitRepo(repo="openai/mock-sandbox-fixture", ref="main"),
             "mounts/s3": S3Mount(
                 bucket="s3-bucket",
-                access_key_id="s3-access-key-id",
-                secret_access_key="s3-secret-access-key",
                 mount_strategy=InContainerMountStrategy(pattern=RcloneMountPattern()),
             ),
             "mounts/gcs": GCSMount(
                 bucket="gcs-bucket",
-                access_id="gcs-access-id",
-                secret_access_key="gcs-secret-access-key",
                 mount_strategy=InContainerMountStrategy(pattern=RcloneMountPattern()),
             ),
             "mounts/r2": R2Mount(
                 bucket="r2-bucket",
                 account_id="r2-account-id",
-                access_key_id="r2-access-key-id",
-                secret_access_key="r2-secret-access-key",
                 mount_strategy=InContainerMountStrategy(pattern=RcloneMountPattern()),
             ),
             "mounts/azure": AzureBlobMount(
                 account="azure-account",
                 container="azure-container",
-                account_key="azure-account-key",
                 mount_strategy=InContainerMountStrategy(pattern=RcloneMountPattern()),
             ),
         },

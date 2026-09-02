@@ -5,16 +5,16 @@ import sys
 import textwrap
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
-import httpx
+import httpx2
 import pytest
 
+import agents._debug as _debug
 from agents.tracing import flush_traces, get_trace_provider
 from agents.tracing.processor_interface import TracingExporter, TracingProcessor
-from agents.tracing.processors import BackendSpanExporter, BatchTraceProcessor
+from agents.tracing.processors import BackendSpanExporter, BatchTraceProcessor, ConsoleSpanExporter
 from agents.tracing.provider import DefaultTraceProvider, TraceProvider
 from agents.tracing.span_data import AgentSpanData
 from agents.tracing.spans import Span, SpanImpl
@@ -43,6 +43,20 @@ def get_trace(processor: TracingProcessor) -> TraceImpl:
         processor=processor,
         tracing_api_key=None,
     )
+
+
+@pytest.mark.parametrize("redacted", [True, False])
+def test_console_span_exporter_respects_data_policy(monkeypatch, capsys, redacted: bool) -> None:
+    monkeypatch.setattr(_debug, "DONT_LOG_MODEL_DATA", redacted)
+    monkeypatch.setattr(_debug, "DONT_LOG_TOOL_DATA", redacted)
+    span = get_span(mock_processor())
+    span.span_data.name = "SECRET_CONSOLE_SPAN"
+
+    ConsoleSpanExporter().export([span])
+
+    output = capsys.readouterr().out
+    assert ("SECRET_CONSOLE_SPAN" not in output) is redacted
+    assert "Export span" in output
 
 
 @pytest.fixture
@@ -118,15 +132,13 @@ def test_batch_trace_processor_force_flush(mocked_exporter):
 
     processor.force_flush()
 
-    # Ensure exporter.export was called with all items
-    # Because max_batch_size=2, it may have been called multiple times
-    total_exported = 0
-    for call_args in mocked_exporter.export.call_args_list:
-        batch = call_args[0][0]  # first positional arg to export() is the items list
-        total_exported += len(batch)
+    # Ensure exporter.export was called with all items in batches respecting max_batch_size=2
+    exported_batches = [call_args[0][0] for call_args in mocked_exporter.export.call_args_list]
+    total_exported = sum(len(batch) for batch in exported_batches)
 
-    # We pushed 3 items; ensure they all got exported
+    # We pushed 3 items; ensure they all got exported across 2 batches (sizes 2 and 1)
     assert total_exported == 3
+    assert [len(batch) for batch in exported_batches] == [2, 1]
 
     processor.shutdown()
 
@@ -270,34 +282,65 @@ def test_batch_trace_processor_survives_exporter_exception():
     assert exporter.call_count >= 3
 
 
-def test_batch_trace_processor_scheduled_export(mocked_exporter):
-    """
-    Tests that items are automatically exported when the schedule_delay expires.
-    We mock time.time() so we can trigger the condition without waiting in real time.
-    """
-    with patch("time.time") as mock_time:
-        base_time = 1000.0
-        mock_time.return_value = base_time
+@pytest.mark.parametrize(
+    ("adjusted_wall_time", "adjusted_monotonic_time", "expected_scheduled_exports"),
+    [
+        (2000.0, 100.5, 0),
+        (0.0, 101.5, 1),
+    ],
+)
+def test_batch_trace_processor_schedule_uses_monotonic_clock(
+    mocked_exporter,
+    monkeypatch,
+    adjusted_wall_time: float,
+    adjusted_monotonic_time: float,
+    expected_scheduled_exports: int,
+) -> None:
+    class ControlledTime:
+        def __init__(self) -> None:
+            self.wall_time = 1000.0
+            self.monotonic_time = 100.0
+            self.sleep_calls = 0
 
-        processor = BatchTraceProcessor(exporter=mocked_exporter, schedule_delay=1.0)
+        def time(self) -> float:
+            return self.wall_time
 
-        processor.on_span_end(get_span(processor))  # queue size = 1
+        def monotonic(self) -> float:
+            return self.monotonic_time
 
-        # Now artificially advance time beyond the next export time
-        mock_time.return_value = base_time + 2.0  # > base_time + schedule_delay
-        # Let the background thread run a bit
-        time.sleep(0.3)
+        def sleep(self, _seconds: float) -> None:
+            self.sleep_calls += 1
+            if self.sleep_calls == 1:
+                self.wall_time = adjusted_wall_time
+                self.monotonic_time = adjusted_monotonic_time
+            else:
+                processor._shutdown_event.set()
 
-        # Check that exporter.export was eventually called
-        # Because the background thread runs, we might need a small sleep
-        processor.shutdown()
+    controlled_time = ControlledTime()
+    monkeypatch.setattr("agents.tracing.processors.time", controlled_time)
+    processor = BatchTraceProcessor(
+        exporter=mocked_exporter,
+        max_queue_size=100,
+        schedule_delay=1.0,
+        export_trigger_ratio=1.0,
+    )
+    processor._queue.put_nowait(get_span(processor))
+    scheduled_export = object()
+    export_deadlines: list[float | None | object] = []
 
-    total_exported = 0
-    for call_args in mocked_exporter.export.call_args_list:
-        batch = call_args[0][0]
-        total_exported += len(batch)
+    def record_export(deadline: float | None | object = scheduled_export) -> None:
+        export_deadlines.append(deadline)
+        if sum(item is scheduled_export for item in export_deadlines) > 1:
+            processor._shutdown_event.set()
 
-    assert total_exported == 1, "Item should be exported after scheduled delay"
+    monkeypatch.setattr(processor, "_export_batches", record_export)
+
+    processor._run()
+
+    assert sum(deadline is scheduled_export for deadline in export_deadlines) == (
+        expected_scheduled_exports
+    )
+    assert export_deadlines[-1] is None
 
 
 def test_flush_traces_delegates_to_default_trace_provider():
@@ -317,7 +360,7 @@ def test_flush_traces_is_importable_from_top_level_agents_package():
     assert top_level_flush_traces is flush_traces
 
 
-def test_default_trace_provider_force_flush_respects_disabled_flag():
+def test_default_trace_provider_force_flush_still_flushes_when_disabled():
     provider = DefaultTraceProvider()
     mock_processor = MagicMock()
     provider.register_processor(mock_processor)
@@ -325,7 +368,7 @@ def test_default_trace_provider_force_flush_respects_disabled_flag():
     provider.set_disabled(True)
     provider.force_flush()
 
-    mock_processor.force_flush.assert_not_called()
+    mock_processor.force_flush.assert_called_once_with()
 
 
 def test_trace_provider_force_flush_and_shutdown_default_to_noops():
@@ -401,7 +444,7 @@ def mock_processor():
     return processor
 
 
-@patch("httpx.Client")
+@patch("httpx2.Client")
 def test_backend_span_exporter_no_items(mock_client):
     exporter = BackendSpanExporter(api_key="test_key")
     exporter.export([])
@@ -410,7 +453,7 @@ def test_backend_span_exporter_no_items(mock_client):
     exporter.close()
 
 
-@patch("httpx.Client")
+@patch("httpx2.Client")
 def test_backend_span_exporter_no_api_key(mock_client):
     # Ensure that os.environ is empty (sometimes devs have the openai api key set in their env)
 
@@ -423,7 +466,7 @@ def test_backend_span_exporter_no_api_key(mock_client):
         exporter.close()
 
 
-@patch("httpx.Client")
+@patch("httpx2.Client")
 def test_backend_span_exporter_2xx_success(mock_client):
     mock_response = MagicMock()
     mock_response.status_code = 200
@@ -437,22 +480,36 @@ def test_backend_span_exporter_2xx_success(mock_client):
     exporter.close()
 
 
-@patch("httpx.Client")
-def test_backend_span_exporter_4xx_client_error(mock_client):
-    mock_response = MagicMock()
-    mock_response.status_code = 400
-    mock_response.text = "Bad Request"
+@patch("httpx2.Client")
+@pytest.mark.parametrize("redacted", [True, False])
+def test_backend_span_exporter_4xx_client_error(mock_client, monkeypatch, caplog, redacted: bool):
+    monkeypatch.setattr(_debug, "DONT_LOG_MODEL_DATA", redacted)
+    monkeypatch.setattr(_debug, "DONT_LOG_TOOL_DATA", redacted)
+
+    class Response:
+        status_code = 400
+        text_reads = 0
+
+        @property
+        def text(self) -> str:
+            self.text_reads += 1
+            return "SECRET_TRACE_RESPONSE_BODY"
+
+    mock_response = Response()
     mock_client.return_value.post.return_value = mock_response
 
     exporter = BackendSpanExporter(api_key="test_key")
-    exporter.export([get_span(mock_processor())])
+    with caplog.at_level(logging.ERROR, logger="openai.agents"):
+        exporter.export([get_span(mock_processor())])
 
     # 4xx should not be retried
     mock_client.return_value.post.assert_called_once()
+    assert ("SECRET_TRACE_RESPONSE_BODY" not in caplog.text) is redacted
+    assert mock_response.text_reads == (0 if redacted else 1)
     exporter.close()
 
 
-@patch("httpx.Client")
+@patch("httpx2.Client")
 def test_backend_span_exporter_5xx_retry(mock_client):
     mock_response = MagicMock()
     mock_response.status_code = 500
@@ -471,7 +528,7 @@ def test_backend_span_exporter_5xx_retry(mock_client):
     exporter.close()
 
 
-@patch("httpx.Client")
+@patch("httpx2.Client")
 def test_backend_span_exporter_deadline_stops_during_5xx_retry_backoff(mock_client):
     mock_response = MagicMock()
     mock_response.status_code = 504
@@ -490,7 +547,7 @@ def test_backend_span_exporter_deadline_stops_during_5xx_retry_backoff(mock_clie
     exporter.close()
 
 
-@patch("httpx.Client")
+@patch("httpx2.Client")
 def test_batch_trace_processor_shutdown_interrupts_exporter_retry_backoff(mock_client):
     post_called = threading.Event()
     mock_response = MagicMock()
@@ -531,7 +588,7 @@ def test_batch_trace_processor_shutdown_interrupts_exporter_retry_backoff(mock_c
     exporter.close()
 
 
-@patch("httpx.Client")
+@patch("httpx2.Client")
 def test_batch_trace_processor_shutdown_without_timeout_preserves_export_retries(mock_client):
     mock_response = MagicMock()
     mock_response.status_code = 504
@@ -556,27 +613,14 @@ def test_batch_trace_processor_shutdown_without_timeout_preserves_export_retries
 
 
 @pytest.mark.serial
+@pytest.mark.review_optional
 def test_tracing_atexit_cleanup_timeout_preserves_process_exit_code_on_504() -> None:
-    request_seen = threading.Event()
-
-    class Always504Handler(BaseHTTPRequestHandler):
-        def do_POST(self) -> None:
-            request_seen.set()
-            self.send_response(504)
-            self.end_headers()
-            self.wfile.write(b"gateway timeout")
-
-        def log_message(self, format: str, *args: Any) -> None:
-            return
-
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Always504Handler)
-    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
-    server_thread.start()
-
     script = textwrap.dedent(
-        f"""
+        """
         import sys
+        import threading
         import time
+        from unittest.mock import patch
 
         from agents.tracing import custom_span, trace
         from agents.tracing.processors import BackendSpanExporter, BatchTraceProcessor
@@ -585,13 +629,29 @@ def test_tracing_atexit_cleanup_timeout_preserves_process_exit_code_on_504() -> 
 
         tracing_setup._DEFAULT_SHUTDOWN_TIMEOUT = 0.2
 
-        exporter = BackendSpanExporter(
-            api_key="test_key",
-            endpoint="http://127.0.0.1:{server.server_port}/traces/ingest",
-            max_retries=100,
-            base_delay=10.0,
-            max_delay=10.0,
-        )
+        class Always504Response:
+            status_code = 504
+            text = "gateway timeout"
+
+        class Always504Client:
+            def __init__(self):
+                self.request_seen = threading.Event()
+
+            def post(self, **kwargs):
+                self.request_seen.set()
+                return Always504Response()
+
+            def close(self):
+                pass
+
+        client = Always504Client()
+        with patch("agents.tracing.processors.httpx2.Client", return_value=client):
+            exporter = BackendSpanExporter(
+                api_key="test_key",
+                max_retries=100,
+                base_delay=10.0,
+                max_delay=10.0,
+            )
         processor = BatchTraceProcessor(
             exporter=exporter,
             max_queue_size=1,
@@ -609,7 +669,7 @@ def test_tracing_atexit_cleanup_timeout_preserves_process_exit_code_on_504() -> 
                 return original_shutdown(*args, **kwargs)
             finally:
                 print(
-                    f"shutdown_elapsed={{time.monotonic() - shutdown_started:.6f}}",
+                    f"shutdown_elapsed={time.monotonic() - shutdown_started:.6f}",
                     flush=True,
                 )
 
@@ -620,24 +680,19 @@ def test_tracing_atexit_cleanup_timeout_preserves_process_exit_code_on_504() -> 
             with custom_span("probe-span"):
                 pass
 
-        time.sleep(0.3)
+        assert client.request_seen.wait(timeout=5.0)
         sys.exit(7)
         """
     )
 
-    try:
-        result = subprocess.run(
-            [sys.executable, "-c", script],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=10.0,
-        )
-    finally:
-        server.shutdown()
-        server.server_close()
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10.0,
+    )
 
-    assert request_seen.is_set()
     assert result.returncode == 7
     shutdown_elapsed_prefix = "shutdown_elapsed="
     shutdown_elapsed_lines = [
@@ -647,10 +702,10 @@ def test_tracing_atexit_cleanup_timeout_preserves_process_exit_code_on_504() -> 
     assert float(shutdown_elapsed_lines[0][len(shutdown_elapsed_prefix) :]) < 0.5
 
 
-@patch("httpx.Client")
+@patch("httpx2.Client")
 def test_backend_span_exporter_request_error(mock_client):
     # Make post() raise a RequestError each time
-    mock_client.return_value.post.side_effect = httpx.RequestError("Network error")
+    mock_client.return_value.post.side_effect = httpx2.RequestError("Network error")
 
     exporter = BackendSpanExporter(api_key="test_key", max_retries=2, base_delay=0.1, max_delay=0.2)
     with patch.object(exporter._shutdown_event, "wait", return_value=False) as wait_for_retry:
@@ -663,7 +718,7 @@ def test_backend_span_exporter_request_error(mock_client):
     exporter.close()
 
 
-@patch("httpx.Client")
+@patch("httpx2.Client")
 def test_backend_span_exporter_close(mock_client):
     exporter = BackendSpanExporter(api_key="test_key")
     exporter.close()
@@ -672,7 +727,7 @@ def test_backend_span_exporter_close(mock_client):
     mock_client.return_value.close.assert_called_once()
 
 
-@patch("httpx.Client")
+@patch("httpx2.Client")
 def test_backend_span_exporter_sanitizes_generation_usage_for_openai_tracing(mock_client):
     """Unsupported usage keys should be stripped before POSTing to OpenAI tracing."""
 
@@ -727,7 +782,7 @@ def test_backend_span_exporter_sanitizes_generation_usage_for_openai_tracing(moc
     exporter.close()
 
 
-@patch("httpx.Client")
+@patch("httpx2.Client")
 def test_backend_span_exporter_truncates_large_input_for_openai_tracing(mock_client):
     class DummyItem:
         tracing_api_key = None
@@ -761,7 +816,7 @@ def test_backend_span_exporter_truncates_large_input_for_openai_tracing(mock_cli
     exporter.close()
 
 
-@patch("httpx.Client")
+@patch("httpx2.Client")
 def test_backend_span_exporter_truncates_large_structured_input_without_stringifying(mock_client):
     class NoStringifyDict(dict[str, Any]):
         def __str__(self) -> str:
@@ -801,7 +856,7 @@ def test_backend_span_exporter_truncates_large_structured_input_without_stringif
     exporter.close()
 
 
-@patch("httpx.Client")
+@patch("httpx2.Client")
 def test_backend_span_exporter_keeps_generation_usage_for_custom_endpoint(mock_client):
     class DummyItem:
         tracing_api_key = None
@@ -839,7 +894,7 @@ def test_backend_span_exporter_keeps_generation_usage_for_custom_endpoint(mock_c
     exporter.close()
 
 
-@patch("httpx.Client")
+@patch("httpx2.Client")
 def test_backend_span_exporter_drops_non_generation_usage_for_openai_endpoint(mock_client):
     class DummyItem:
         tracing_api_key = None
@@ -865,7 +920,7 @@ def test_backend_span_exporter_drops_non_generation_usage_for_openai_endpoint(mo
     exporter.close()
 
 
-@patch("httpx.Client")
+@patch("httpx2.Client")
 def test_backend_span_exporter_keeps_non_generation_usage_for_custom_endpoint(mock_client):
     class DummyItem:
         tracing_api_key = None
@@ -910,7 +965,7 @@ def test_sanitize_for_openai_tracing_api_keeps_allowed_generation_usage():
     exporter.close()
 
 
-@patch("httpx.Client")
+@patch("httpx2.Client")
 def test_backend_span_exporter_keeps_large_input_for_custom_endpoint(mock_client):
     class DummyItem:
         tracing_api_key = None

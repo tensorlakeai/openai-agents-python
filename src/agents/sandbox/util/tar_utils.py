@@ -8,6 +8,7 @@ import tarfile
 import tempfile
 from collections.abc import Iterable
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import cast
 
 
 class UnsafeTarMemberError(ValueError):
@@ -158,7 +159,7 @@ def strip_tar_member_prefix(data: io.IOBase, *, prefix: str | Path) -> io.IOBase
         with tarfile.open(fileobj=out, mode="r:*") as tar:
             validate_tarfile(tar)
         out.seek(0)
-        return out
+        return cast(io.IOBase, out)
     except Exception:
         out.close()
         raise
@@ -181,6 +182,19 @@ def _is_within(path: Path, prefix: Path) -> bool:
     return path.parts[: len(prefix.parts)] == prefix.parts
 
 
+def _tar_member_rel_variants(member_name: str, root_name: str | None) -> list[Path]:
+    raw_parts = [p for p in Path(member_name).parts if p not in ("", ".")]
+    if raw_parts[:1] == ["/"]:
+        raw_parts = raw_parts[1:]
+    if not raw_parts:
+        return [Path()]
+
+    variants = [Path(*raw_parts)]
+    if root_name and raw_parts[0] == root_name:
+        variants.append(Path(*raw_parts[1:]))
+    return variants
+
+
 def should_skip_tar_member(
     member_name: str,
     *,
@@ -194,18 +208,24 @@ def should_skip_tar_member(
     directory name depending on how the tar was produced.
     """
 
-    raw_parts = [p for p in Path(member_name).parts if p not in ("", ".")]
-    if raw_parts[:1] == ["/"]:
-        raw_parts = raw_parts[1:]
-    if not raw_parts:
-        rel_variants = [Path()]
-    else:
-        rel_variants = [Path(*raw_parts)]
-        if root_name and raw_parts and raw_parts[0] == root_name:
-            rel_variants.append(Path(*raw_parts[1:]))
-
+    rel_variants = _tar_member_rel_variants(member_name, root_name)
     prefixes = [_normalize_rel(p) for p in skip_rel_paths]
     return any(_is_within(rel, prefix) for rel in rel_variants for prefix in prefixes)
+
+
+def _restored_regular_file_mode(mode: int) -> int:
+    """Return the permission bits to restore for an extracted regular file.
+
+    This mirrors the mode policy of the standard library's ``tarfile`` ``data`` filter, which
+    this extractor replaces: setuid, setgid, sticky and group/other write bits are dropped,
+    execute bits are kept only when the owner had them, and the owner is always left able to
+    read and write the file.
+    """
+
+    restored = mode & 0o755
+    if not restored & 0o100:
+        restored &= ~0o111
+    return restored | 0o600
 
 
 def _ensure_no_symlink_parents(*, root: Path, dest: Path, check_leaf: bool = True) -> None:
@@ -234,6 +254,7 @@ def _ensure_no_symlink_parents(*, root: Path, dest: Path, check_leaf: bool = Tru
 def validate_tarfile(
     tar: tarfile.TarFile,
     *,
+    reject_rel_paths: Iterable[str | Path] = (),
     reject_symlink_rel_paths: Iterable[str | Path] = (),
     skip_rel_paths: Iterable[str | Path] = (),
     root_name: str | None = None,
@@ -250,6 +271,7 @@ def validate_tarfile(
     been restored.
     """
 
+    rejected_rel_paths = {_normalize_rel(path) for path in reject_rel_paths}
     rejected_symlink_rel_paths = {_normalize_rel(path) for path in reject_symlink_rel_paths}
     members_by_rel_path: dict[Path, tarfile.TarInfo] = {}
     symlink_rel_paths: set[Path] = set()
@@ -265,6 +287,17 @@ def validate_tarfile(
         rel_path = safe_tar_member_rel_path(member, allow_symlinks=allow_symlinks)
         if rel_path is None:
             continue
+        rel_variants = _tar_member_rel_variants(member.name, root_name)
+        for rejected_path in rejected_rel_paths:
+            if any(
+                _is_within(variant, rejected_path)
+                or (not member.isdir() and _is_within(rejected_path, variant))
+                for variant in rel_variants
+            ):
+                raise UnsafeTarMemberError(
+                    member=member.name,
+                    reason=f"archive member overlaps protected path: {rejected_path.as_posix()}",
+                )
 
         previous = members_by_rel_path.get(rel_path)
         if previous is not None and not (previous.isdir() and member.isdir()):
@@ -308,6 +341,7 @@ def validate_tarfile(
 def validate_tar_bytes(
     raw: bytes,
     *,
+    reject_rel_paths: Iterable[str | Path] = (),
     reject_symlink_rel_paths: Iterable[str | Path] = (),
     skip_rel_paths: Iterable[str | Path] = (),
     root_name: str | None = None,
@@ -319,6 +353,7 @@ def validate_tar_bytes(
         with tarfile.open(fileobj=io.BytesIO(raw), mode="r:*") as tar:
             validate_tarfile(
                 tar,
+                reject_rel_paths=reject_rel_paths,
                 reject_symlink_rel_paths=reject_symlink_rel_paths,
                 skip_rel_paths=skip_rel_paths,
                 root_name=root_name,
@@ -391,6 +426,14 @@ def safe_extract_tarfile(
         try:
             with os.fdopen(fd, "wb") as out:
                 shutil.copyfileobj(fileobj, out)
+                out.flush()
+                if hasattr(os, "fchmod"):
+                    # Restore the archived permissions so a workspace snapshot round-trip keeps
+                    # executable scripts executable. This runs on the still-open descriptor,
+                    # after the payload is written and flushed: the file keeps its private
+                    # creation mode while it holds partial data, and a failed copy leaves the
+                    # partial file at 0o600 instead of its final readable/executable mode.
+                    os.fchmod(out.fileno(), _restored_regular_file_mode(member.mode))
         finally:
             try:
                 fileobj.close()

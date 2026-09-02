@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-import httpx
-from openai import AsyncOpenAI, DefaultAsyncHttpxClient
+from typing import Any
 
+import httpx2
+from openai import AsyncOpenAI, DefaultAsyncHttpx2Client
+
+from ...exceptions import UserError
 from ...models import _openai_shared
 from ...models.openai_agent_registration import (
     OpenAIAgentRegistrationConfig,
@@ -13,15 +16,15 @@ from ..model import STTModel, TTSModel, VoiceModelProvider
 from .openai_stt import OpenAISTTModel
 from .openai_tts import OpenAITTSModel
 
-_http_client: httpx.AsyncClient | None = None
+_http_client: httpx2.AsyncClient | None = None
 
 
-# If we create a new httpx client for each request, that would mean no sharing of connection pools,
+# If we create a new HTTP client for each request, that would mean no sharing of connection pools,
 # which would mean worse latency and resource usage. So, we share the client across requests.
-def shared_http_client() -> httpx.AsyncClient:
+def shared_http_client() -> httpx2.AsyncClient:
     global _http_client
     if _http_client is None:
-        _http_client = DefaultAsyncHttpxClient()
+        _http_client = DefaultAsyncHttpx2Client()
     return _http_client
 
 
@@ -40,7 +43,7 @@ class OpenAIVoiceModelProvider(VoiceModelProvider):
         openai_client: AsyncOpenAI | None = None,
         organization: str | None = None,
         project: str | None = None,
-        agent_registration: OpenAIAgentRegistrationConfig | None = None,
+        agent_registration: OpenAIAgentRegistrationConfig | dict[str, Any] | None = None,
     ) -> None:
         """Create a new OpenAI voice model provider.
 
@@ -56,9 +59,11 @@ class OpenAIVoiceModelProvider(VoiceModelProvider):
             agent_registration: Optional agent registration configuration.
         """
         if openai_client is not None:
-            assert api_key is None and base_url is None, (
-                "Don't provide api_key or base_url if you provide openai_client"
-            )
+            if any(value is not None for value in (api_key, base_url, organization, project)):
+                raise UserError(
+                    "Don't provide api_key, base_url, organization, or project if you provide "
+                    "openai_client"
+                )
             self._client: AsyncOpenAI | None = openai_client
         else:
             self._client = None
@@ -76,12 +81,32 @@ class OpenAIVoiceModelProvider(VoiceModelProvider):
     # AsyncOpenAI() raises an error if you don't have an API key set.
     def _get_client(self) -> AsyncOpenAI:
         if self._client is None:
-            self._client = _openai_shared.get_default_openai_client() or AsyncOpenAI(
-                api_key=self._stored_api_key or _openai_shared.get_default_openai_key(),
-                base_url=self._stored_base_url,
-                organization=self._stored_organization,
-                project=self._stored_project,
-                http_client=shared_http_client(),
+            has_explicit_client_options = any(
+                value is not None
+                for value in (
+                    self._stored_api_key,
+                    self._stored_base_url,
+                    self._stored_organization,
+                    self._stored_project,
+                )
+            )
+            default_client = (
+                None if has_explicit_client_options else _openai_shared.get_default_openai_client()
+            )
+            self._client = (
+                default_client
+                if default_client is not None
+                else AsyncOpenAI(
+                    api_key=(
+                        self._stored_api_key
+                        if self._stored_api_key is not None
+                        else _openai_shared.get_default_openai_key()
+                    ),
+                    base_url=self._stored_base_url,
+                    organization=self._stored_organization,
+                    project=self._stored_project,
+                    http_client=shared_http_client(),
+                )
             )
 
         return self._client

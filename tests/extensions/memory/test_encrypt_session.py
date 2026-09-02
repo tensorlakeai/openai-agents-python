@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -10,9 +10,16 @@ pytest.importorskip("cryptography")  # Skip tests if cryptography is not install
 
 from cryptography.fernet import Fernet
 
-from agents import Agent, Runner, SessionSettings, SQLiteSession, TResponseInputItem
+from agents import (
+    Agent,
+    RunContextWrapper,
+    Runner,
+    SessionSettings,
+    SQLiteSession,
+    TResponseInputItem,
+)
 from agents.extensions.memory.encrypt_session import EncryptedSession
-from tests.fake_model import FakeModel
+from agents.testing import ScriptedModel
 from tests.test_responses import get_text_message
 
 # Mark all tests in this file as asyncio
@@ -28,8 +35,8 @@ def _invalid_encrypted_envelope() -> TResponseInputItem:
 
 @pytest.fixture
 def agent() -> Agent:
-    """Fixture for a basic agent with a fake model."""
-    return Agent(name="test", model=FakeModel())
+    """Fixture for a basic agent with a scripted model."""
+    return Agent(name="test", model=ScriptedModel())
 
 
 @pytest.fixture
@@ -99,8 +106,8 @@ async def test_encrypted_session_with_runner(
         encryption_key=encryption_key,
     )
 
-    assert isinstance(agent.model, FakeModel)
-    agent.model.set_next_output([get_text_message("San Francisco")])
+    assert isinstance(agent.model, ScriptedModel)
+    agent.model.enqueue([get_text_message("San Francisco")])
     result1 = await Runner.run(
         agent,
         "What city is the Golden Gate Bridge in?",
@@ -108,11 +115,11 @@ async def test_encrypted_session_with_runner(
     )
     assert result1.final_output == "San Francisco"
 
-    agent.model.set_next_output([get_text_message("California")])
+    agent.model.enqueue([get_text_message("California")])
     result2 = await Runner.run(agent, "What state is it in?", session=session)
     assert result2.final_output == "California"
 
-    last_input = agent.model.last_turn_args["input"]
+    last_input = agent.model.calls[-1].input
     assert len(last_input) > 1
     assert any("Golden Gate Bridge" in str(item.get("content", "")) for item in last_input)
 
@@ -159,6 +166,66 @@ async def test_encrypted_session_clear(encryption_key: str, underlying_session: 
     assert len(items) == 0
 
     underlying_session.close()
+
+
+async def test_encrypted_session_forwards_wrapper_to_all_underlying_operations(
+    encryption_key: str,
+):
+    class ContextAwareUnderlying:
+        def __init__(self) -> None:
+            self.session_id = "test_session"
+            self.session_settings = None
+            self.items: list[TResponseInputItem] = []
+            self.wrappers: list[RunContextWrapper[Any] | None] = []
+
+        async def get_items(
+            self,
+            limit: int | None = None,
+            *,
+            wrapper: RunContextWrapper[Any] | None = None,
+        ) -> list[TResponseInputItem]:
+            self.wrappers.append(wrapper)
+            return list(self.items if limit is None else self.items[-limit:])
+
+        async def add_items(
+            self,
+            items: list[TResponseInputItem],
+            *,
+            wrapper: RunContextWrapper[Any] | None = None,
+        ) -> None:
+            self.wrappers.append(wrapper)
+            self.items.extend(items)
+
+        async def pop_item(
+            self,
+            *,
+            wrapper: RunContextWrapper[Any] | None = None,
+        ) -> TResponseInputItem | None:
+            self.wrappers.append(wrapper)
+            return self.items.pop() if self.items else None
+
+        async def clear_session(
+            self,
+            *,
+            wrapper: RunContextWrapper[Any] | None = None,
+        ) -> None:
+            self.wrappers.append(wrapper)
+            self.items.clear()
+
+    underlying = ContextAwareUnderlying()
+    session = EncryptedSession(
+        session_id="test_session",
+        underlying_session=cast(Any, underlying),
+        encryption_key=encryption_key,
+    )
+    wrapper = RunContextWrapper(context={"tenant": "a"})
+
+    await session.add_items([{"role": "user", "content": "hello"}], wrapper=wrapper)
+    assert await session.get_items(wrapper=wrapper) == [{"role": "user", "content": "hello"}]
+    assert await session.pop_item(wrapper=wrapper) == {"role": "user", "content": "hello"}
+    await session.clear_session(wrapper=wrapper)
+
+    assert underlying.wrappers == [wrapper, wrapper, wrapper, wrapper]
 
 
 async def test_encrypted_session_ttl_expiration(
@@ -536,7 +603,7 @@ async def test_runner_with_session_settings_override(encryption_key: str):
     """Test that RunConfig can override session's default settings."""
     from agents import Agent, RunConfig, Runner
     from agents.memory import SessionSettings
-    from tests.fake_model import FakeModel
+    from agents.testing import ScriptedModel
     from tests.test_responses import get_text_message
 
     temp_dir = tempfile.mkdtemp()
@@ -553,9 +620,9 @@ async def test_runner_with_session_settings_override(encryption_key: str):
     items: list[TResponseInputItem] = [{"role": "user", "content": f"Turn {i}"} for i in range(10)]
     await session.add_items(items)
 
-    model = FakeModel()
+    model = ScriptedModel()
     agent = Agent(name="test", model=model)
-    model.set_next_output([get_text_message("Got it")])
+    model.enqueue([get_text_message("Got it")])
 
     await Runner.run(
         agent,
@@ -567,7 +634,7 @@ async def test_runner_with_session_settings_override(encryption_key: str):
     )
 
     # Verify the agent received only the last 2 history items + new question
-    last_input = model.last_turn_args["input"]
+    last_input = model.calls[-1].input
     # Filter out the new "New question" input
     history_items = [item for item in last_input if item.get("content") != "New question"]
     # Should have 2 history items (last two from the 10 we added)

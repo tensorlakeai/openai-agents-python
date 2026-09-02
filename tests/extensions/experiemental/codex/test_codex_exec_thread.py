@@ -200,6 +200,11 @@ def test_coerce_thread_options_rejects_unknown_fields() -> None:
         coerce_thread_options({"unknown": "value"})
 
 
+def test_coerce_thread_options_rejects_non_mapping() -> None:
+    with pytest.raises(UserError, match="ThreadOptions must be a ThreadOptions or a mapping"):
+        coerce_thread_options(cast(Any, ["model", "gpt"]))
+
+
 def test_codex_start_and_resume_thread() -> None:
     codex = Codex(CodexOptions(codex_path_override="/bin/codex"))
     thread = codex.start_thread({"model": "gpt"})
@@ -335,9 +340,10 @@ async def test_codex_exec_run_builds_command_args_and_env(monkeypatch: pytest.Mo
         "--config",
         'approval_policy="on-request"',
         "resume",
-        "thread-123",
         "--image",
         "/tmp/img.png",
+        "--",
+        "thread-123",
         "-",
     ]
 
@@ -346,6 +352,33 @@ async def test_codex_exec_run_builds_command_args_and_env(monkeypatch: pytest.Mo
     assert env[exec_module._INTERNAL_ORIGINATOR_ENV] == exec_module._TYPESCRIPT_SDK_ORIGINATOR
     assert env["OPENAI_BASE_URL"] == "https://example.com"
     assert env["CODEX_API_KEY"] == "api-key"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("images", [None, ["/tmp/img.png"]], ids=["no-images", "with-image"])
+async def test_codex_exec_run_treats_option_like_thread_id_as_positional(
+    monkeypatch: pytest.MonkeyPatch, images: list[str] | None
+) -> None:
+    captured_args: tuple[Any, ...] = ()
+
+    async def fake_create_subprocess_exec(*args: Any, **_kwargs: Any) -> FakeProcess:
+        nonlocal captured_args
+        captured_args = args
+        return FakeProcess(stdout_lines=[])
+
+    monkeypatch.setattr(exec_module.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    exec_client = exec_module.CodexExec(executable_path="/bin/codex")
+    args = exec_module.CodexExecArgs(input="hello", thread_id="--thread-option", images=images)
+
+    _ = [line async for line in exec_client.run(args)]
+
+    expected_args = ["/bin/codex", "exec", "--experimental-json", "resume"]
+    if images:
+        expected_args.extend(["--image", images[0]])
+    expected_args.extend(["--", "--thread-option", "-"])
+
+    assert captured_args == tuple(expected_args)
 
 
 @pytest.mark.asyncio
@@ -717,3 +750,36 @@ async def test_thread_run_streamed_idle_timeout_sets_signal(
             pass
 
     assert signal.is_set() is True
+
+
+@pytest.mark.asyncio
+async def test_thread_run_streamed_idle_timeout_creates_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = [
+        {
+            "type": "turn.completed",
+            "usage": {"input_tokens": 1, "cached_input_tokens": 0, "output_tokens": 1},
+        }
+    ]
+    fake_exec = FakeExec(events, delay=0.2)
+    thread = Thread(
+        exec_client=cast(CodexExec, fake_exec),
+        options=CodexOptions(),
+        thread_options=ThreadOptions(),
+    )
+
+    def fake_create_output_schema_file(schema: dict[str, Any] | None) -> OutputSchemaFile:
+        return OutputSchemaFile(schema_path=None, cleanup=lambda: None)
+
+    monkeypatch.setattr(thread_module, "create_output_schema_file", fake_create_output_schema_file)
+
+    with pytest.raises(RuntimeError, match="Codex stream idle for"):
+        async for _ in thread._run_streamed_internal(
+            "hello", TurnOptions(idle_timeout_seconds=0.01)
+        ):
+            pass
+
+    assert fake_exec.last_args is not None
+    assert fake_exec.last_args.signal is not None
+    assert fake_exec.last_args.signal.is_set() is True

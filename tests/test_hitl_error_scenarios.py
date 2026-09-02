@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from typing import Any, Optional, cast
 
 import pytest
-from openai.types.responses import ResponseComputerToolCall, ResponseFunctionToolCall
+from openai.types.responses import (
+    ResponseComputerToolCall,
+    ResponseCustomToolCall,
+    ResponseFunctionToolCall,
+)
 from openai.types.responses.response_computer_tool_call import ActionScreenshot
 from openai.types.responses.response_input_param import (
     ComputerCallOutput,
@@ -16,15 +21,19 @@ from openai.types.responses.response_output_item import LocalShellCall, McpAppro
 
 from agents import (
     Agent,
+    AgentBase,
     ApplyPatchTool,
     ComputerTool,
+    CustomTool,
     LocalShellTool,
     Runner,
     RunResult,
     RunState,
     ShellTool,
     ToolApprovalItem,
+    ToolExecutionConfig,
     function_tool,
+    handoff,
     tool_namespace,
 )
 from agents._public_agent import set_public_agent
@@ -40,6 +49,7 @@ from agents.items import (
 )
 from agents.lifecycle import RunHooks
 from agents.run import RunConfig
+from agents.run_context import RunContextWrapper
 from agents.run_internal import run_loop
 from agents.run_internal.agent_bindings import bind_execution_agent, bind_public_agent
 from agents.run_internal.run_loop import (
@@ -49,16 +59,31 @@ from agents.run_internal.run_loop import (
     ToolRunApplyPatchCall,
     ToolRunComputerAction,
     ToolRunFunction,
+    ToolRunHandoff,
     ToolRunMCPApprovalRequest,
     ToolRunShellCall,
     extract_tool_call_id,
 )
-from agents.run_internal.tool_planning import _select_function_tool_runs_for_resume
+from agents.run_internal.run_steps import ToolRunCustom
+from agents.run_internal.tool_actions import ApplyPatchAction, CustomToolAction, ShellAction
+from agents.run_internal.tool_execution import execute_function_tool_calls
+from agents.run_internal.tool_planning import (
+    _collect_runs_by_approval,
+    _select_function_tool_runs_for_resume,
+    execute_mcp_approval_requests,
+)
 from agents.run_state import RunState as RunStateClass
-from agents.tool import HostedMCPTool
+from agents.testing import ScriptedModel
+from agents.tool import FunctionTool, HostedMCPTool
+from agents.tool_guardrails import (
+    ToolGuardrailFunctionOutput,
+    ToolInputGuardrailData,
+    ToolOutputGuardrailData,
+    tool_input_guardrail,
+    tool_output_guardrail,
+)
 from agents.usage import Usage
 
-from .fake_model import FakeModel
 from .mcp.helpers import FakeMCPServer
 from .test_responses import get_text_message
 from .utils.hitl import (
@@ -296,12 +321,12 @@ async def test_nested_agent_tool_resumes_after_rejection() -> None:
     async def inner_hitl_tool() -> str:
         return "ok"
 
-    inner_model = FakeModel()
+    inner_model = ScriptedModel()
     inner_agent = Agent(name="Inner", model=inner_model, tools=[inner_hitl_tool])
     inner_call_first = make_function_tool_call(inner_hitl_tool.name, call_id="inner-1")
     inner_call_retry = make_function_tool_call(inner_hitl_tool.name, call_id="inner-2")
     inner_final = get_text_message("done")
-    inner_model.add_multiple_turn_outputs(
+    inner_model.extend(
         [
             [inner_call_first],
             [inner_call_retry],
@@ -315,12 +340,12 @@ async def test_nested_agent_tool_resumes_after_rejection() -> None:
         needs_approval=True,
     )
 
-    outer_model = FakeModel()
+    outer_model = ScriptedModel()
     outer_agent = Agent(name="Outer", model=outer_model, tools=[agent_tool])
     outer_call = make_function_tool_call(
         agent_tool.name, call_id="outer-1", arguments='{"input":"hi"}'
     )
-    outer_model.add_multiple_turn_outputs([[outer_call]])
+    outer_model.extend([[outer_call]])
 
     first = await Runner.run(outer_agent, "start")
     assert first.interruptions, "agent tool should request approval first"
@@ -351,16 +376,71 @@ async def test_nested_agent_tool_resumes_after_rejection() -> None:
 
 
 @pytest.mark.asyncio
-async def test_nested_agent_tool_interruptions_dont_collide_on_duplicate_call_ids() -> None:
-    """Nested agent tool interruptions should survive duplicate outer call IDs."""
+async def test_changed_nested_parent_fails_before_tool_inventory_callbacks() -> None:
+    enabled_calls: list[str] = []
+
+    async def enabled(_context: RunContextWrapper[Any], agent: AgentBase[Any]) -> bool:
+        enabled_calls.append(agent.name)
+        return True
 
     @function_tool(needs_approval=True)
     async def inner_hitl_tool() -> str:
         return "ok"
 
-    inner_model = FakeModel()
+    @function_tool(is_enabled=enabled)
+    async def observer() -> str:
+        return "unused"
+
+    inner_model = ScriptedModel()
+    inner_model.extend([[make_function_tool_call(inner_hitl_tool.name, call_id="inner-1")]])
     inner_agent = Agent(name="Inner", model=inner_model, tools=[inner_hitl_tool])
-    inner_model.add_multiple_turn_outputs(
+    agent_tool = inner_agent.as_tool(
+        tool_name="inner_agent_tool",
+        tool_description="Inner agent tool with HITL",
+        needs_approval=True,
+    )
+    outer_model = ScriptedModel(
+        steps=[
+            [
+                make_function_tool_call(
+                    agent_tool.name,
+                    call_id="outer-1",
+                    arguments='{"input":"safe"}',
+                )
+            ]
+        ]
+    )
+    outer_agent = Agent(name="Outer", model=outer_model, tools=[agent_tool, observer])
+
+    first = await Runner.run(outer_agent, "start")
+    first_state = first.to_state()
+    first_state.approve(first.interruptions[0])
+    second = await Runner.run(outer_agent, first_state)
+    assert second.interruptions[0].tool_name == inner_hitl_tool.name
+
+    resume_state = second.to_state()
+    assert resume_state._last_processed_response is not None
+    enabled_calls.clear()
+    resume_state._last_processed_response.functions[0].tool_call.arguments = '{"input":"evil"}'
+    resume_state.approve(second.interruptions[0])
+
+    with pytest.raises(ModelBehaviorError, match="unique call ID"):
+        await Runner.run(outer_agent, resume_state)
+
+    assert enabled_calls == []
+
+
+@pytest.mark.asyncio
+async def test_nested_agent_tool_interruptions_remain_distinct_across_outer_calls() -> None:
+    """Nested agent tool interruptions should survive multiple outer calls."""
+
+    @function_tool(needs_approval=True)
+    async def inner_hitl_tool() -> str:
+        return "ok"
+
+    inner_model = ScriptedModel()
+    inner_agent = Agent(name="Inner", model=inner_model, tools=[inner_hitl_tool])
+    inner_model.extend(
         [
             [make_function_tool_call(inner_hitl_tool.name, call_id="inner-1")],
             [make_function_tool_call(inner_hitl_tool.name, call_id="inner-2")],
@@ -373,16 +453,16 @@ async def test_nested_agent_tool_interruptions_dont_collide_on_duplicate_call_id
         needs_approval=False,
     )
 
-    outer_model = FakeModel()
+    outer_model = ScriptedModel()
     outer_agent = Agent(name="Outer", model=outer_model, tools=[agent_tool])
-    outer_model.add_multiple_turn_outputs(
+    outer_model.extend(
         [
             [
                 make_function_tool_call(
-                    agent_tool.name, call_id="outer-dup", arguments='{"input":"a"}'
+                    agent_tool.name, call_id="outer-a", arguments='{"input":"a"}'
                 ),
                 make_function_tool_call(
-                    agent_tool.name, call_id="outer-dup", arguments='{"input":"b"}'
+                    agent_tool.name, call_id="outer-b", arguments='{"input":"b"}'
                 ),
             ]
         ]
@@ -408,11 +488,9 @@ async def test_nested_agent_tool_does_not_inherit_parent_approvals() -> None:
     async def inner_shared_tool() -> str:
         return "inner"
 
-    inner_model = FakeModel()
+    inner_model = ScriptedModel()
     inner_agent = Agent(name="Inner", model=inner_model, tools=[inner_shared_tool])
-    inner_model.add_multiple_turn_outputs(
-        [[make_function_tool_call(inner_shared_tool.name, call_id="dup")]]
-    )
+    inner_model.extend([[make_function_tool_call(inner_shared_tool.name, call_id="dup")]])
 
     agent_tool = inner_agent.as_tool(
         tool_name="inner_agent_tool",
@@ -420,9 +498,9 @@ async def test_nested_agent_tool_does_not_inherit_parent_approvals() -> None:
         needs_approval=False,
     )
 
-    outer_model = FakeModel()
+    outer_model = ScriptedModel()
     outer_agent = Agent(name="Outer", model=outer_model, tools=[outer_shared_tool, agent_tool])
-    outer_model.add_multiple_turn_outputs(
+    outer_model.extend(
         [
             [make_function_tool_call(outer_shared_tool.name, call_id="dup")],
             [
@@ -488,7 +566,7 @@ async def test_resume_does_not_duplicate_pending_shell_approvals() -> None:
     call_id = extract_tool_call_id(raw_call)
     assert call_id, "shell call must have a call_id"
 
-    model.set_next_output([raw_call])
+    model.enqueue([raw_call])
     first = await Runner.run(agent, "run shell")
     assert first.interruptions, "shell tool should require approval"
 
@@ -546,7 +624,8 @@ async def test_route_local_shell_calls_to_remote_shell_tool():
         action={"type": "exec", "command": ["echo", "test"], "env": {}},  # type: ignore[arg-type]
         status="in_progress",
     )
-    model.set_next_output([local_shell_call])
+    model.enqueue([local_shell_call])
+    model.enqueue([])
 
     await Runner.run(agent, "run local shell")
 
@@ -574,7 +653,7 @@ async def test_preserve_max_turns_when_resuming_from_runresult_state():
     tool = function_tool(test_tool, needs_approval=require_approval)
     model, agent = make_model_and_agent(tools=[tool])
 
-    model.add_multiple_turn_outputs([[make_function_tool_call("test_tool", call_id="call-1")]])
+    model.extend([[make_function_tool_call("test_tool", call_id="call-1")]])
 
     result1 = await Runner.run(agent, "call test_tool", max_turns=20)
     assert result1.interruptions, "should have an interruption"
@@ -582,7 +661,7 @@ async def test_preserve_max_turns_when_resuming_from_runresult_state():
     state = approve_first_interruption(result1, always_approve=True)
 
     # Provide 10 more turns (turns 2-11) to ensure we exceed the default 10 but not 20.
-    model.add_multiple_turn_outputs(
+    model.extend(
         [
             [
                 get_text_message(f"turn {i + 2}"),  # Text message first (doesn't finish)
@@ -591,6 +670,7 @@ async def test_preserve_max_turns_when_resuming_from_runresult_state():
             for i in range(10)
         ]
     )
+    model.enqueue([])
 
     result2 = await Runner.run(agent, state)
     assert result2 is not None, "Run should complete successfully with max_turns=20 from state"
@@ -607,7 +687,7 @@ async def test_current_turn_not_preserved_in_to_state():
     model, agent = make_model_and_agent(tools=[tool])
 
     # Model emits a tool call requiring approval
-    model.set_next_output([make_function_tool_call("test_tool", call_id="call-1")])
+    model.enqueue([make_function_tool_call("test_tool", call_id="call-1")])
 
     # First turn with interruption
     result1 = await Runner.run(agent, "call test_tool")
@@ -680,8 +760,8 @@ async def test_deserialize_interruptions_preserve_mcp_tools(
 
 
 @pytest.mark.asyncio
-async def test_hosted_mcp_approval_matches_unknown_tool_key() -> None:
-    """Approved hosted MCP interruptions should resume even when the tool name is missing."""
+async def test_hosted_mcp_approval_with_unknown_legacy_identity_requires_reapproval() -> None:
+    """Incomplete legacy MCP approvals cannot receive an authorization decision."""
     agent = make_agent()
     context_wrapper = make_context_wrapper()
 
@@ -693,51 +773,8 @@ async def test_hosted_mcp_approval_matches_unknown_tool_key() -> None:
         include_name=False,
         use_call_id=False,
     )
-    context_wrapper.approve_tool(approval_item)
-
-    class DummyMcpTool:
-        on_approval_request: Any = None
-
-    processed_response = ProcessedResponse(
-        new_items=[],
-        handoffs=[],
-        functions=[],
-        computer_actions=[],
-        local_shell_calls=[],
-        shell_calls=[],
-        apply_patch_calls=[],
-        tools_used=[],
-        mcp_approval_requests=[
-            ToolRunMCPApprovalRequest(
-                request_item=McpApprovalRequest(
-                    id="mcp-123",
-                    type="mcp_approval_request",
-                    server_label="test_server",
-                    arguments="{}",
-                    name="hosted_mcp",
-                ),
-                mcp_tool=cast(Any, DummyMcpTool()),
-            )
-        ],
-        interruptions=[],
-    )
-
-    result = await _resolve_interrupted_turn(
-        agent=agent,
-        original_input="test",
-        original_pre_step_items=[approval_item],
-        new_response=ModelResponse(output=[], usage=Usage(), response_id="resp"),
-        processed_response=processed_response,
-        hooks=RunHooks(),
-        context_wrapper=context_wrapper,
-        run_config=RunConfig(),
-        run_state=None,
-    )
-
-    assert any(
-        isinstance(item, MCPApprovalResponseItem) and item.raw_item.get("approve") is True
-        for item in result.new_step_items
-    ), "Approved hosted MCP call should emit an approval response"
+    with pytest.raises(ModelBehaviorError, match="canonical invocation identity"):
+        context_wrapper.approve_tool(approval_item)
 
 
 @pytest.mark.asyncio
@@ -822,7 +859,7 @@ async def test_preserve_persisted_item_counter_when_resuming_streamed_runs():
     ]
 
     # Set up model to return final output immediately (so the run completes)
-    model.set_next_output([get_text_message("done")])
+    model.enqueue([get_text_message("done")])
 
     result = Runner.run_streamed(agent, state)
 
@@ -873,10 +910,94 @@ async def test_function_needs_approval_invalid_type_raises() -> None:
         return "ok"
 
     model, agent = make_model_and_agent(tools=[bad_tool])
-    model.set_next_output([make_function_tool_call("bad_tool")])
+    model.enqueue([make_function_tool_call("bad_tool")])
 
     with pytest.raises(UserError, match="needs_approval"):
         await Runner.run(agent, "run invalid")
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        "",
+        '{"subject": "refund"',
+        "null",
+        "[]",
+        '{"amount": NaN}',
+        '{"amount": Infinity}',
+        '{"amount": -Infinity}',
+    ],
+)
+@pytest.mark.asyncio
+async def test_callable_function_approval_fails_closed_for_invalid_arguments(
+    arguments: str,
+) -> None:
+    """Uninspectable function arguments must require approval before a manual tool can run."""
+    approval_inputs: list[dict[str, Any]] = []
+    tool_inputs: list[str] = []
+
+    async def needs_approval(_ctx: Any, params: dict[str, Any], _call_id: str) -> bool:
+        approval_inputs.append(params)
+        return False
+
+    async def invoke_tool(_ctx: Any, raw_arguments: str) -> str:
+        tool_inputs.append(raw_arguments)
+        return "sent"
+
+    tool = FunctionTool(
+        name="send_email",
+        description="Send an email.",
+        params_json_schema={"type": "object", "properties": {}},
+        on_invoke_tool=invoke_tool,
+        needs_approval=needs_approval,
+    )
+    model, agent = make_model_and_agent(tools=[tool])
+    model.enqueue([make_function_tool_call(tool.name, arguments=arguments, call_id="call-invalid")])
+
+    result = await Runner.run(agent, "send an email")
+
+    assert len(result.interruptions) == 1
+    assert result.interruptions[0].tool_name == tool.name
+    assert approval_inputs == []
+    assert tool_inputs == []
+
+
+@pytest.mark.asyncio
+async def test_callable_function_approval_receives_valid_object_arguments() -> None:
+    """Valid object arguments should preserve callable approval behavior."""
+    approval_inputs: list[dict[str, Any]] = []
+    tool_inputs: list[str] = []
+
+    async def needs_approval(_ctx: Any, params: dict[str, Any], _call_id: str) -> bool:
+        approval_inputs.append(params)
+        return False
+
+    async def invoke_tool(_ctx: Any, raw_arguments: str) -> str:
+        tool_inputs.append(raw_arguments)
+        return "sent"
+
+    tool = FunctionTool(
+        name="send_email",
+        description="Send an email.",
+        params_json_schema={"type": "object", "properties": {"subject": {"type": "string"}}},
+        on_invoke_tool=invoke_tool,
+        needs_approval=needs_approval,
+    )
+    arguments = '{"subject": "status update"}'
+    model, agent = make_model_and_agent(tools=[tool])
+    model.extend(
+        [
+            [make_function_tool_call(tool.name, arguments=arguments, call_id="call-valid")],
+            [get_text_message("done")],
+        ]
+    )
+
+    result = await Runner.run(agent, "send an email")
+
+    assert result.final_output == "done"
+    assert approval_inputs
+    assert all(params == {"subject": "status update"} for params in approval_inputs)
+    assert tool_inputs == [arguments]
 
 
 @pytest.mark.asyncio
@@ -936,7 +1057,7 @@ async def test_agent_as_tool_with_nested_approvals_propagates() -> None:
     spanish_agent.tools = [get_current_timestamp]
 
     # Spanish agent will first request timestamp, then return text.
-    nested_model.add_multiple_turn_outputs(
+    nested_model.extend(
         [
             [make_function_tool_call("get_current_timestamp")],
             [get_text_message("hola")],
@@ -944,7 +1065,7 @@ async def test_agent_as_tool_with_nested_approvals_propagates() -> None:
     )
 
     # Orchestrator model will call the spanish agent tool.
-    orchestrator_model = FakeModel()
+    orchestrator_model = ScriptedModel()
     orchestrator = Agent(
         name="orchestrator",
         tools=[
@@ -957,7 +1078,7 @@ async def test_agent_as_tool_with_nested_approvals_propagates() -> None:
         model=orchestrator_model,
     )
 
-    orchestrator_model.add_multiple_turn_outputs(
+    orchestrator_model.extend(
         [
             [
                 make_function_tool_call(
@@ -987,6 +1108,137 @@ async def test_agent_as_tool_with_nested_approvals_propagates() -> None:
     final = await Runner.run(orchestrator, final_state)
     assert final.final_output == "done"
     assert tool_calls == ["called"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streamed", [False, True])
+async def test_nested_agent_tool_continuation_runs_outer_callbacks_once(streamed: bool) -> None:
+    """Nested resume re-enters only the saved agent run, not the outer callback pipeline."""
+    nested_model, nested_agent = make_model_and_agent(name="nested_agent")
+    inner_calls: list[str] = []
+    counts = {
+        "input_guardrail": 0,
+        "start": 0,
+        "output_guardrail": 0,
+        "custom_output": 0,
+        "extractor": 0,
+        "end": 0,
+    }
+
+    @function_tool(needs_approval=True)
+    async def inner_tool() -> str:
+        inner_calls.append("called")
+        return "inner output"
+
+    nested_agent.tools = [inner_tool]
+    nested_model.extend(
+        [
+            [
+                make_function_tool_call(
+                    "inner_tool",
+                    call_id=f"inner-call-{streamed}",
+                )
+            ],
+            [get_text_message("nested done")],
+        ]
+    )
+
+    @tool_input_guardrail
+    def track_input(_data: ToolInputGuardrailData) -> ToolGuardrailFunctionOutput:
+        counts["input_guardrail"] += 1
+        return ToolGuardrailFunctionOutput.allow()
+
+    @tool_output_guardrail
+    def track_output(_data: ToolOutputGuardrailData) -> ToolGuardrailFunctionOutput:
+        counts["output_guardrail"] += 1
+        return ToolGuardrailFunctionOutput.allow()
+
+    def extract_custom_data(_context: Any) -> dict[str, Any]:
+        counts["extractor"] += 1
+        return {"nested": True}
+
+    async def extract_custom_output(result: Any) -> str:
+        counts["custom_output"] += 1
+        return cast(str, result.final_output)
+
+    outer_tool = nested_agent.as_tool(
+        tool_name="delegate",
+        tool_description="Delegate to the nested agent",
+        custom_output_extractor=extract_custom_output,
+    )
+    outer_tool.tool_input_guardrails = [track_input]
+    outer_tool.tool_output_guardrails = [track_output]
+    outer_tool.custom_data_extractor = extract_custom_data
+
+    outer_model = ScriptedModel()
+    outer_model.extend(
+        [
+            [
+                make_function_tool_call(
+                    "delegate",
+                    call_id=f"outer-call-{streamed}",
+                    arguments='{"input":"hello"}',
+                )
+            ],
+            [get_text_message("outer done")],
+        ]
+    )
+    outer_agent = Agent(name="outer_agent", model=outer_model, tools=[outer_tool])
+
+    class CountingHooks(RunHooks[Any]):
+        async def on_tool_start(
+            self,
+            _context: Any,
+            _agent: Agent[Any],
+            tool: Any,
+        ) -> None:
+            if tool.name == "delegate":
+                counts["start"] += 1
+
+        async def on_tool_end(
+            self,
+            _context: Any,
+            _agent: Agent[Any],
+            tool: Any,
+            _result: object,
+        ) -> None:
+            if tool.name == "delegate":
+                counts["end"] += 1
+
+    hooks = CountingHooks()
+
+    async def run(input_value: Any) -> Any:
+        if not streamed:
+            return await Runner.run(outer_agent, input_value, hooks=hooks)
+        result = Runner.run_streamed(outer_agent, input_value, hooks=hooks)
+        async for _event in result.stream_events():
+            pass
+        return result
+
+    interrupted = await run("start")
+    assert interrupted.interruptions
+    assert counts["input_guardrail"] <= 1
+    assert counts["start"] <= 1
+    assert counts["output_guardrail"] == 0
+    assert counts["custom_output"] == 0
+    assert counts["extractor"] == 0
+    assert counts["end"] == 0
+
+    state = interrupted.to_state()
+    state.approve(state.get_interruptions()[0])
+    restored = await RunState.from_json(outer_agent, state.to_json())
+    final = await run(restored)
+
+    assert final.final_output == "outer done"
+    assert inner_calls == ["called"]
+    assert counts == {
+        "input_guardrail": 1,
+        "start": 1,
+        "output_guardrail": 1,
+        "custom_output": 1,
+        "extractor": 1,
+        "end": 1,
+    }
 
 
 @pytest.mark.asyncio
@@ -1303,6 +1555,842 @@ async def test_resume_skips_needs_approval_checker_when_status_resolved() -> Non
     assert checker_calls == []
     assert [run.tool_call.call_id for run in selected] == ["approved-call"]
     assert rejections == ["rejected-call"]
+
+
+@pytest.mark.asyncio
+async def test_function_resume_reuses_falsy_pending_item() -> None:
+    class FalsyToolApprovalItem(ToolApprovalItem):
+        def __bool__(self) -> bool:
+            return False
+
+    @function_tool(needs_approval=True)
+    async def approve_me(value: str) -> str:
+        return value
+
+    tool_call = make_function_tool_call(
+        approve_me.name,
+        call_id="pending-function",
+        arguments='{"value":"a"}',
+    )
+    agent = Agent(name="agent", tools=[approve_me])
+    existing_pending = FalsyToolApprovalItem(agent=agent, raw_item=tool_call)
+    run = ToolRunFunction(tool_call=tool_call, function_tool=approve_me)
+    pending: list[ToolApprovalItem] = []
+
+    async def _needs_approval_checker(_run: ToolRunFunction) -> bool:
+        return True
+
+    async def _record_rejection(
+        _call_id: str | None,
+        _tool_call: ResponseFunctionToolCall,
+        _tool: FunctionTool,
+    ) -> None:
+        raise AssertionError("unresolved approval must not be recorded as a rejection")
+
+    selected = await _select_function_tool_runs_for_resume(
+        [run],
+        approval_items_by_call_id={tool_call.call_id: existing_pending},
+        context_wrapper=make_context_wrapper(),
+        needs_approval_checker=_needs_approval_checker,
+        output_exists_checker=lambda _run: False,
+        record_rejection=_record_rejection,
+        pending_interruption_adder=pending.append,
+        pending_item_builder=lambda _run: ToolApprovalItem(agent=agent, raw_item=tool_call),
+    )
+
+    assert selected == []
+    assert pending == [existing_pending]
+    assert pending[0] is existing_pending
+
+
+@pytest.mark.asyncio
+async def test_resume_rechecks_rejection_after_function_approval_checker() -> None:
+    """A rejection recorded while the checker waits must prevent another interruption."""
+
+    @function_tool(needs_approval=True)
+    async def sensitive() -> str:
+        return "should-not-run"
+
+    tool_call = make_function_tool_call(sensitive.name, call_id="call-concurrent-function")
+    run = ToolRunFunction(tool_call=tool_call, function_tool=sensitive)
+    agent = Agent(name="agent", tools=[sensitive])
+    approval_item = ToolApprovalItem(agent=agent, raw_item=tool_call)
+    context_wrapper = make_context_wrapper()
+    checker_started = asyncio.Event()
+    release_checker = asyncio.Event()
+
+    async def _needs_approval_checker(_run: ToolRunFunction) -> bool:
+        checker_started.set()
+        await release_checker.wait()
+        return True
+
+    pending: list[ToolApprovalItem] = []
+    rejections: list[str | None] = []
+
+    async def _record_rejection(
+        call_id: str | None,
+        _tool_call: ResponseFunctionToolCall,
+        _tool: FunctionTool,
+    ) -> None:
+        rejections.append(call_id)
+
+    selection_task = asyncio.create_task(
+        _select_function_tool_runs_for_resume(
+            [run],
+            approval_items_by_call_id={tool_call.call_id: approval_item},
+            context_wrapper=context_wrapper,
+            needs_approval_checker=_needs_approval_checker,
+            output_exists_checker=lambda _run: False,
+            record_rejection=_record_rejection,
+            pending_interruption_adder=pending.append,
+            pending_item_builder=lambda _run: approval_item,
+        )
+    )
+    try:
+        await asyncio.wait_for(checker_started.wait(), timeout=1)
+        context_wrapper.reject_tool(approval_item)
+        release_checker.set()
+        selected = await selection_task
+    finally:
+        release_checker.set()
+
+    assert selected == []
+    assert pending == []
+    assert rejections == [tool_call.call_id]
+
+
+@pytest.mark.asyncio
+async def test_resume_rejects_changed_handoff_under_approved_function_call_id() -> None:
+    """A resumed handoff must match the invocation that received approval."""
+    target = Agent(name="target")
+    route_handoff = handoff(target, tool_name_override="route")
+    agent = Agent(name="agent", handoffs=[route_handoff])
+    approved_call = make_function_tool_call(
+        "route",
+        call_id="call-shared",
+        arguments='{"destination":"safe"}',
+    )
+    changed_call = make_function_tool_call(
+        "route",
+        call_id="call-shared",
+        arguments='{"destination":"safe"}',
+    )
+    approval_item = ToolApprovalItem(agent=agent, raw_item=approved_call, tool_name="route")
+    context_wrapper = make_context_wrapper()
+    context_wrapper.approve_tool(approval_item, always_approve=True)
+    processed_response = ProcessedResponse(
+        new_items=[],
+        handoffs=[ToolRunHandoff(handoff=route_handoff, tool_call=changed_call)],
+        functions=[],
+        computer_actions=[],
+        local_shell_calls=[],
+        shell_calls=[],
+        apply_patch_calls=[],
+        tools_used=[],
+        mcp_approval_requests=[],
+        interruptions=[],
+    )
+
+    with pytest.raises(ModelBehaviorError, match="unique call ID"):
+        await _resolve_interrupted_turn(
+            agent=agent,
+            original_input="resume handoff",
+            original_pre_step_items=[approval_item],
+            new_response=ModelResponse(
+                output=[changed_call],
+                usage=Usage(),
+                response_id="resp",
+            ),
+            processed_response=processed_response,
+            hooks=RunHooks(),
+            context_wrapper=context_wrapper,
+            run_config=RunConfig(),
+            run_state=make_state_with_interruptions(agent, [approval_item]),
+        )
+
+
+@pytest.mark.parametrize("approved", [True, False], ids=["approved", "rejected"])
+@pytest.mark.asyncio
+async def test_execute_path_prefers_decision_resolved_during_rejecting_guardrail(
+    approved: bool,
+) -> None:
+    """Stored approval status must win when a rejecting guardrail was already waiting."""
+    guardrail_started = asyncio.Event()
+    release_guardrail = asyncio.Event()
+    guardrail_calls = 0
+    executed: list[str] = []
+
+    @tool_input_guardrail
+    async def rejecting_guardrail(
+        _data: ToolInputGuardrailData,
+    ) -> ToolGuardrailFunctionOutput:
+        nonlocal guardrail_calls
+        guardrail_calls += 1
+        guardrail_started.set()
+        await release_guardrail.wait()
+        return ToolGuardrailFunctionOutput.reject_content("guardrail rejection")
+
+    @function_tool(needs_approval=True, tool_input_guardrails=[rejecting_guardrail])
+    async def sensitive() -> str:
+        executed.append("ran")
+        return "tool output"
+
+    tool_call = make_function_tool_call(sensitive.name, call_id="call-pending-guardrail")
+    tool_run = ToolRunFunction(tool_call=tool_call, function_tool=sensitive)
+    agent = Agent(name="agent", tools=[sensitive])
+    approval_item = ToolApprovalItem(agent=agent, raw_item=tool_call)
+    context_wrapper = make_context_wrapper()
+    execution_task = asyncio.create_task(
+        execute_function_tool_calls(
+            bindings=bind_public_agent(agent),
+            tool_runs=[tool_run],
+            hooks=RunHooks(),
+            context_wrapper=context_wrapper,
+            config=RunConfig(
+                tool_execution=ToolExecutionConfig(pre_approval_tool_input_guardrails=True)
+            ),
+        )
+    )
+    try:
+        await asyncio.wait_for(guardrail_started.wait(), timeout=1)
+        if approved:
+            context_wrapper.approve_tool(approval_item)
+        else:
+            context_wrapper.reject_tool(approval_item, rejection_message="stored rejection")
+        release_guardrail.set()
+        results, _, _ = await execution_task
+    finally:
+        release_guardrail.set()
+
+    assert len(results) == 1
+    if approved:
+        assert results[0].output == "guardrail rejection"
+        assert guardrail_calls == 2
+        assert executed == []
+    else:
+        assert results[0].output == "stored rejection"
+        assert guardrail_calls == 1
+        assert executed == []
+
+
+@pytest.mark.asyncio
+async def test_execute_path_skips_needs_approval_checker_when_status_resolved() -> None:
+    """Resuming an approved call must not re-evaluate its dynamic approval policy."""
+    checker_calls: list[str] = []
+
+    async def needs_approval(_ctx: Any, _args: dict[str, Any], call_id: str) -> bool:
+        checker_calls.append(call_id)
+        if len(checker_calls) > 1:
+            raise AssertionError("resolved approval must bypass needs_approval")
+        return True
+
+    @function_tool(needs_approval=needs_approval)
+    async def sensitive(value: str) -> str:
+        return f"ran:{value}"
+
+    model = ScriptedModel()
+    agent = Agent(name="agent", model=model, tools=[sensitive])
+    model.extend(
+        [
+            [make_function_tool_call(sensitive.name, call_id="call-1", arguments='{"value":"x"}')],
+            [get_text_message("done")],
+        ]
+    )
+
+    first = await Runner.run(agent, "hello")
+    assert len(first.interruptions) == 1
+    assert checker_calls == ["call-1"]
+
+    state = first.to_state()
+    state.approve(first.interruptions[0])
+    resumed = await Runner.run(agent, state)
+
+    assert resumed.final_output == "done"
+    assert checker_calls == ["call-1"]
+    assert any(
+        isinstance(item, ToolCallOutputItem) and item.output == "ran:x"
+        for item in resumed.new_items
+    )
+
+
+@pytest.mark.asyncio
+async def test_resume_checkpoints_tool_output_before_tool_use_behavior_failure() -> None:
+    """A failed post-tool callback must leave the exact output replayable without reexecution."""
+    executions: list[str] = []
+
+    @function_tool(needs_approval=True)
+    async def sensitive(value: str) -> str:
+        executions.append(value)
+        return f"ran:{value}"
+
+    def failing_behavior(_ctx: Any, _results: Any) -> Any:
+        raise RuntimeError("tool use behavior failed")
+
+    model = ScriptedModel()
+    agent = Agent(
+        name="agent",
+        model=model,
+        tools=[sensitive],
+        tool_use_behavior=failing_behavior,
+    )
+    model.extend(
+        [
+            [make_function_tool_call(sensitive.name, call_id="call-1", arguments='{"value":"x"}')],
+            [get_text_message("done")],
+        ]
+    )
+
+    first = await Runner.run(agent, "hello")
+    state = first.to_state()
+    state.approve(first.interruptions[0])
+
+    with pytest.raises(RuntimeError, match="tool use behavior failed"):
+        await Runner.run(agent, state)
+
+    assert executions == ["x"]
+    assert any(
+        isinstance(item, ToolCallOutputItem) and item.output == "ran:x"
+        for item in state._generated_items
+    )
+
+    agent.tool_use_behavior = "run_llm_again"
+    resumed = await Runner.run(agent, state)
+
+    assert resumed.final_output == "done"
+    assert executions == ["x"]
+
+
+@pytest.mark.parametrize("tool_kind", ["function", "shell", "custom", "apply_patch"])
+@pytest.mark.asyncio
+async def test_execute_path_honors_sticky_rejection_before_checker(tool_kind: str) -> None:
+    """A sticky rejection must bypass dynamic policies and prevent side effects."""
+    executed: list[str] = []
+    context_wrapper = make_context_wrapper()
+
+    async def unexpected_checker(_ctx: Any, _payload: Any, _call_id: str) -> bool:
+        raise AssertionError("sticky rejection must bypass needs_approval")
+
+    if tool_kind == "function":
+
+        @function_tool(needs_approval=unexpected_checker)
+        async def sensitive() -> str:
+            executed.append("function")
+            return "should-not-run"
+
+        agent = Agent(name="agent", tools=[sensitive])
+        context_wrapper.reject_tool(
+            ToolApprovalItem(
+                agent=agent,
+                raw_item=make_function_tool_call(sensitive.name, call_id="call-prior"),
+            ),
+            always_reject=True,
+        )
+        function_results, _, _ = await execute_function_tool_calls(
+            bindings=bind_public_agent(agent),
+            tool_runs=[
+                ToolRunFunction(
+                    tool_call=make_function_tool_call(sensitive.name, call_id="call-next"),
+                    function_tool=sensitive,
+                )
+            ],
+            hooks=RunHooks(),
+            context_wrapper=context_wrapper,
+            config=RunConfig(),
+        )
+        assert [result.output for result in function_results] == [HITL_REJECTION_MSG]
+    elif tool_kind == "shell":
+
+        def shell_executor(_req: Any) -> str:
+            executed.append("shell")
+            return "should-not-run"
+
+        shell_tool = ShellTool(executor=shell_executor, needs_approval=unexpected_checker)
+        agent = Agent(name="agent", tools=[shell_tool])
+        context_wrapper.reject_tool(
+            ToolApprovalItem(
+                agent=agent,
+                raw_item=cast(dict[str, Any], make_shell_call("call-prior")),
+                tool_name=shell_tool.name,
+            ),
+            always_reject=True,
+        )
+        result = await ShellAction.execute(
+            agent=agent,
+            call=ToolRunShellCall(
+                tool_call=cast(dict[str, Any], make_shell_call("call-next")),
+                shell_tool=shell_tool,
+            ),
+            hooks=RunHooks(),
+            context_wrapper=context_wrapper,
+            config=RunConfig(),
+        )
+        assert isinstance(result, ToolCallOutputItem)
+        assert HITL_REJECTION_MSG in str(result.output)
+    elif tool_kind == "custom":
+
+        async def invoke_custom(_ctx: Any, _raw: str) -> str:
+            executed.append("custom")
+            return "should-not-run"
+
+        custom_tool = CustomTool(
+            name="raw_editor",
+            description="Edit raw text.",
+            on_invoke_tool=invoke_custom,
+            format={"type": "text"},
+            needs_approval=unexpected_checker,
+        )
+        agent = Agent(name="agent", tools=[custom_tool])
+        context_wrapper.reject_tool(
+            ToolApprovalItem(
+                agent=agent,
+                raw_item=cast(
+                    Any,
+                    ResponseCustomToolCall(
+                        type="custom_tool_call",
+                        name=custom_tool.name,
+                        call_id="call-prior",
+                        input="prior",
+                    ),
+                ),
+                tool_name=custom_tool.name,
+            ),
+            always_reject=True,
+        )
+        next_call = ResponseCustomToolCall(
+            type="custom_tool_call",
+            name=custom_tool.name,
+            call_id="call-next",
+            input="next",
+        )
+        result = await CustomToolAction.execute(
+            agent=agent,
+            call=ToolRunCustom(tool_call=next_call, custom_tool=custom_tool),
+            hooks=RunHooks(),
+            context_wrapper=context_wrapper,
+            config=RunConfig(),
+        )
+        assert isinstance(result, ToolCallOutputItem)
+        assert result.output == HITL_REJECTION_MSG
+    else:
+        editor = RecordingEditor()
+        apply_patch_tool = ApplyPatchTool(
+            editor=editor,
+            needs_approval=unexpected_checker,
+        )
+        agent = Agent(name="agent", tools=[apply_patch_tool])
+        context_wrapper.reject_tool(
+            ToolApprovalItem(
+                agent=agent,
+                raw_item=cast(dict[str, Any], make_apply_patch_dict("call-prior")),
+                tool_name=apply_patch_tool.name,
+            ),
+            always_reject=True,
+        )
+        result = await ApplyPatchAction.execute(
+            agent=agent,
+            call=ToolRunApplyPatchCall(
+                tool_call=cast(dict[str, Any], make_apply_patch_dict("call-next")),
+                apply_patch_tool=apply_patch_tool,
+            ),
+            hooks=RunHooks(),
+            context_wrapper=context_wrapper,
+            config=RunConfig(),
+        )
+        assert isinstance(result, ToolCallOutputItem)
+        assert HITL_REJECTION_MSG in str(result.output)
+        assert editor.operations == []
+
+    assert executed == []
+
+
+@pytest.mark.parametrize("tool_kind", ["shell", "custom", "apply_patch"])
+@pytest.mark.asyncio
+async def test_tool_execution_rejects_changed_approval_recorded_while_policy_waits(
+    tool_kind: str,
+) -> None:
+    """A concurrent decision for changed content must not authorize the waiting call."""
+    checker_started = asyncio.Event()
+    release_checker = asyncio.Event()
+    executed: list[str] = []
+    context_wrapper = make_context_wrapper()
+    tool: Any
+    current_raw: Any
+    changed_raw: Any
+    execution_task: asyncio.Task[RunItem]
+
+    async def needs_approval(_ctx: Any, _payload: Any, _call_id: str) -> bool:
+        checker_started.set()
+        await release_checker.wait()
+        return True
+
+    if tool_kind == "shell":
+
+        def execute_shell(_request: Any) -> str:
+            executed.append("shell")
+            return "should-not-run"
+
+        tool = ShellTool(executor=execute_shell, needs_approval=needs_approval)
+        agent = Agent(name="agent", tools=[tool])
+        current_raw = cast(dict[str, Any], make_shell_call("call-shared", commands=["safe"]))
+        changed_raw = cast(dict[str, Any], make_shell_call("call-shared", commands=["changed"]))
+        execution_task = asyncio.create_task(
+            ShellAction.execute(
+                agent=agent,
+                call=ToolRunShellCall(tool_call=current_raw, shell_tool=tool),
+                hooks=RunHooks(),
+                context_wrapper=context_wrapper,
+                config=RunConfig(),
+            )
+        )
+    elif tool_kind == "custom":
+
+        async def invoke_custom(_ctx: Any, _raw: str) -> str:
+            executed.append("custom")
+            return "should-not-run"
+
+        tool = CustomTool(
+            name="raw_editor",
+            description="Edit raw text.",
+            on_invoke_tool=invoke_custom,
+            format={"type": "text"},
+            needs_approval=needs_approval,
+        )
+        agent = Agent(name="agent", tools=[tool])
+        current_raw = ResponseCustomToolCall(
+            type="custom_tool_call",
+            name=tool.name,
+            call_id="call-shared",
+            input="safe",
+        )
+        changed_raw = ResponseCustomToolCall(
+            type="custom_tool_call",
+            name=tool.name,
+            call_id="call-shared",
+            input="changed",
+        )
+        execution_task = asyncio.create_task(
+            CustomToolAction.execute(
+                agent=agent,
+                call=ToolRunCustom(tool_call=current_raw, custom_tool=tool),
+                hooks=RunHooks(),
+                context_wrapper=context_wrapper,
+                config=RunConfig(),
+            )
+        )
+    else:
+        editor = RecordingEditor()
+        tool = ApplyPatchTool(editor=editor, needs_approval=needs_approval)
+        agent = Agent(name="agent", tools=[tool])
+        current_raw = {
+            "type": "apply_patch_call",
+            "call_id": "call-shared",
+            "operation": {"type": "delete_file", "path": "safe.txt"},
+        }
+        changed_raw = {
+            "type": "apply_patch_call",
+            "call_id": "call-shared",
+            "operation": {"type": "delete_file", "path": "changed.txt"},
+        }
+        execution_task = asyncio.create_task(
+            ApplyPatchAction.execute(
+                agent=agent,
+                call=ToolRunApplyPatchCall(tool_call=current_raw, apply_patch_tool=tool),
+                hooks=RunHooks(),
+                context_wrapper=context_wrapper,
+                config=RunConfig(),
+            )
+        )
+
+    try:
+        await asyncio.wait_for(checker_started.wait(), timeout=1)
+        context_wrapper.approve_tool(
+            ToolApprovalItem(agent=agent, raw_item=changed_raw, tool_name=tool.name)
+        )
+        release_checker.set()
+        with pytest.raises(ModelBehaviorError, match="unique call ID"):
+            await execution_task
+    finally:
+        release_checker.set()
+
+    assert executed == []
+    if tool_kind == "apply_patch":
+        assert editor.operations == []
+
+
+@pytest.mark.asyncio
+async def test_collect_runs_by_approval_skips_checker_when_status_resolved() -> None:
+    """Approved/rejected shell calls must not invoke needs_approval_checker.
+
+    Mirrors #3229 for non-function tools: when the approval status is already
+    True or False, a user-supplied checker (which may have side effects, hit
+    the network, or raise) must be short-circuited.
+    """
+    shell_tool = ShellTool(executor=lambda _req: "ok", needs_approval=True)
+    approved_call = make_shell_call("approved-shell")
+    rejected_call = make_shell_call("rejected-shell")
+    agent = Agent(name="agent")
+    context_wrapper = make_context_wrapper()
+    context_wrapper.approve_tool(
+        ToolApprovalItem(
+            agent=agent,
+            raw_item=cast(dict[str, Any], approved_call),
+            tool_name=shell_tool.name,
+        )
+    )
+    context_wrapper.reject_tool(
+        ToolApprovalItem(
+            agent=agent,
+            raw_item=cast(dict[str, Any], rejected_call),
+            tool_name=shell_tool.name,
+        )
+    )
+
+    runs = [
+        ToolRunShellCall(tool_call=approved_call, shell_tool=shell_tool),
+        ToolRunShellCall(tool_call=rejected_call, shell_tool=shell_tool),
+    ]
+    checker_calls: list[str] = []
+
+    async def _needs_approval(run: ToolRunShellCall) -> bool:
+        checker_calls.append(run.tool_call["call_id"])
+        raise AssertionError("checker must not run for resolved approvals")
+
+    async def _build_rejection(run: ToolRunShellCall, call_id: str) -> RunItem:
+        return ToolCallOutputItem(
+            output="rejected",
+            raw_item={"type": "function_call_output", "call_id": call_id, "output": "rejected"},
+            agent=agent,
+        )
+
+    approved, rejections = await _collect_runs_by_approval(
+        runs,
+        call_id_extractor=lambda run: run.tool_call["call_id"],
+        tool_name_resolver=lambda run: run.shell_tool.name,
+        rejection_builder=_build_rejection,
+        context_wrapper=context_wrapper,
+        approval_items_by_call_id={},
+        agent=agent,
+        pending_interruption_adder=lambda _item: None,
+        needs_approval_checker=_needs_approval,
+        output_exists_checker=lambda _call_id: False,
+    )
+
+    assert checker_calls == []
+    assert approved == [runs[0]]
+    assert len(rejections) == 1
+
+
+@pytest.mark.asyncio
+async def test_collect_runs_by_approval_reuses_falsy_pending_item() -> None:
+    class FalsyToolApprovalItem(ToolApprovalItem):
+        def __bool__(self) -> bool:
+            return False
+
+    shell_tool = ShellTool(executor=lambda _req: "ok", needs_approval=True)
+    shell_call = make_shell_call("pending-shell")
+    agent = Agent(name="agent")
+    existing_pending = FalsyToolApprovalItem(
+        agent=agent,
+        raw_item=cast(dict[str, Any], shell_call),
+        tool_name=shell_tool.name,
+    )
+    run = ToolRunShellCall(tool_call=shell_call, shell_tool=shell_tool)
+    pending: list[ToolApprovalItem] = []
+
+    async def _build_rejection(_run: ToolRunShellCall, call_id: str) -> RunItem:
+        return ToolCallOutputItem(
+            output="rejected",
+            raw_item={"type": "function_call_output", "call_id": call_id, "output": "rejected"},
+            agent=agent,
+        )
+
+    async def _needs_approval(_run: ToolRunShellCall) -> bool:
+        return True
+
+    approved, rejections = await _collect_runs_by_approval(
+        [run],
+        call_id_extractor=lambda item: item.tool_call["call_id"],
+        tool_name_resolver=lambda item: item.shell_tool.name,
+        rejection_builder=_build_rejection,
+        context_wrapper=make_context_wrapper(),
+        approval_items_by_call_id={"pending-shell": existing_pending},
+        agent=agent,
+        pending_interruption_adder=pending.append,
+        needs_approval_checker=_needs_approval,
+    )
+
+    assert approved == []
+    assert rejections == []
+    assert pending == [existing_pending]
+    assert pending[0] is existing_pending
+
+
+@pytest.mark.parametrize("approved", [True, False], ids=["approved", "rejected"])
+@pytest.mark.asyncio
+async def test_resume_apply_patch_uses_concurrent_decision_without_reinterrupting(
+    approved: bool,
+) -> None:
+    """A resolved apply-patch decision must stop callbacks and avoid stale interruptions."""
+    checker_started = asyncio.Event()
+    release_checker = asyncio.Event()
+    checked_paths: list[str] = []
+
+    async def _needs_approval(_ctx: Any, operation: Any, _call_id: str) -> bool:
+        checked_paths.append(operation.path)
+        if len(checked_paths) > 1:
+            raise AssertionError("resolved rejection must stop later approval callbacks")
+        checker_started.set()
+        await release_checker.wait()
+        return False
+
+    editor = RecordingEditor()
+    apply_patch_tool = ApplyPatchTool(editor=editor, needs_approval=_needs_approval)
+    _model, public_agent = make_model_and_agent(tools=[apply_patch_tool])
+    execution_agent = public_agent.clone()
+    set_public_agent(execution_agent, public_agent)
+    raw_item = cast(
+        Any,
+        {
+            "type": "apply_patch_call",
+            "call_id": "call-concurrent-apply-patch",
+            "operations": [
+                {"type": "update_file", "path": "first.txt", "diff": "-old\n+new\n"},
+                {"type": "delete_file", "path": "second.txt"},
+            ],
+        },
+    )
+    approval_item = ToolApprovalItem(
+        agent=public_agent,
+        raw_item=raw_item,
+        tool_name=apply_patch_tool.name,
+    )
+    context_wrapper = make_context_wrapper()
+    processed_response = ProcessedResponse(
+        new_items=[],
+        handoffs=[],
+        functions=[],
+        computer_actions=[],
+        local_shell_calls=[],
+        shell_calls=[],
+        apply_patch_calls=[
+            ToolRunApplyPatchCall(tool_call=raw_item, apply_patch_tool=apply_patch_tool)
+        ],
+        tools_used=[],
+        mcp_approval_requests=[],
+        interruptions=[],
+    )
+
+    resolution_task = asyncio.create_task(
+        _resolve_interrupted_turn(
+            agent=execution_agent,
+            original_input="resume apply patch",
+            original_pre_step_items=[],
+            new_response=ModelResponse(output=[], usage=Usage(), response_id="resp"),
+            processed_response=processed_response,
+            hooks=RunHooks(),
+            context_wrapper=context_wrapper,
+            run_config=RunConfig(),
+            run_state=make_state_with_interruptions(public_agent, [approval_item]),
+        )
+    )
+    try:
+        await asyncio.wait_for(checker_started.wait(), timeout=1)
+        if approved:
+            context_wrapper.approve_tool(approval_item)
+        else:
+            context_wrapper.reject_tool(approval_item)
+        release_checker.set()
+        result = await resolution_task
+    finally:
+        release_checker.set()
+
+    assert checked_paths == ["first.txt"]
+    assert not isinstance(result.next_step, NextStepInterruption)
+    rejection_outputs = [
+        item
+        for item in result.new_step_items
+        if isinstance(item, ToolCallOutputItem) and item.output == HITL_REJECTION_MSG
+    ]
+    if approved:
+        assert rejection_outputs == []
+        assert len(editor.operations) == 2
+    else:
+        assert len(rejection_outputs) == 1
+        assert editor.operations == []
+
+
+@pytest.mark.parametrize("tool_kind", ["shell", "apply_patch"])
+@pytest.mark.asyncio
+async def test_resume_preserves_approval_created_during_tool_execution(tool_kind: str) -> None:
+    """A second policy evaluation may create a new approval interruption during execution."""
+    checker_calls = 0
+    executed: list[str] = []
+    context_wrapper = make_context_wrapper()
+    processed_response = ProcessedResponse(
+        new_items=[],
+        handoffs=[],
+        functions=[],
+        computer_actions=[],
+        local_shell_calls=[],
+        shell_calls=[],
+        apply_patch_calls=[],
+        tools_used=[],
+        mcp_approval_requests=[],
+        interruptions=[],
+    )
+
+    async def needs_approval(_ctx: Any, _payload: Any, _call_id: str) -> bool:
+        nonlocal checker_calls
+        checker_calls += 1
+        return checker_calls == 2
+
+    tool: Any
+    if tool_kind == "shell":
+
+        def execute_shell(_request: Any) -> str:
+            executed.append("shell")
+            return "should-not-run"
+
+        tool = ShellTool(executor=execute_shell, needs_approval=needs_approval)
+        raw_item = cast(dict[str, Any], make_shell_call("call-execution-approval"))
+        processed_response.shell_calls = [ToolRunShellCall(tool_call=raw_item, shell_tool=tool)]
+    else:
+        editor = RecordingEditor()
+        tool = ApplyPatchTool(editor=editor, needs_approval=needs_approval)
+        raw_item = cast(Any, make_apply_patch_dict("call-execution-approval"))
+        processed_response.apply_patch_calls = [
+            ToolRunApplyPatchCall(tool_call=raw_item, apply_patch_tool=tool)
+        ]
+
+    _model, public_agent = make_model_and_agent(tools=[tool])
+    execution_agent = public_agent.clone()
+    set_public_agent(execution_agent, public_agent)
+    original_approval = ToolApprovalItem(
+        agent=public_agent,
+        raw_item=raw_item,
+        tool_name=tool.name,
+    )
+
+    result = await _resolve_interrupted_turn(
+        agent=execution_agent,
+        original_input="resume approval",
+        original_pre_step_items=[],
+        new_response=ModelResponse(output=[], usage=Usage(), response_id="resp"),
+        processed_response=processed_response,
+        hooks=RunHooks(),
+        context_wrapper=context_wrapper,
+        run_config=RunConfig(),
+        run_state=make_state_with_interruptions(public_agent, [original_approval]),
+    )
+
+    assert checker_calls == 2
+    assert isinstance(result.next_step, NextStepInterruption)
+    assert [extract_tool_call_id(item.raw_item) for item in result.next_step.interruptions] == [
+        "call-execution-approval"
+    ]
+    assert executed == []
+    if tool_kind == "apply_patch":
+        assert editor.operations == []
 
 
 @pytest.mark.asyncio
@@ -1871,6 +2959,100 @@ async def test_resume_skips_shell_calls_with_existing_output() -> None:
 
 
 @pytest.mark.asyncio
+async def test_resume_validates_changed_shell_before_sibling_approval_callback() -> None:
+    """Changed completed calls must fail before sibling approval callbacks run."""
+    checker_calls: list[str] = []
+
+    async def needs_approval(_ctx: Any, _args: dict[str, Any], call_id: str) -> bool:
+        checker_calls.append(call_id)
+        return False
+
+    @function_tool(needs_approval=needs_approval)
+    async def sibling_tool() -> str:
+        return "should-not-run"
+
+    shell_tool = ShellTool(executor=lambda _request: "should-not-run", needs_approval=True)
+    enabled_calls: list[str] = []
+    target = Agent(name="target")
+
+    def handoff_is_enabled(_ctx: Any, _agent: Agent[Any]) -> bool:
+        enabled_calls.append("handoff")
+        return True
+
+    agent = Agent(
+        name="agent",
+        tools=[sibling_tool, shell_tool],
+        handoffs=[handoff(target, is_enabled=handoff_is_enabled)],
+    )
+    context_wrapper = make_context_wrapper()
+    approved_shell_call = cast(
+        dict[str, Any],
+        make_shell_call("call-reused", commands=["echo safe"], status="completed"),
+    )
+    changed_shell_call = cast(
+        dict[str, Any],
+        make_shell_call("call-reused", commands=["echo changed"], status="completed"),
+    )
+    context_wrapper.approve_tool(
+        ToolApprovalItem(
+            agent=agent,
+            raw_item=approved_shell_call,
+            tool_name=shell_tool.name,
+        )
+    )
+    processed_response = ProcessedResponse(
+        new_items=[],
+        handoffs=[],
+        functions=[
+            ToolRunFunction(
+                tool_call=make_function_tool_call(sibling_tool.name, call_id="call-sibling"),
+                function_tool=sibling_tool,
+            )
+        ],
+        computer_actions=[],
+        local_shell_calls=[],
+        shell_calls=[
+            ToolRunShellCall(tool_call=changed_shell_call, shell_tool=shell_tool),
+        ],
+        apply_patch_calls=[],
+        tools_used=[],
+        mcp_approval_requests=[],
+        interruptions=[],
+    )
+    original_pre_step_items = [
+        ToolCallOutputItem(
+            agent=agent,
+            raw_item=cast(
+                dict[str, Any],
+                {
+                    "type": "shell_call_output",
+                    "call_id": "call-reused",
+                    "status": "completed",
+                    "output": "prior run",
+                },
+            ),
+            output="prior run",
+        )
+    ]
+
+    with pytest.raises(ModelBehaviorError, match="unique call ID"):
+        await _resolve_interrupted_turn(
+            agent=agent,
+            original_input="resume run",
+            original_pre_step_items=cast(list[RunItem], original_pre_step_items),
+            new_response=ModelResponse(output=[], usage=Usage(), response_id="resp"),
+            processed_response=processed_response,
+            hooks=RunHooks(),
+            context_wrapper=context_wrapper,
+            run_config=RunConfig(),
+            run_state=None,
+        )
+
+    assert checker_calls == []
+    assert enabled_calls == []
+
+
+@pytest.mark.asyncio
 async def test_resume_keeps_approved_shell_outputs_with_pending_interruptions() -> None:
     """Approved shell outputs should be emitted even when other approvals are still pending."""
 
@@ -1995,6 +3177,84 @@ async def test_resume_executes_pending_computer_actions() -> None:
 
 
 @pytest.mark.asyncio
+async def test_resume_checkpoints_computer_output_before_custom_data_failure() -> None:
+    """A failed extractor must not make a completed computer side effect retryable."""
+
+    computer = TrackingComputer()
+
+    def fail_custom_data(_context: Any) -> dict[str, Any]:
+        raise RuntimeError("custom data failed")
+
+    computer_tool = ComputerTool(
+        computer=computer,
+        custom_data_extractor=fail_custom_data,
+    )
+    _model, agent = make_model_and_agent(tools=[computer_tool])
+    computer_call = ResponseComputerToolCall(
+        type="computer_call",
+        id="comp_checkpoint",
+        call_id="comp_checkpoint",
+        status="in_progress",
+        action=ActionScreenshot(type="screenshot"),
+        pending_safety_checks=[],
+    )
+    processed_response = ProcessedResponse(
+        new_items=[],
+        handoffs=[],
+        functions=[],
+        computer_actions=[
+            ToolRunComputerAction(tool_call=computer_call, computer_tool=computer_tool)
+        ],
+        local_shell_calls=[],
+        shell_calls=[],
+        apply_patch_calls=[],
+        tools_used=[computer_tool.name],
+        mcp_approval_requests=[],
+        interruptions=[],
+    )
+    context_wrapper = make_context_wrapper()
+    run_state = make_state_with_interruptions(agent, [])
+    run_state._context = context_wrapper
+
+    with pytest.raises(RuntimeError, match="custom data failed"):
+        await _resolve_interrupted_turn(
+            agent=agent,
+            original_input="resume computer",
+            original_pre_step_items=[],
+            new_response=ModelResponse(output=[], usage=Usage(), response_id="resp"),
+            processed_response=processed_response,
+            hooks=RunHooks(),
+            context_wrapper=context_wrapper,
+            run_config=RunConfig(),
+            run_state=run_state,
+        )
+
+    checkpointed_items = list(run_state._generated_items)
+    assert len(checkpointed_items) == 1
+    assert isinstance(checkpointed_items[0], ToolCallOutputItem)
+    assert checkpointed_items[0].call_id == "comp_checkpoint"
+    assert checkpointed_items[0].custom_data is None
+
+    computer_tool.custom_data_extractor = None
+    resumed = await _resolve_interrupted_turn(
+        agent=agent,
+        original_input="resume computer",
+        original_pre_step_items=checkpointed_items,
+        new_response=ModelResponse(output=[], usage=Usage(), response_id="resp"),
+        processed_response=processed_response,
+        hooks=RunHooks(),
+        context_wrapper=context_wrapper,
+        run_config=RunConfig(),
+        run_state=run_state,
+    )
+
+    assert computer.calls == ["screenshot"]
+    assert resumed.new_step_items == []
+    assert run_state._generated_items == checkpointed_items
+    assert isinstance(resumed.next_step, NextStepRunAgain)
+
+
+@pytest.mark.asyncio
 async def test_resume_skips_computer_actions_with_existing_output() -> None:
     """Computer actions with persisted output should not execute again when resuming."""
 
@@ -2059,6 +3319,10 @@ async def test_resume_skips_computer_actions_with_existing_output() -> None:
 async def test_rebuild_function_runs_handles_pending_and_rejections() -> None:
     """Rebuilt function runs should surface pending approvals and emit rejections."""
 
+    class FalsyToolApprovalItem(ToolApprovalItem):
+        def __bool__(self) -> bool:
+            return False
+
     @function_tool(needs_approval=True)
     def reject_me(text: str = "nope") -> str:
         return text
@@ -2084,7 +3348,7 @@ async def test_rebuild_function_runs_handles_pending_and_rejections() -> None:
     }
 
     rejected_item = ToolApprovalItem(agent=agent, raw_item=rejected_raw)
-    pending_item = ToolApprovalItem(agent=agent, raw_item=pending_raw)
+    pending_item = FalsyToolApprovalItem(agent=agent, raw_item=pending_raw)
     context_wrapper.reject_tool(rejected_item)
 
     run_state = make_state_with_interruptions(agent, [rejected_item, pending_item])
@@ -2114,7 +3378,8 @@ async def test_rebuild_function_runs_handles_pending_and_rejections() -> None:
     )
 
     assert isinstance(result.next_step, NextStepInterruption)
-    assert pending_item in result.next_step.interruptions
+    assert any(item is pending_item for item in result.next_step.interruptions)
+    assert any(item is pending_item for item in result.new_step_items)
     rejection_outputs = [
         item
         for item in result.new_step_items
@@ -2379,3 +3644,157 @@ async def test_mcp_callback_approvals_are_processed() -> None:
         for item in result.new_step_items
     ), "MCP callback approvals should emit approval responses"
     assert isinstance(result.next_step, NextStepRunAgain)
+
+
+@pytest.mark.asyncio
+async def test_mcp_callback_exact_retry_reuses_stored_decision() -> None:
+    """An exact uncommitted MCP retry must not invoke the approval callback twice."""
+    callback_calls: list[str] = []
+    agent = make_agent()
+    context_wrapper = make_context_wrapper()
+
+    class DummyMcpTool:
+        def on_approval_request(self, request: Any) -> dict[str, Any]:
+            callback_calls.append(request.data.id)
+            return {"approve": True, "reason": "ok"}
+
+    approval_request = ToolRunMCPApprovalRequest(
+        request_item=McpApprovalRequest(
+            id="mcp-callback-retry",
+            type="mcp_approval_request",
+            server_label="server",
+            arguments="{}",
+            name="hosted_mcp",
+        ),
+        mcp_tool=cast(HostedMCPTool, DummyMcpTool()),
+    )
+
+    first = await execute_mcp_approval_requests(
+        agent=agent,
+        approval_requests=[approval_request],
+        context_wrapper=context_wrapper,
+    )
+    second = await execute_mcp_approval_requests(
+        agent=agent,
+        approval_requests=[approval_request],
+        context_wrapper=context_wrapper,
+    )
+
+    assert callback_calls == ["mcp-callback-retry"]
+    responses = [item for item in [*first, *second] if isinstance(item, MCPApprovalResponseItem)]
+    assert [item.raw_item["approve"] for item in responses] == [True, True]
+
+
+@pytest.mark.asyncio
+async def test_mcp_callback_failure_is_not_retried_for_same_request() -> None:
+    """A callback that started without a committed response fails closed on retry."""
+    callback_calls: list[str] = []
+    agent = make_agent()
+    context_wrapper = make_context_wrapper()
+
+    class DummyMcpTool:
+        def on_approval_request(self, request: Any) -> dict[str, Any]:
+            callback_calls.append(request.data.id)
+            raise RuntimeError("callback failed")
+
+    approval_request = ToolRunMCPApprovalRequest(
+        request_item=McpApprovalRequest(
+            id="mcp-callback-failure",
+            type="mcp_approval_request",
+            server_label="server",
+            arguments="{}",
+            name="hosted_mcp",
+        ),
+        mcp_tool=cast(HostedMCPTool, DummyMcpTool()),
+    )
+
+    with pytest.raises(RuntimeError, match="callback failed"):
+        await execute_mcp_approval_requests(
+            agent=agent,
+            approval_requests=[approval_request],
+            context_wrapper=context_wrapper,
+        )
+    with pytest.raises(ModelBehaviorError, match="already ran"):
+        await execute_mcp_approval_requests(
+            agent=agent,
+            approval_requests=[approval_request],
+            context_wrapper=context_wrapper,
+        )
+
+    assert callback_calls == ["mcp-callback-failure"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_callback_exact_siblings_invoke_callback_once() -> None:
+    """Exact same-ID MCP siblings must share one approval callback result."""
+    callback_calls: list[str] = []
+    agent = make_agent()
+    context_wrapper = make_context_wrapper()
+
+    class DummyMcpTool:
+        async def on_approval_request(self, request: Any) -> dict[str, Any]:
+            callback_calls.append(request.data.id)
+            await asyncio.sleep(0)
+            return {"approve": True, "reason": "ok"}
+
+    mcp_tool = cast(HostedMCPTool, DummyMcpTool())
+    approval_requests = [
+        ToolRunMCPApprovalRequest(
+            request_item=McpApprovalRequest(
+                id="mcp-callback-sibling",
+                type="mcp_approval_request",
+                server_label="server",
+                arguments="{}",
+                name="hosted_mcp",
+            ),
+            mcp_tool=mcp_tool,
+        )
+        for _ in range(2)
+    ]
+
+    responses = await execute_mcp_approval_requests(
+        agent=agent,
+        approval_requests=approval_requests,
+        context_wrapper=context_wrapper,
+    )
+
+    assert callback_calls == ["mcp-callback-sibling"]
+    assert len(responses) == 1
+
+
+@pytest.mark.asyncio
+async def test_mcp_callback_changed_same_id_siblings_fail_before_callbacks() -> None:
+    """Changed same-ID MCP siblings must fail before invoking approval callbacks."""
+    callback_calls: list[str] = []
+    agent = make_agent()
+    context_wrapper = make_context_wrapper()
+
+    class DummyMcpTool:
+        async def on_approval_request(self, request: Any) -> dict[str, Any]:
+            callback_calls.append(request.data.arguments)
+            await asyncio.sleep(0)
+            return {"approve": True, "reason": "ok"}
+
+    mcp_tool = cast(HostedMCPTool, DummyMcpTool())
+    approval_requests = [
+        ToolRunMCPApprovalRequest(
+            request_item=McpApprovalRequest(
+                id="mcp-callback-sibling",
+                type="mcp_approval_request",
+                server_label="server",
+                arguments=arguments,
+                name="hosted_mcp",
+            ),
+            mcp_tool=mcp_tool,
+        )
+        for arguments in ('{"q":1}', '{"q":2}')
+    ]
+
+    with pytest.raises(ModelBehaviorError, match="reused an approval-gated tool call ID"):
+        await execute_mcp_approval_requests(
+            agent=agent,
+            approval_requests=approval_requests,
+            context_wrapper=context_wrapper,
+        )
+
+    assert callback_calls == []

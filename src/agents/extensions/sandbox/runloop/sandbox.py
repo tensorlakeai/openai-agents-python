@@ -34,6 +34,7 @@ from runloop_api_client.types.shared.launch_parameters import (
     UserParameters as _RunloopSdkUserParameters,
 )
 
+from ....sandbox._mount_security import redact_mount_error_data
 from ....sandbox.entries import Mount
 from ....sandbox.errors import (
     ExecTimeoutError,
@@ -53,6 +54,7 @@ from ....sandbox.session.runtime_helpers import RESOLVE_WORKSPACE_PATH_HELPER, R
 from ....sandbox.session.sandbox_client import BaseSandboxClient, BaseSandboxClientOptions
 from ....sandbox.snapshot import SnapshotBase, SnapshotSpec, resolve_snapshot
 from ....sandbox.types import ExecResult, ExposedPortEndpoint, User
+from ....sandbox.util.retry import iter_exception_chain
 from ....sandbox.util.tar_utils import UnsafeTarMemberError, validate_tar_bytes
 from ....sandbox.workspace_paths import coerce_posix_path, posix_path_as_path, sandbox_path_str
 
@@ -83,10 +85,16 @@ class _RunloopSdkImports:
     api_response_validation_error: type[BaseException]
     api_status_error: type[BaseException]
     api_timeout_error: type[BaseException]
+    authentication_error: type[BaseException]
+    bad_request_error: type[BaseException]
+    internal_server_error: type[BaseException]
     not_found_error: type[BaseException]
+    permission_denied_error: type[BaseException]
     polling_config: type[Any] | None
     polling_timeout: type[BaseException] | None
+    rate_limit_error: type[BaseException]
     runloop_error: type[BaseException]
+    unprocessable_entity_error: type[BaseException]
 
 
 _RUNLOOP_SDK_IMPORTS: _RunloopSdkImports | None = None
@@ -103,8 +111,14 @@ def _import_runloop_sdk() -> _RunloopSdkImports:
             APIResponseValidationError,
             APIStatusError,
             APITimeoutError,
+            AuthenticationError,
+            BadRequestError,
+            InternalServerError,
             NotFoundError,
+            PermissionDeniedError,
+            RateLimitError,
             RunloopError,
+            UnprocessableEntityError,
         )
         from runloop_api_client.sdk import AsyncRunloopSDK
     except ImportError as e:
@@ -132,10 +146,16 @@ def _import_runloop_sdk() -> _RunloopSdkImports:
         api_response_validation_error=APIResponseValidationError,
         api_status_error=APIStatusError,
         api_timeout_error=APITimeoutError,
+        authentication_error=AuthenticationError,
+        bad_request_error=BadRequestError,
+        internal_server_error=InternalServerError,
         not_found_error=NotFoundError,
+        permission_denied_error=PermissionDeniedError,
         polling_config=polling_config,
         polling_timeout=polling_timeout,
+        rate_limit_error=RateLimitError,
         runloop_error=RunloopError,
+        unprocessable_entity_error=UnprocessableEntityError,
     )
     return _RUNLOOP_SDK_IMPORTS
 
@@ -262,6 +282,56 @@ def _runloop_error_message(exc: BaseException) -> str | None:
     return None
 
 
+_RUNLOOP_HTTP_STATUS_RETRYABLE: dict[int, bool] = {
+    400: False,
+    401: False,
+    403: False,
+    404: False,
+    408: True,
+    422: False,
+    429: True,
+    500: True,
+    502: True,
+    503: True,
+    504: True,
+}
+
+
+def _runloop_retryable_error_types() -> tuple[type[BaseException], ...]:
+    sdk_imports = _import_runloop_sdk()
+    return (
+        sdk_imports.api_connection_error,
+        sdk_imports.api_timeout_error,
+        sdk_imports.internal_server_error,
+        sdk_imports.rate_limit_error,
+    )
+
+
+def _runloop_non_retryable_error_types() -> tuple[type[BaseException], ...]:
+    sdk_imports = _import_runloop_sdk()
+    return (
+        sdk_imports.authentication_error,
+        sdk_imports.bad_request_error,
+        sdk_imports.not_found_error,
+        sdk_imports.permission_denied_error,
+        sdk_imports.unprocessable_entity_error,
+    )
+
+
+def _runloop_provider_retryability(exc: BaseException) -> bool | None:
+    retryable_error_types = _runloop_retryable_error_types()
+    non_retryable_error_types = _runloop_non_retryable_error_types()
+    for candidate in iter_exception_chain(exc):
+        if isinstance(candidate, retryable_error_types):
+            return True
+        if isinstance(candidate, non_retryable_error_types):
+            return False
+        status_code = _runloop_status_code(candidate)
+        if status_code in _RUNLOOP_HTTP_STATUS_RETRYABLE:
+            return _RUNLOOP_HTTP_STATUS_RETRYABLE[status_code]
+    return None
+
+
 def _runloop_provider_error_types() -> tuple[type[BaseException], ...]:
     sdk_imports = _import_runloop_sdk()
     return (
@@ -352,6 +422,16 @@ class RunloopMcpSpec(BaseModel):
     secret: str = Field(min_length=1)
 
 
+class RunloopExistingSecret(BaseModel):
+    """A `managed_secrets` entry that is already stored on the Runloop account.
+
+    Used in place of a secret value to attach an account secret to the devbox by name,
+    leaving the stored value untouched.
+    """
+
+    model_config = {"frozen": True, "extra": "forbid"}
+
+
 def _normalize_runloop_user_parameters(
     user_parameters: RunloopUserParameters | dict[str, object] | None,
 ) -> RunloopUserParameters | None:
@@ -405,7 +485,7 @@ class RunloopSandboxClientOptions(BaseSandboxClientOptions):
     gateways: dict[str, RunloopGatewaySpec] | None = None
     mcp: dict[str, RunloopMcpSpec] | None = None
     metadata: dict[str, str] | None = None
-    managed_secrets: dict[str, str] | None = None
+    managed_secrets: dict[str, str | RunloopExistingSecret] | None = None
 
     def __init__(
         self,
@@ -422,7 +502,7 @@ class RunloopSandboxClientOptions(BaseSandboxClientOptions):
         gateways: dict[str, RunloopGatewaySpec] | None = None,
         mcp: dict[str, RunloopMcpSpec] | None = None,
         metadata: dict[str, str] | None = None,
-        managed_secrets: dict[str, str] | None = None,
+        managed_secrets: dict[str, str | RunloopExistingSecret] | None = None,
         *,
         type: Literal["runloop"] = "runloop",
     ) -> None:
@@ -665,6 +745,7 @@ class RunloopSandboxSession(BaseSandboxSession):
             return 0.001
         return float(timeout_s)
 
+    @redact_mount_error_data
     async def start(self) -> None:
         """Resume a reconnected Runloop devbox without replaying full setup when possible.
 
@@ -672,6 +753,7 @@ class RunloopSandboxSession(BaseSandboxSession):
         In that path, Runloop reuses the live machine and only reapplies snapshot or ephemeral
         manifest state if the cached workspace fingerprint no longer matches.
         """
+        await self._validate_manifest_application()
         if self._skip_start:
             if await self.state.snapshot.restorable(dependencies=self.dependencies):
                 is_running = await self.running()
@@ -781,6 +863,7 @@ class RunloopSandboxSession(BaseSandboxSession):
                     command=command,
                     context=_runloop_error_context(e, backend_detail="exec_failed"),
                     cause=e,
+                    retryable=_runloop_provider_retryability(e),
                 ) from e
             raise ExecTransportError(command=command, cause=e) from e
 
@@ -795,6 +878,7 @@ class RunloopSandboxSession(BaseSandboxSession):
                     reason="backend_unavailable",
                     context=_runloop_error_context(e, backend_detail="get_tunnel_url_failed"),
                     cause=e,
+                    retryable=_runloop_provider_retryability(e),
                 ) from e
             raise
         if isinstance(url, str) and url:
@@ -815,6 +899,7 @@ class RunloopSandboxSession(BaseSandboxSession):
                     reason="backend_unavailable",
                     context=_runloop_error_context(e, backend_detail="enable_tunnel_failed"),
                     cause=e,
+                    retryable=_runloop_provider_retryability(e),
                 ) from e
             raise
         try:
@@ -829,6 +914,7 @@ class RunloopSandboxSession(BaseSandboxSession):
                     reason="backend_unavailable",
                     context=context,
                     cause=e,
+                    retryable=_runloop_provider_retryability(e),
                 ) from e
             raise
         if not isinstance(url, str) or not url:
@@ -894,6 +980,7 @@ class RunloopSandboxSession(BaseSandboxSession):
                     path=error_path,
                     context=_runloop_error_context(e, backend_detail="file_download_failed"),
                     cause=e,
+                    retryable=_runloop_provider_retryability(e),
                 ) from e
             raise WorkspaceArchiveReadError(path=error_path, cause=e) from e
 
@@ -929,6 +1016,7 @@ class RunloopSandboxSession(BaseSandboxSession):
                     path=workspace_path,
                     context=_runloop_error_context(e, backend_detail="file_upload_failed"),
                     cause=e,
+                    retryable=_runloop_provider_retryability(e),
                 ) from e
             raise WorkspaceArchiveWriteError(path=workspace_path, cause=e) from e
 
@@ -1134,10 +1222,14 @@ class RunloopSandboxSession(BaseSandboxSession):
         except WorkspaceArchiveReadError as e:
             snapshot_error = e
         except Exception as e:
+            retryable = None
+            if _is_runloop_provider_error(e):
+                retryable = _runloop_provider_retryability(e)
             snapshot_error = WorkspaceArchiveReadError(
                 path=root,
                 context={"reason": "snapshot_failed"},
                 cause=e,
+                retryable=retryable,
             )
         finally:
             remount_error: WorkspaceArchiveReadError | None = None
@@ -1249,6 +1341,9 @@ class RunloopSandboxSession(BaseSandboxSession):
                 path=root,
                 context=context,
                 cause=e,
+                retryable=_runloop_provider_retryability(e)
+                if _is_runloop_provider_error(e)
+                else None,
             ) from e
 
     async def _restore_snapshot_into_workspace_on_resume(self) -> None:
@@ -1397,10 +1492,10 @@ def _runloop_launch_parameters_payload(
     return payload or None
 
 
-async def _upsert_runloop_managed_secrets(
+async def _resolve_runloop_managed_secret_refs(
     sdk: Any,
     *,
-    managed_secrets: dict[str, str] | None,
+    managed_secrets: dict[str, str | RunloopExistingSecret] | None,
     timeout_s: float,
 ) -> dict[str, str]:
     if not managed_secrets:
@@ -1408,13 +1503,14 @@ async def _upsert_runloop_managed_secrets(
 
     secret_refs: dict[str, str] = {}
     for env_var, secret_value in sorted(managed_secrets.items()):
-        try:
-            await sdk.secret.create(name=env_var, value=secret_value, timeout=timeout_s)
-        except Exception as e:
-            if _is_runloop_conflict(e):
-                await sdk.secret.update(env_var, value=secret_value, timeout=timeout_s)
-            else:
-                raise
+        if not isinstance(secret_value, RunloopExistingSecret):
+            try:
+                await sdk.secret.create(name=env_var, value=secret_value, timeout=timeout_s)
+            except Exception as e:
+                if _is_runloop_conflict(e):
+                    await sdk.secret.update(env_var, value=secret_value, timeout=timeout_s)
+                else:
+                    raise
         secret_refs[env_var] = env_var
     return secret_refs
 
@@ -1463,13 +1559,16 @@ class RunloopSandboxClient(BaseSandboxClient[RunloopSandboxClientOptions | None]
     ) -> None:
         self._sdk = _import_runloop_sdk().async_sdk(bearer_token=bearer_token, base_url=base_url)
         self._platform = RunloopPlatformClient(self._sdk)
-        self._instrumentation = instrumentation or Instrumentation()
+        self._instrumentation = (
+            instrumentation if instrumentation is not None else Instrumentation()
+        )
         self._dependencies = dependencies
 
     @property
     def platform(self) -> RunloopPlatformClient:
         return self._platform
 
+    @redact_mount_error_data
     async def create(
         self,
         *,
@@ -1485,7 +1584,7 @@ class RunloopSandboxClient(BaseSandboxClient[RunloopSandboxClientOptions | None]
         configured blueprint selection or user profile when provisioning the devbox. The returned
         session follows the shared sandbox lifecycle and must be started before direct operations.
         """
-        resolved_options = options or RunloopSandboxClientOptions()
+        resolved_options = options if options is not None else RunloopSandboxClientOptions()
         if (
             resolved_options.blueprint_id is not None
             and resolved_options.blueprint_name is not None
@@ -1495,8 +1594,13 @@ class RunloopSandboxClient(BaseSandboxClient[RunloopSandboxClientOptions | None]
             )
 
         user_parameters = _normalize_runloop_user_parameters(resolved_options.user_parameters)
-        manifest = manifest or Manifest(root=_default_runloop_manifest_root(user_parameters))
+        manifest = (
+            manifest
+            if manifest is not None
+            else Manifest(root=_default_runloop_manifest_root(user_parameters))
+        )
         _validate_runloop_manifest_root(manifest, user_parameters=user_parameters)
+        self._validate_manifest_for_create(manifest)
 
         timeouts_in = resolved_options.timeouts
         if isinstance(timeouts_in, RunloopTimeouts):
@@ -1506,7 +1610,7 @@ class RunloopSandboxClient(BaseSandboxClient[RunloopSandboxClientOptions | None]
         else:
             timeouts = RunloopTimeouts.model_validate(timeouts_in)
 
-        secret_refs = await _upsert_runloop_managed_secrets(
+        secret_refs = await _resolve_runloop_managed_secret_refs(
             self._sdk,
             managed_secrets=resolved_options.managed_secrets,
             timeout_s=timeouts.fast_op_s,
@@ -1578,6 +1682,7 @@ class RunloopSandboxClient(BaseSandboxClient[RunloopSandboxClientOptions | None]
             pass
         return session
 
+    @redact_mount_error_data
     async def resume(
         self,
         state: SandboxSessionState,
@@ -1591,6 +1696,7 @@ class RunloopSandboxClient(BaseSandboxClient[RunloopSandboxClientOptions | None]
         """
         if not isinstance(state, RunloopSandboxSessionState):
             raise TypeError("RunloopSandboxClient.resume expects a RunloopSandboxSessionState")
+        state.assert_path_grants_rebound()
 
         devbox = None
         reconnected = False
@@ -1635,4 +1741,4 @@ class RunloopSandboxClient(BaseSandboxClient[RunloopSandboxClientOptions | None]
         return self._wrap_session(inner, instrumentation=self._instrumentation)
 
     def deserialize_session_state(self, payload: dict[str, object]) -> SandboxSessionState:
-        return RunloopSandboxSessionState.model_validate(payload)
+        return self._deserialize_session_state_payload(payload, RunloopSandboxSessionState)

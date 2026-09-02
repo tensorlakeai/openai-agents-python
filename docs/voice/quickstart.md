@@ -8,6 +8,12 @@ Make sure you've followed the base [quickstart instructions](../quickstart.md) f
 pip install 'openai-agents[voice]'
 ```
 
+The demo code below also uses [`sounddevice`](https://pypi.org/project/sounddevice/) for microphone and speaker I/O, which is not part of the `voice` extra:
+
+```bash
+pip install sounddevice
+```
+
 ## Concepts
 
 The main concept to know about is a [`VoicePipeline`][agents.voice.pipeline.VoicePipeline], which is a 3 step process:
@@ -44,21 +50,17 @@ graph LR
 
 ## Agents
 
-First, let's set up some Agents. This should feel familiar to you if you've built any agents with this SDK. We'll have a couple of Agents, a handoff, and a tool.
+First, let's set up some Agents. This should feel familiar to you if you've built any agents with this SDK. We'll have two Agents, a configured handoff, and a tool.
 
 ```python
-import asyncio
 import random
 
-from agents import (
-    Agent,
-    function_tool,
-)
+from agents import Agent
+from agents.decorators import tool
 from agents.extensions.handoff_prompt import prompt_with_handoff_instructions
 
 
-
-@function_tool
+@tool
 def get_weather(city: str) -> str:
     """Get the weather for a given city."""
     print(f"[debug] get_weather called with city: {city}")
@@ -68,19 +70,19 @@ def get_weather(city: str) -> str:
 
 spanish_agent = Agent(
     name="Spanish",
-    handoff_description="A spanish speaking agent.",
+    handoff_description="A Spanish-speaking agent.",
     instructions=prompt_with_handoff_instructions(
         "You're speaking to a human, so be polite and concise. Speak in Spanish.",
     ),
-    model="gpt-5.5",
+    model="gpt-5.6-sol",
 )
 
 agent = Agent(
     name="Assistant",
     instructions=prompt_with_handoff_instructions(
-        "You're speaking to a human, so be polite and concise. If the user speaks in Spanish, handoff to the spanish agent.",
+        "You're speaking to a human, so be polite and concise. If the user speaks in Spanish, hand off to the Spanish agent.",
     ),
-    model="gpt-5.5",
+    model="gpt-5.6-sol",
     handoffs=[spanish_agent],
     tools=[get_weather],
 )
@@ -129,11 +131,8 @@ import random
 import numpy as np
 import sounddevice as sd
 
-from agents import (
-    Agent,
-    function_tool,
-    set_tracing_disabled,
-)
+from agents import Agent
+from agents.decorators import tool
 from agents.voice import (
     AudioInput,
     SingleAgentVoiceWorkflow,
@@ -142,7 +141,7 @@ from agents.voice import (
 from agents.extensions.handoff_prompt import prompt_with_handoff_instructions
 
 
-@function_tool
+@tool
 def get_weather(city: str) -> str:
     """Get the weather for a given city."""
     print(f"[debug] get_weather called with city: {city}")
@@ -152,19 +151,19 @@ def get_weather(city: str) -> str:
 
 spanish_agent = Agent(
     name="Spanish",
-    handoff_description="A spanish speaking agent.",
+    handoff_description="A Spanish-speaking agent.",
     instructions=prompt_with_handoff_instructions(
         "You're speaking to a human, so be polite and concise. Speak in Spanish.",
     ),
-    model="gpt-5.5",
+    model="gpt-5.6-sol",
 )
 
 agent = Agent(
     name="Assistant",
     instructions=prompt_with_handoff_instructions(
-        "You're speaking to a human, so be polite and concise. If the user speaks in Spanish, handoff to the spanish agent.",
+        "You're speaking to a human, so be polite and concise. If the user speaks in Spanish, hand off to the Spanish agent.",
     ),
-    model="gpt-5.5",
+    model="gpt-5.6-sol",
     handoffs=[spanish_agent],
     tools=[get_weather],
 )
@@ -191,4 +190,4 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-If you run this example, the agent will speak to you! Check out the example in [examples/voice/static](https://github.com/openai/openai-agents-python/tree/main/examples/voice/static) to see a demo where you can speak to the agent yourself.
+If you run this example, the agent will produce spoken audio for you to hear! Check out the example in [examples/voice/static](https://github.com/openai/openai-agents-python/tree/main/examples/voice/static) to see a demo where you can speak to the agent yourself.

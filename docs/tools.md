@@ -2,9 +2,9 @@
 
 Tools let agents take actions: things like fetching data, running code, calling external APIs, and even using a computer. The SDK supports five categories:
 
--   Hosted OpenAI tools: run alongside the model on OpenAI servers.
+-   Hosted OpenAI tools: execute for the model on OpenAI servers.
 -   Local/runtime execution tools: `ComputerTool` and `ApplyPatchTool` always run in your environment, while `ShellTool` can run locally or in a hosted container.
--   Function calling: wrap any Python function as a tool.
+-   `FunctionTool` instances: wrap any Python function as a tool.
 -   Agents as tools: expose an agent as a callable tool without a full handoff.
 -   Experimental: Codex tool: run workspace-scoped Codex tasks from a tool call.
 
@@ -16,6 +16,7 @@ Use this page as a catalog, then jump to the section that matches the runtime yo
 | --- | --- |
 | Use OpenAI-managed tools (web search, file search, code interpreter, hosted MCP, image generation) | [Hosted tools](#hosted-tools) |
 | Defer large tool surfaces until runtime with tool search | [Hosted tool search](#hosted-tool-search) |
+| Coordinate several tool calls from generated JavaScript | [Programmatic Tool Calling](#programmatic-tool-calling) |
 | Run tools in your own process or environment | [Local runtime tools](#local-runtime-tools) |
 | Wrap Python functions as tools | [Function tools](#function-tools) |
 | Let one agent call another without a handoff | [Agents as tools](#agents-as-tools) |
@@ -31,10 +32,11 @@ OpenAI offers a few built-in tools when using the [`OpenAIResponsesModel`][agent
 -   The [`HostedMCPTool`][agents.tool.HostedMCPTool] exposes a remote MCP server's tools to the model.
 -   The [`ImageGenerationTool`][agents.tool.ImageGenerationTool] generates images from a prompt.
 -   The [`ToolSearchTool`][agents.tool.ToolSearchTool] lets the model load deferred tools, namespaces, or hosted MCP servers on demand.
+-   The [`ProgrammaticToolCallingTool`][agents.tool.ProgrammaticToolCallingTool] lets the model coordinate eligible tools from generated JavaScript.
 
 Advanced hosted search options:
 
--   `FileSearchTool` supports `filters`, `ranking_options`, and `include_search_results` in addition to `vector_store_ids` and `max_num_results`.
+-   `FileSearchTool` supports `filters`, `ranking_options`, and `include_search_results` in addition to `vector_store_ids` and `max_num_results`. Set `max_num_results` to an integer from 1 through 50; `None` or zero uses the provider default.
 -   `WebSearchTool` supports `filters`, `user_location`, and `search_context_size`.
 
 ```python
@@ -65,10 +67,11 @@ Start with hosted tool search when the candidate tools are already known when yo
 ```python
 from typing import Annotated
 
-from agents import Agent, Runner, ToolSearchTool, function_tool, tool_namespace
+from agents import Agent, Runner, ToolSearchTool, tool_namespace
+from agents.decorators import tool
 
 
-@function_tool(defer_loading=True)
+@tool(defer_loading=True)
 def get_customer_profile(
     customer_id: Annotated[str, "The customer ID to look up."],
 ) -> str:
@@ -76,7 +79,7 @@ def get_customer_profile(
     return f"profile for {customer_id}"
 
 
-@function_tool(defer_loading=True)
+@tool(defer_loading=True)
 def list_open_orders(
     customer_id: Annotated[str, "The customer ID to look up."],
 ) -> str:
@@ -93,7 +96,7 @@ crm_tools = tool_namespace(
 
 agent = Agent(
     name="Operations assistant",
-    model="gpt-5.5",
+    model="gpt-5.6-sol",
     instructions="Load the crm namespace before using CRM tools.",
     tools=[*crm_tools, ToolSearchTool()],
 )
@@ -119,6 +122,60 @@ What to know:
 -   See `examples/tools/tool_search.py` for complete runnable examples covering both namespaced loading and top-level deferred tools.
 -   Official platform guide: [Tool search](https://developers.openai.com/api/docs/guides/tools-tool-search).
 
+### Programmatic Tool Calling
+
+Programmatic Tool Calling lets a supported OpenAI Responses model generate JavaScript that calls eligible tools, combines their outputs, and returns one result to the model. It is useful for bounded workflows that benefit from loops, branching, parallel calls, or intermediate calculations without a model round trip after every tool call.
+
+The generated program runs in a fresh hosted V8 environment. It does not have Node.js APIs, filesystem or network access, or a persistent process. The program can interact only with tools that you explicitly allow.
+
+```python
+from pydantic import BaseModel
+
+from agents import (
+    Agent,
+    ModelSettings,
+    ProgrammaticToolCallingTool,
+    Runner,
+)
+from agents.decorators import tool
+
+
+class InventoryOutput(BaseModel):
+    sku: str
+    available_units: int
+
+
+@tool(allowed_callers=["programmatic"])
+def get_inventory(sku: str) -> InventoryOutput:
+    return InventoryOutput(sku=sku, available_units=42)
+
+
+agent = Agent(
+    name="Inventory planner",
+    model="gpt-5.6",
+    model_settings=ModelSettings(tool_choice="programmatic_tool_calling"),
+    tools=[get_inventory, ProgrammaticToolCallingTool()],
+)
+
+result = Runner.run_sync(agent, "Check inventory for desk-lamp and summarize it.")
+print(result.final_output)
+```
+
+What to know:
+
+-   Programmatic Tool Calling is available only with supported OpenAI Responses models. `ProgrammaticToolCallingTool()` and `tool_choice="programmatic_tool_calling"` are rejected by Chat Completions models and non-Responses backends.
+-   Add at most one `ProgrammaticToolCallingTool()` to an agent. The agent must also expose at least one programmatically callable tool, a `ToolSearchTool()` backed by a namespace, deferred function, or deferred hosted MCP server, or an opaque prompt-managed tool surface. A bare `ToolSearchTool()` without a searchable surface is rejected.
+-   `allowed_callers` controls how a tool may be invoked. Omitting it allows direct model calls only. Use `["programmatic"]` for program-only access or `["direct", "programmatic"]` to allow both.
+-   SDK tool types that can opt in are `FunctionTool`, `CustomTool`, `ShellTool`, `ApplyPatchTool`, `HostedMCPTool`, and `CodeInterpreterTool`. Function, custom, shell, and apply-patch tools expose `allowed_callers` directly. For hosted MCP and code interpreter, set `allowed_callers` inside `tool_config`.
+-   For `@function_tool(allowed_callers=[...])`, a structured return annotation such as a Pydantic model, TypedDict, or dataclass automatically becomes a strict object output schema, and the returned value is validated against that schema before it is returned to the program. Use `output_type=...` when the function has no usable annotation, or the lower-level `output_json_schema={...}` escape hatch when you already have a strict object schema. `output_type` and `output_json_schema` are mutually exclusive. Return annotations of `str`, `Any`, or `None` do not create an output schema. For a schema-backed program-owned call, the default failure formatter is disabled because its free-form text does not satisfy the output schema. A handler exception therefore propagates unless you provide a custom `failure_error_function` that returns schema-conforming JSON.
+-   Program-owned SDK tools still use the normal Runner lifecycle. Tool input and output guardrails, hooks, timeouts, concurrency limits, approvals, sessions, and `RunState` pause/resume behavior continue to apply, and the SDK preserves each child call's program caller relationship.
+-   Model-request retries use a stricter replay-safety boundary whenever `ProgrammaticToolCallingTool()` is present, even before a program executes. The SDK disables provider-managed retries and WebSocket pre-event retries for these requests. A Runner retry policy retries only when provider advice explicitly marks the replay safe; `retry_policies.network_error()` by itself does not override this boundary.
+-   Approval-sensitive or high-impact tools are usually better kept as direct calls so a person can review each action before it becomes part of a larger program. If a program-owned call pauses for approval, resolve the interruption through `RunState` and resume the original run as usual.
+-   Programmatic Tool Calling can be combined with [hosted tool search](#hosted-tool-search). The model must load deferred tools before a generated program can call them.
+-   A `program` item and its ordinary program-owned child tool calls appear as [`ToolCallItem`][agents.items.ToolCallItem] entries. The matching `program_output` appears as a [`ToolCallOutputItem`][agents.items.ToolCallOutputItem]. Hosted MCP approval requests and tool catalogs use specialized MCP items and stream events instead. See [Results](results.md#new-items) and [Streaming](streaming.md#run-item-event-names) for inspection details.
+-   See `examples/tools/programmatic_tool_calling.py` for a complete concurrent inventory-planning example.
+-   Official platform guide: [Programmatic Tool Calling](https://developers.openai.com/api/docs/guides/tools-programmatic-tool-calling).
+
 ### Hosted container shell + skills
 
 `ShellTool` also supports OpenAI-hosted container execution. Use this mode when you want the model to run shell commands in a managed container instead of your local runtime.
@@ -134,7 +191,7 @@ csv_skill: ShellToolSkillReference = {
 
 agent = Agent(
     name="Container shell agent",
-    model="gpt-5.5",
+    model="gpt-5.6-sol",
     instructions="Use the mounted skill when helpful.",
     tools=[
         ShellTool(
@@ -182,11 +239,13 @@ Local runtime tools require you to supply implementations:
 -   [`ApplyPatchTool`][agents.tool.ApplyPatchTool]: implement [`ApplyPatchEditor`][agents.editor.ApplyPatchEditor] to apply diffs locally.
 -   Local shell skills are available with `ShellTool(environment={"type": "local", "skills": [...]})`.
 
+Shell action timeouts use positive integer milliseconds for a finite timeout. The SDK treats both `0` and `None` as no explicit timeout before calling a local `ShellTool` executor because zero does not have a portable meaning across executor implementations; other values are rejected before executor invocation. This is specific to the timeout field: `max_output_length=0` remains a supported request for empty captured output.
+
 ### ComputerTool and the Responses computer tool
 
 `ComputerTool` is still a local harness: you provide a [`Computer`][agents.computer.Computer] or [`AsyncComputer`][agents.computer.AsyncComputer] implementation, and the SDK maps that harness onto the OpenAI Responses API computer surface.
 
-For explicit [`gpt-5.5`](https://developers.openai.com/api/docs/models/gpt-5.5) requests, the SDK sends the GA built-in tool payload `{"type": "computer"}`. The older `computer-use-preview` model keeps the preview payload `{"type": "computer_use_preview", "environment": ..., "display_width": ..., "display_height": ...}`. This mirrors the platform migration described in OpenAI's [Computer use guide](https://developers.openai.com/api/docs/guides/tools-computer-use/):
+For explicit [`gpt-5.5`](https://developers.openai.com/api/docs/models/gpt-5.5) requests, the SDK sends the GA built-in tool payload `{"type": "computer"}`. For requests to the older `computer-use-preview` model, the SDK continues to send the preview payload `{"type": "computer_use_preview", "environment": ..., "display_width": ..., "display_height": ...}`. This mirrors the platform migration described in OpenAI's [Computer use guide](https://developers.openai.com/api/docs/guides/tools-computer-use/):
 
 -   Model: `computer-use-preview` -> `gpt-5.5`
 -   Tool selector: `computer_use_preview` -> `computer`
@@ -197,7 +256,7 @@ The SDK chooses that wire shape from the effective model on the actual Responses
 
 When a [`ComputerTool`][agents.tool.ComputerTool] is present, `tool_choice="computer"`, `"computer_use"`, and `"computer_use_preview"` are all accepted and normalized to the built-in selector that matches the effective request model. Without a `ComputerTool`, those strings still behave like ordinary function names.
 
-This distinction matters when `ComputerTool` is backed by a [`ComputerProvider`][agents.tool.ComputerProvider] factory. The GA `computer` payload does not need `environment` or dimensions at serialization time, so unresolved factories are fine. Preview-compatible serialization still needs a resolved `Computer` or `AsyncComputer` instance so the SDK can send `environment`, `display_width`, and `display_height`.
+This distinction matters when `ComputerTool` is backed by a [`ComputerProvider`][agents.tool.ComputerProvider] factory. The GA `computer` payload does not need `environment` or dimensions at serialization time, so serialization can occur before a factory has produced a `Computer` or `AsyncComputer` instance. Preview-compatible serialization still needs a resolved `Computer` or `AsyncComputer` instance so the SDK can send `environment`, `display_width`, and `display_height`.
 
 At runtime, both paths still use the same local harness. Preview responses emit `computer_call` items with a single `action`; `gpt-5.5` can emit batched `actions[]`, and the SDK executes them in order before producing a `computer_call_output` screenshot item. See `examples/tools/computer_use.py` for a runnable Playwright-based harness.
 
@@ -243,12 +302,14 @@ agent = Agent(
 
 ## Function tools
 
-You can use any Python function as a tool. The Agents SDK will setup the tool automatically:
+You can use any Python function as a tool. The Agents SDK will set up the tool automatically:
 
 -   The name of the tool will be the name of the Python function (or you can provide a name)
 -   Tool description will be taken from the docstring of the function (or you can provide a description)
 -   The schema for the function inputs is automatically created from the function's arguments
 -   Descriptions for each input are taken from the docstring of the function, unless disabled
+
+Tools created by `@tool` expose the original Python callable through the read-only `__wrapped__` attribute. This is useful for inspection and testing, but calling it directly bypasses the tool runtime pipeline, including schema validation, context injection, guardrails, timeouts, failure handling, and tracing. Hand-built `FunctionTool` instances do not expose `__wrapped__`.
 
 We use Python's `inspect` module to extract the function signature, along with [`griffe`](https://mkdocstrings.github.io/griffe/) to parse docstrings and `pydantic` for schema creation.
 
@@ -259,14 +320,15 @@ import json
 
 from typing_extensions import TypedDict, Any
 
-from agents import Agent, FunctionTool, RunContextWrapper, function_tool
+from agents import Agent, FunctionTool, RunContextWrapper
+from agents.decorators import tool
 
 
 class Location(TypedDict):
     lat: float
     long: float
 
-@function_tool  # (1)!
+@tool  # (1)!
 async def fetch_weather(location: Location) -> str:
     # (2)!
     """Fetch the weather for a given location.
@@ -278,7 +340,7 @@ async def fetch_weather(location: Location) -> str:
     return "sunny"
 
 
-@function_tool(name_override="fetch_data")  # (3)!
+@tool(name_override="fetch_data")  # (3)!
 def read_file(ctx: RunContextWrapper[Any], path: str, directory: str | None = None) -> str:
     """Read the contents of a file.
 
@@ -306,7 +368,7 @@ for tool in agent.tools:
 
 1.  You can use any Python types as arguments to your functions, and the function can be sync or async.
 2.  Docstrings, if present, are used to capture descriptions and argument descriptions
-3.  Functions can optionally take the `context` (must be the first argument). You can also set overrides, like the name of the tool, description, which docstring style to use, etc.
+3.  Functions can optionally take the run context as their first argument. You can also set overrides, like the name of the tool, description, which docstring style to use, etc.
 4.  You can pass the decorated functions to the list of tools.
 
 ??? note "Expand to see output"
@@ -432,7 +494,7 @@ tool = FunctionTool(
 As mentioned before, we automatically parse the function signature to extract the schema for the tool, and we parse the docstring to extract descriptions for the tool and for individual arguments. Some notes on that:
 
 1. The signature parsing is done via the `inspect` module. We use type annotations to understand the types for the arguments, and dynamically build a Pydantic model to represent the overall schema. It supports most types, including Python primitives, Pydantic models, TypedDicts, and more.
-2. We use `griffe` to parse docstrings. Supported docstring formats are `google`, `sphinx` and `numpy`. We attempt to automatically detect the docstring format, but this is best-effort and you can explicitly set it when calling `function_tool`. You can also disable docstring parsing by setting `use_docstring_info` to `False`.
+2. We use `griffe` to parse docstrings. Supported docstring formats are `google`, `sphinx` and `numpy`. We attempt to automatically detect the docstring format, but this is best-effort and you can explicitly set it when calling `function_tool`. You can also disable docstring parsing by setting `use_docstring_info` to `False`. For Google-style docstrings, the parser also accepts an `Args:`, `Arguments:`, `Params:`, or `Parameters:` section immediately after summary text without an intervening blank line.
 
 The code for the schema extraction lives in [`agents.function_schema`][].
 
@@ -443,15 +505,15 @@ You can use Pydantic's [`Field`](https://docs.pydantic.dev/latest/concepts/field
 ```python
 from typing import Annotated
 from pydantic import Field
-from agents import function_tool
+from agents.decorators import tool
 
 # Default-based form
-@function_tool
+@tool
 def score_a(score: int = Field(..., ge=0, le=100, description="Score from 0 to 100")) -> str:
     return f"Score recorded: {score}"
 
 # Annotated form
-@function_tool
+@tool
 def score_b(score: Annotated[int, Field(..., ge=0, le=100, description="Score from 0 to 100")]) -> str:
     return f"Score recorded: {score}"
 ```
@@ -462,10 +524,11 @@ You can set per-call timeouts for async function tools with `@function_tool(time
 
 ```python
 import asyncio
-from agents import Agent, Runner, function_tool
+from agents import Agent
+from agents.decorators import tool
 
 
-@function_tool(timeout=2.0)
+@tool(timeout=2.0)
 async def slow_lookup(query: str) -> str:
     await asyncio.sleep(10)
     return f"Result for {query}"
@@ -488,10 +551,11 @@ You can control timeout handling:
 
 ```python
 import asyncio
-from agents import Agent, Runner, ToolTimeoutError, function_tool
+from agents import Agent, Runner, ToolTimeoutError
+from agents.decorators import tool
 
 
-@function_tool(timeout=1.5, timeout_behavior="raise_exception")
+@tool(timeout=1.5, timeout_behavior="raise_exception")
 async def slow_tool() -> str:
     await asyncio.sleep(5)
     return "done"
@@ -518,7 +582,8 @@ When you create a function tool via `@function_tool`, you can pass a `failure_er
 -   If you explicitly pass `None`, then any tool call errors will be re-raised for you to handle. This could be a `ModelBehaviorError` if the model produced invalid JSON, or a `UserError` if your code crashed, etc.
 
 ```python
-from agents import function_tool, RunContextWrapper
+from agents import RunContextWrapper
+from agents.decorators import tool
 from typing import Any
 
 def my_custom_error_function(context: RunContextWrapper[Any], error: Exception) -> str:
@@ -526,7 +591,7 @@ def my_custom_error_function(context: RunContextWrapper[Any], error: Exception) 
     print(f"A tool call failed with the following error: {error}")
     return "An internal server error occurred. Please try again later."
 
-@function_tool(failure_error_function=my_custom_error_function)
+@tool(failure_error_function=my_custom_error_function)
 def get_user_profile(user_id: str) -> str:
     """Fetches a user profile from a mock API.
      This function demonstrates a 'flaky' or failing API call.
@@ -545,8 +610,9 @@ If you are manually creating a `FunctionTool` object, then you must handle error
 In some workflows, you may want a central agent to orchestrate a network of specialized agents, instead of handing off control. You can do this by modeling agents as tools.
 
 ```python
-from agents import Agent, Runner
 import asyncio
+
+from agents import Agent, Runner
 
 spanish_agent = Agent(
     name="Spanish agent",
@@ -561,7 +627,7 @@ french_agent = Agent(
 orchestrator_agent = Agent(
     name="orchestrator_agent",
     instructions=(
-        "You are a translation agent. You use the tools given to you to translate."
+        "You are a translation agent. You use the tools given to you to translate. "
         "If asked for multiple translations, you call the relevant tools."
     ),
     tools=[
@@ -579,14 +645,23 @@ orchestrator_agent = Agent(
 async def main():
     result = await Runner.run(orchestrator_agent, input="Say 'Hello, how are you?' in Spanish.")
     print(result.final_output)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
 ### Customizing tool-agents
 
-The `agent.as_tool` function is a convenience method to make it easy to turn an agent into a tool. It supports common runtime options such as `max_turns`, `run_config`, `hooks`, `previous_response_id`, `conversation_id`, `session`, and `needs_approval`. It also supports structured input with `parameters`, `input_builder`, and `include_input_schema`. For advanced orchestration (for example, conditional retries, fallback behavior, or chaining multiple agent calls), use `Runner.run` directly in your tool implementation:
+`agent.as_tool` is a convenience method for turning an agent into a tool. It supports common runtime options such as `max_turns`, `run_config`, `hooks`, `previous_response_id`, `conversation_id`, `session`, and `needs_approval`. It also supports structured input with `parameters`, `input_builder`, and `include_input_schema`.
+
+The state options configure the nested agent run started by the tool call; the parent run's conversation state is not inherited automatically. To share client-managed history between the parent and nested runs, explicitly pass the same `session` to both. As with `Runner.run`, choose one state strategy for the nested run: a client-managed `session`, or server-managed continuation through `previous_response_id` or `conversation_id`.
 
 ```python
-@function_tool
+from agents.decorators import tool
+
+
+@tool
 async def run_my_agent() -> str:
     """A tool that runs the agent with custom configs"""
 
@@ -604,7 +679,7 @@ async def run_my_agent() -> str:
 
 ### Structured input for tool-agents
 
-By default, `Agent.as_tool()` expects a single string input (`{"input": "..."}`), but you can expose a structured schema by passing `parameters` (a Pydantic model or dataclass type).
+By default, `Agent.as_tool()` expects an object with one string field, `input` (`{"input": "..."}`), but you can expose a structured schema by passing `parameters` (a Pydantic model type or a dataclass type).
 
 Additional options:
 
@@ -663,10 +738,7 @@ json_tool = data_agent.as_tool(
 )
 ```
 
-Inside a custom extractor, the nested [`RunResult`][agents.result.RunResult] also exposes
-[`agent_tool_invocation`][agents.result.RunResultBase.agent_tool_invocation], which is useful when
-you need the outer tool name, call ID, or raw arguments while post-processing the nested result.
-See the [Results guide](results.md#agent-as-tool-metadata).
+Inside a custom extractor, the nested [`RunResult`][agents.result.RunResult] also exposes [`agent_tool_invocation`][agents.result.RunResultBase.agent_tool_invocation], which is useful when you need the outer tool name, call ID, or raw arguments while post-processing the nested result. See the [Results guide](results.md#agent-as-tool-metadata).
 
 ### Streaming nested agent runs
 
@@ -746,8 +818,8 @@ orchestrator = Agent(
 )
 
 async def main():
-    context = RunContextWrapper(LanguageContext(language_preference="french_spanish"))
-    result = await Runner.run(orchestrator, "How are you?", context=context.context)
+    context = LanguageContext(language_preference="french_spanish")
+    result = await Runner.run(orchestrator, "How are you?", context=context)
     print(result.final_output)
 
 asyncio.run(main())
@@ -761,10 +833,14 @@ The `is_enabled` parameter accepts:
 
 Disabled tools are completely hidden from the LLM at runtime, making this useful for:
 
--   Feature gating based on user permissions
+-   Request-scoped capability visibility
 -   Environment-specific tool availability (dev vs prod)
 -   A/B testing different tool configurations
 -   Dynamic tool filtering based on runtime state
+
+For locally configured function tools, the runner also reevaluates `is_enabled` before invocation. However, `is_enabled` controls visibility and dispatch; it does not replace authorization that depends on the tool arguments or the resource being accessed. Enforce those checks inside the tool implementation, or use [tool input guardrails](guardrails.md#tool-guardrails) and [approvals](human_in_the_loop.md) when appropriate. MCP servers must authorize their own protected operations.
+
+See [context management](context.md#use-local-context-for-capability-visibility) for a pattern that applies one application policy across function tools, MCP tools, and handoffs.
 
 ## Experimental: Codex tool
 

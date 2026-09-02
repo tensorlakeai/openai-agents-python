@@ -8,19 +8,21 @@ from agents import (
     ToolInputGuardrailData,
     ToolOutputGuardrailData,
     ToolOutputGuardrailTripwireTriggered,
-    function_tool,
+)
+from agents.decorators import (
+    tool,
     tool_input_guardrail,
     tool_output_guardrail,
 )
 
 
-@function_tool
+@tool
 def send_email(to: str, subject: str, body: str) -> str:
     """Send an email to the specified recipient."""
     return f"Email sent to {to} with subject '{subject}'"
 
 
-@function_tool
+@tool
 def get_user_data(user_id: str) -> dict[str, str]:
     """Get user data by ID."""
     # Simulate returning sensitive data
@@ -33,7 +35,7 @@ def get_user_data(user_id: str) -> dict[str, str]:
     }
 
 
-@function_tool
+@tool
 def get_contact_info(user_id: str) -> dict[str, str]:
     """Get contact info by ID."""
     return {
@@ -107,7 +109,11 @@ get_contact_info.tool_output_guardrails = [reject_phone_numbers]
 
 agent = Agent(
     name="Secure Assistant",
-    instructions="You are a helpful assistant with access to email and user data tools.",
+    instructions=(
+        "You are a helpful assistant with access to email and user data tools. "
+        "When the user provides all required arguments for a requested tool, call it instead of "
+        "asking a follow-up question."
+    ),
     tools=[send_email, get_user_data, get_contact_info],
 )
 
@@ -115,20 +121,23 @@ agent = Agent(
 async def main():
     print("=== Tool Guardrails Example ===\n")
 
-    try:
-        # Example 1: Normal operation - should work fine
-        print("1. Normal email sending:")
-        result = await Runner.run(agent, "Send a welcome email to john@example.com")
-        print(f"✅ Successful tool execution: {result.final_output}\n")
+    # Example 1: Normal operation - should work fine
+    print("1. Normal email sending:")
+    result = await Runner.run(
+        agent,
+        "Send an email to john@example.com with subject 'Welcome' and body "
+        "'Welcome to our service.'",
+    )
+    print(f"✅ Successful tool execution: {result.final_output}\n")
 
-        # Example 2: Input guardrail triggers - function tool call is rejected but execution continues
-        print("2. Attempting to send email with suspicious content:")
-        result = await Runner.run(
-            agent, "Send an email to john@example.com introducing the company ACME corp."
-        )
-        print(f"❌ Guardrail rejected function tool call: {result.final_output}\n")
-    except Exception as e:
-        print(f"Error: {e}\n")
+    # Example 2: Input guardrail triggers - function tool call is rejected but execution continues
+    print("2. Attempting to send email with suspicious content:")
+    result = await Runner.run(
+        agent,
+        "Send an email to john@example.com with subject 'Introduction' and body "
+        "'Introducing ACME corp.'",
+    )
+    print(f"❌ Guardrail rejected function tool call: {result.final_output}\n")
 
     try:
         # Example 3: Output guardrail triggers - should raise exception for sensitive data
@@ -139,13 +148,10 @@ async def main():
         print("🚨 Output guardrail triggered: Execution halted for sensitive data")
         print(f"Details: {e.output.output_info}\n")
 
-    try:
-        # Example 4: Output guardrail triggers - reject returning function tool output but continue execution
-        print("4. Rejecting function tool output containing phone numbers:")
-        result = await Runner.run(agent, "Get contact info for user456")
-        print(f"❌ Guardrail rejected function tool output: {result.final_output}\n")
-    except Exception as e:
-        print(f"Error: {e}\n")
+    # Example 4: Output guardrail triggers - reject returning function tool output but continue execution
+    print("4. Rejecting function tool output containing phone numbers:")
+    result = await Runner.run(agent, "Get contact info for user456")
+    print(f"❌ Guardrail rejected function tool output: {result.final_output}\n")
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ Required environment variable:
 - `OPENAI_API_KEY`
 
 Optional environment variables:
-- `OPENAI_MODEL` (defaults to `gpt-5.5`)
+- `OPENAI_MODEL` (defaults to `gpt-5.6-sol`)
 - `OPENAI_BASE_URL`
 - `OPENAI_WEBSOCKET_BASE_URL`
 - `EXAMPLES_INTERACTIVE_MODE=auto` (auto-approve HITL prompts for scripted runs)
@@ -28,14 +28,14 @@ from agents import (
     Agent,
     ModelSettings,
     ResponsesWebSocketSession,
-    function_tool,
     responses_websocket_session,
     trace,
 )
+from agents.decorators import tool
 from examples.auto_mode import confirm_with_fallback
 
 
-@function_tool
+@tool
 def lookup_order(order_id: str) -> dict[str, Any]:
     """Return deterministic order data for the demo."""
     orders = {
@@ -69,7 +69,7 @@ def lookup_order(order_id: str) -> dict[str, Any]:
     )
 
 
-@function_tool(needs_approval=True)
+@tool(needs_approval=True)
 def submit_refund(order_id: str, amount: float, reason: str) -> dict[str, Any]:
     """Create a refund request. This tool requires approval."""
     ticket = "RF-1001" if order_id == "ORD-1001" else f"RF-{order_id[-4:]}"
@@ -160,7 +160,7 @@ async def run_streamed_turn(
 
 
 async def main() -> None:
-    model_name = os.getenv("OPENAI_MODEL", "gpt-5.5")
+    model_name = os.getenv("OPENAI_MODEL", "gpt-5.6-sol")
     policy_agent = Agent(
         name="RefundPolicySpecialist",
         instructions=(

@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from contextvars import ContextVar
 from typing import Any, cast
 
-import httpx
+import httpx2
 import pytest
 from openai import APIConnectionError, APIStatusError, BadRequestError
 from pydantic import ValidationError
 
+from agents.exceptions import ModelTimeoutError
 from agents.items import ModelResponse, TResponseStreamEvent
+from agents.model_settings import ModelSettings
 from agents.models._openai_retry import get_openai_retry_advice
 from agents.models._retry_runtime import (
     should_disable_provider_managed_retries,
@@ -17,12 +20,15 @@ from agents.models._retry_runtime import (
 )
 from agents.retry import (
     ModelRetryAdvice,
+    ModelRetryAdviceRequest,
     ModelRetryBackoffSettings,
     ModelRetryNormalizedError,
     ModelRetrySettings,
     RetryDecision,
     RetryPolicyContext,
     retry_policies,
+    retry_policy_retries_all_transient_errors,
+    retry_policy_retries_safe_transport_errors,
 )
 from agents.run_internal.model_retry import get_response_with_retry, stream_response_with_retry
 from agents.usage import Usage
@@ -55,16 +61,48 @@ def test_model_retry_backoff_settings_allow_zero_values() -> None:
     assert backoff.multiplier == 0
 
 
+@pytest.mark.parametrize("timeout", [0, -0.1, float("inf"), float("nan")])
+def test_model_settings_rejects_invalid_model_call_timeout(timeout: float) -> None:
+    with pytest.raises(ValidationError):
+        ModelSettings(timeout=timeout)
+
+
+def test_model_settings_accepts_finite_model_call_timeout() -> None:
+    settings = ModelSettings(timeout=1.25)
+
+    assert settings.timeout == 1.25
+    assert settings.to_traceable_dict()["timeout"] == 1.25
+
+
+def test_retry_capabilities_preserve_falsey_policy() -> None:
+    class FalseyPolicy:
+        _openai_agents_retries_safe_transport_errors: bool
+        _openai_agents_retries_all_transient_errors: bool
+
+        def __bool__(self) -> bool:
+            return False
+
+        def __call__(self, _context: RetryPolicyContext) -> bool:
+            return False
+
+    policy = FalseyPolicy()
+    policy._openai_agents_retries_safe_transport_errors = True
+    policy._openai_agents_retries_all_transient_errors = True
+
+    assert retry_policy_retries_safe_transport_errors(policy) is True
+    assert retry_policy_retries_all_transient_errors(policy) is True
+
+
 def _connection_error(message: str = "connection error") -> APIConnectionError:
     return APIConnectionError(
         message=message,
-        request=httpx.Request("POST", "https://example.com"),
+        request=httpx2.Request("POST", "https://example.com"),
     )
 
 
 def _conversation_locked_error() -> BadRequestError:
-    request = httpx.Request("POST", "https://example.com")
-    response = httpx.Response(
+    request = httpx2.Request("POST", "https://example.com")
+    response = httpx2.Response(
         400,
         request=request,
         json={"error": {"code": "conversation_locked", "message": "locked"}},
@@ -79,8 +117,8 @@ def _conversation_locked_error() -> BadRequestError:
 
 
 def _status_error(status_code: int, code: str = "server_error") -> APIStatusError:
-    request = httpx.Request("POST", "https://example.com")
-    response = httpx.Response(
+    request = httpx2.Request("POST", "https://example.com")
+    response = httpx2.Response(
         status_code,
         request=request,
         json={"error": {"code": code, "message": code}},
@@ -95,8 +133,8 @@ def _status_error(status_code: int, code: str = "server_error") -> APIStatusErro
 
 
 def _status_error_without_code(status_code: int, body_code: str = "server_error") -> APIStatusError:
-    request = httpx.Request("POST", "https://example.com")
-    response = httpx.Response(
+    request = httpx2.Request("POST", "https://example.com")
+    response = httpx2.Response(
         status_code,
         request=request,
         json={"error": {"code": body_code, "message": body_code}},
@@ -106,6 +144,326 @@ def _status_error_without_code(status_code: int, body_code: str = "server_error"
         response=response,
         body={"error": {"code": body_code, "message": body_code}},
     )
+
+
+@pytest.mark.asyncio
+async def test_get_response_with_retry_times_out_and_retries_stateless_attempt() -> None:
+    calls = 0
+
+    async def get_response() -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            await asyncio.Event().wait()
+        return ModelResponse(output=[get_text_message("ok")], usage=Usage(), response_id="resp")
+
+    result = await get_response_with_retry(
+        get_response=get_response,
+        rewind=lambda: asyncio.sleep(0),
+        retry_settings=ModelRetrySettings(
+            max_retries=1,
+            backoff={"initial_delay": 0},
+            policy=retry_policies.network_error(),
+        ),
+        get_retry_advice=lambda _request: None,
+        previous_response_id=None,
+        conversation_id=None,
+        timeout=0.01,
+    )
+
+    assert calls == 2
+    assert result.response_id == "resp"
+
+
+@pytest.mark.asyncio
+async def test_get_response_with_retry_blocks_unsafe_stateful_timeout_replay() -> None:
+    calls = 0
+
+    async def get_response() -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    with pytest.raises(ModelTimeoutError, match="timed out after 0.01 seconds"):
+        await get_response_with_retry(
+            get_response=get_response,
+            rewind=lambda: asyncio.sleep(0),
+            retry_settings=ModelRetrySettings(
+                max_retries=1,
+                backoff={"initial_delay": 0},
+                policy=retry_policies.network_error(),
+            ),
+            get_retry_advice=lambda _request: None,
+            previous_response_id=None,
+            conversation_id="conv_123",
+            timeout=0.01,
+        )
+
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_model_timeout_discards_cleanup_exception_graph() -> None:
+    sensitive_payload = "sensitive provider payload"
+
+    async def get_response() -> ModelResponse:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError as exc:
+            raise RuntimeError(sensitive_payload) from exc
+        raise AssertionError("unreachable")
+
+    with pytest.raises(ModelTimeoutError) as exc_info:
+        await get_response_with_retry(
+            get_response=get_response,
+            rewind=lambda: asyncio.sleep(0),
+            retry_settings=None,
+            get_retry_advice=lambda _request: None,
+            previous_response_id=None,
+            conversation_id=None,
+            timeout=0.01,
+        )
+
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert sensitive_payload not in repr(exc_info.value)
+    traceback = exc_info.value.__traceback__
+    while traceback is not None:
+        if traceback.tb_frame.f_code.co_name == "_await_model_attempt":
+            frame_locals = traceback.tb_frame.f_locals
+            assert "awaitable" not in frame_locals
+            assert "task" not in frame_locals
+            assert "done" not in frame_locals
+            assert "pending" not in frame_locals
+        traceback = traceback.tb_next
+
+
+@pytest.mark.asyncio
+async def test_stream_timeout_discards_owner_task_from_traceback_locals() -> None:
+    sensitive_payload = "sensitive stream cleanup payload"
+
+    def get_stream() -> AsyncIterator[TResponseStreamEvent]:
+        async def iterator() -> AsyncIterator[TResponseStreamEvent]:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                raise RuntimeError(sensitive_payload)
+            yield cast(TResponseStreamEvent, {"type": "response.created"})
+
+        return iterator()
+
+    with pytest.raises(ModelTimeoutError) as exc_info:
+        async for _event in stream_response_with_retry(
+            get_stream=get_stream,
+            rewind=lambda: asyncio.sleep(0),
+            retry_settings=None,
+            get_retry_advice=lambda _request: None,
+            previous_response_id=None,
+            conversation_id=None,
+            timeout=0.01,
+        ):
+            pass
+
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    traceback = exc_info.value.__traceback__
+    while traceback is not None:
+        if traceback.tb_frame.f_code.co_name == "stream_response_with_retry":
+            frame_locals = traceback.tb_frame.f_locals
+            assert frame_locals.get("stream_owner") is None
+            assert frame_locals.get("stream_requests") is None
+            assert frame_locals.get("stream_results") is None
+        traceback = traceback.tb_next
+
+
+@pytest.mark.asyncio
+async def test_model_timeout_cancels_blocked_cleanup_after_deadline() -> None:
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+
+    async def get_response() -> ModelResponse:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleanup_started.set()
+            await release_cleanup.wait()
+        raise AssertionError("unreachable")
+
+    task = asyncio.create_task(
+        get_response_with_retry(
+            get_response=get_response,
+            rewind=lambda: asyncio.sleep(0),
+            retry_settings=None,
+            get_retry_advice=lambda _request: None,
+            previous_response_id=None,
+            conversation_id=None,
+            timeout=0.01,
+        )
+    )
+    await cleanup_started.wait()
+    done, _ = await asyncio.wait({task}, timeout=0.2)
+    if task not in done:
+        release_cleanup.set()
+        await task
+        pytest.fail("Non-streaming timeout cleanup did not receive a second cancellation.")
+
+    with pytest.raises(ModelTimeoutError) as exc_info:
+        await task
+
+    assert exc_info.value.timeout_seconds == 0.01
+
+
+@pytest.mark.asyncio
+async def test_get_response_with_retry_preserves_parent_cancellation() -> None:
+    started = asyncio.Event()
+
+    async def get_response() -> ModelResponse:
+        started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    task = asyncio.create_task(
+        get_response_with_retry(
+            get_response=get_response,
+            rewind=lambda: asyncio.sleep(0),
+            retry_settings=None,
+            get_retry_advice=lambda _request: None,
+            previous_response_id=None,
+            conversation_id=None,
+            timeout=10,
+        )
+    )
+    await started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_get_response_with_retry_preserves_parent_cancellation_during_timeout_cleanup() -> (
+    None
+):
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+
+    async def get_response() -> ModelResponse:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cleanup_started.set()
+            await release_cleanup.wait()
+        raise AssertionError("unreachable")
+
+    task = asyncio.create_task(
+        get_response_with_retry(
+            get_response=get_response,
+            rewind=lambda: asyncio.sleep(0),
+            retry_settings=None,
+            get_retry_advice=lambda _request: None,
+            previous_response_id=None,
+            conversation_id=None,
+            timeout=0.01,
+        )
+    )
+    await cleanup_started.wait()
+    task.cancel()
+    release_cleanup.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_get_response_with_retry_preserves_parent_cancellation_over_cleanup_error() -> None:
+    started = asyncio.Event()
+
+    async def get_response() -> ModelResponse:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError as exc:
+            raise RuntimeError("cleanup failed") from exc
+        raise AssertionError("unreachable")
+
+    task = asyncio.create_task(
+        get_response_with_retry(
+            get_response=get_response,
+            rewind=lambda: asyncio.sleep(0),
+            retry_settings=None,
+            get_retry_advice=lambda _request: None,
+            previous_response_id=None,
+            conversation_id=None,
+            timeout=10,
+        )
+    )
+    await started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_programmatic_request_disables_hidden_provider_retries() -> None:
+    provider_retry_flags: list[bool] = []
+
+    async def get_response() -> ModelResponse:
+        provider_retry_flags.append(should_disable_provider_managed_retries())
+        return ModelResponse(output=[get_text_message("ok")], usage=Usage(), response_id="resp")
+
+    result = await get_response_with_retry(
+        get_response=get_response,
+        rewind=lambda: asyncio.sleep(0),
+        retry_settings=None,
+        get_retry_advice=lambda _request: None,
+        previous_response_id=None,
+        conversation_id=None,
+        replay_unsafe_request=True,
+    )
+
+    assert result.response_id == "resp"
+    assert provider_retry_flags == [True]
+
+
+@pytest.mark.asyncio
+async def test_programmatic_request_requires_replay_approval_for_runner_retry() -> None:
+    calls = 0
+
+    async def get_response() -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        raise _connection_error()
+
+    with pytest.raises(APIConnectionError):
+        await get_response_with_retry(
+            get_response=get_response,
+            rewind=lambda: asyncio.sleep(0),
+            retry_settings=ModelRetrySettings(
+                max_retries=1,
+                backoff={"initial_delay": 0},
+                policy=retry_policies.network_error(),
+            ),
+            get_retry_advice=lambda _request: None,
+            previous_response_id=None,
+            conversation_id=None,
+            replay_unsafe_request=True,
+        )
+
+    assert calls == 1
+
+
+def test_get_openai_retry_advice_returns_none_for_non_retryable_status() -> None:
+    advice = get_openai_retry_advice(
+        ModelRetryAdviceRequest(
+            error=_status_error(400, code="invalid_request_error"),
+            attempt=1,
+            stream=False,
+        )
+    )
+
+    assert advice is None
 
 
 class _AcloseTrackingStream:
@@ -695,8 +1053,8 @@ async def test_get_response_with_retry_honors_explicit_none_retry_after_override
     async def get_response() -> ModelResponse:
         nonlocal calls
         calls += 1
-        request = httpx.Request("POST", "https://example.com")
-        response = httpx.Response(
+        request = httpx2.Request("POST", "https://example.com")
+        response = httpx2.Response(
             429,
             request=request,
             headers={"retry-after-ms": "1250"},
@@ -1431,6 +1789,439 @@ async def test_stream_response_with_retry_retries_before_first_event(monkeypatch
     assert sleeps == [0.25]
     assert failed_attempts == [1]
     assert events == [cast(TResponseStreamEvent, {"type": "response.created"})]
+
+
+@pytest.mark.asyncio
+async def test_stream_response_with_retry_retries_timeout_before_output() -> None:
+    attempts = 0
+
+    def get_stream() -> AsyncIterator[TResponseStreamEvent]:
+        nonlocal attempts
+        attempts += 1
+
+        async def iterator() -> AsyncIterator[TResponseStreamEvent]:
+            if attempts == 1:
+                await asyncio.Event().wait()
+            yield cast(TResponseStreamEvent, {"type": "response.created"})
+
+        return iterator()
+
+    events = [
+        event
+        async for event in stream_response_with_retry(
+            get_stream=get_stream,
+            rewind=lambda: asyncio.sleep(0),
+            retry_settings=ModelRetrySettings(
+                max_retries=1,
+                backoff={"initial_delay": 0},
+                policy=retry_policies.network_error(),
+            ),
+            get_retry_advice=lambda _request: None,
+            previous_response_id=None,
+            conversation_id=None,
+            timeout=0.01,
+        )
+    ]
+
+    assert attempts == 2
+    assert events == [cast(TResponseStreamEvent, {"type": "response.created"})]
+
+
+@pytest.mark.asyncio
+async def test_stream_response_with_retry_keeps_one_context_for_timed_attempt() -> None:
+    context_value: ContextVar[str | None] = ContextVar("context_value", default=None)
+
+    def get_stream() -> AsyncIterator[TResponseStreamEvent]:
+        async def iterator() -> AsyncIterator[TResponseStreamEvent]:
+            token = context_value.set("active")
+            try:
+                yield cast(TResponseStreamEvent, {"type": "response.created"})
+                yield cast(TResponseStreamEvent, {"type": "response.in_progress"})
+            finally:
+                context_value.reset(token)
+
+        return iterator()
+
+    events = [
+        event
+        async for event in stream_response_with_retry(
+            get_stream=get_stream,
+            rewind=lambda: asyncio.sleep(0),
+            retry_settings=None,
+            get_retry_advice=lambda _request: None,
+            previous_response_id=None,
+            conversation_id=None,
+            timeout=1,
+        )
+    ]
+
+    assert events == [
+        cast(TResponseStreamEvent, {"type": "response.created"}),
+        cast(TResponseStreamEvent, {"type": "response.in_progress"}),
+    ]
+    assert context_value.get() is None
+
+
+@pytest.mark.asyncio
+async def test_timed_stream_constructs_and_closes_iterator_in_one_context() -> None:
+    context_value: ContextVar[str | None] = ContextVar("context_value", default=None)
+
+    class ConstructionScopedStream:
+        def __init__(self) -> None:
+            self.token = context_value.set("active")
+            self.emitted = False
+
+        def __aiter__(self) -> ConstructionScopedStream:
+            return self
+
+        async def __anext__(self) -> TResponseStreamEvent:
+            if self.emitted:
+                raise StopAsyncIteration
+            self.emitted = True
+            return cast(TResponseStreamEvent, {"type": "response.created"})
+
+        async def aclose(self) -> None:
+            context_value.reset(self.token)
+
+    events = [
+        event
+        async for event in stream_response_with_retry(
+            get_stream=ConstructionScopedStream,
+            rewind=lambda: asyncio.sleep(0),
+            retry_settings=None,
+            get_retry_advice=lambda _request: None,
+            previous_response_id=None,
+            conversation_id=None,
+            timeout=1,
+        )
+    ]
+
+    assert events == [cast(TResponseStreamEvent, {"type": "response.created"})]
+    assert context_value.get() is None
+
+
+@pytest.mark.asyncio
+async def test_timed_stream_early_close_keeps_generator_cleanup_context() -> None:
+    context_value: ContextVar[str | None] = ContextVar("context_value", default=None)
+    cleanup_state: list[str] = []
+
+    def get_stream() -> AsyncIterator[TResponseStreamEvent]:
+        async def iterator() -> AsyncIterator[TResponseStreamEvent]:
+            token = context_value.set("active")
+            try:
+                yield cast(TResponseStreamEvent, {"type": "response.created"})
+                await asyncio.Event().wait()
+            finally:
+                context_value.reset(token)
+                cleanup_state.append("reset")
+
+        return iterator()
+
+    stream = stream_response_with_retry(
+        get_stream=get_stream,
+        rewind=lambda: asyncio.sleep(0),
+        retry_settings=None,
+        get_retry_advice=lambda _request: None,
+        previous_response_id=None,
+        conversation_id=None,
+        timeout=1,
+    )
+
+    assert await stream.__anext__() == cast(TResponseStreamEvent, {"type": "response.created"})
+    await stream.aclose()
+
+    assert cleanup_state == ["reset"]
+    assert context_value.get() is None
+
+
+@pytest.mark.asyncio
+async def test_timed_stream_early_close_allows_cooperative_cleanup() -> None:
+    cleanup_state: list[str] = []
+
+    class CooperativeCloseStream:
+        def __init__(self) -> None:
+            self.emitted = False
+
+        def __aiter__(self) -> CooperativeCloseStream:
+            return self
+
+        async def __anext__(self) -> TResponseStreamEvent:
+            if not self.emitted:
+                self.emitted = True
+                return cast(TResponseStreamEvent, {"type": "response.created"})
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        async def aclose(self) -> None:
+            await asyncio.sleep(0)
+            cleanup_state.append("closed")
+
+    stream = stream_response_with_retry(
+        get_stream=CooperativeCloseStream,
+        rewind=lambda: asyncio.sleep(0),
+        retry_settings=None,
+        get_retry_advice=lambda _request: None,
+        previous_response_id=None,
+        conversation_id=None,
+        timeout=1,
+    )
+
+    assert await stream.__anext__() == cast(TResponseStreamEvent, {"type": "response.created"})
+    await stream.aclose()
+
+    assert cleanup_state == ["closed"]
+
+
+@pytest.mark.asyncio
+async def test_timed_stream_parent_cancellation_allows_cooperative_cleanup() -> None:
+    read_started = asyncio.Event()
+    cleanup_state: list[str] = []
+
+    class CooperativeCancelStream:
+        def __aiter__(self) -> CooperativeCancelStream:
+            return self
+
+        async def __anext__(self) -> TResponseStreamEvent:
+            read_started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        async def aclose(self) -> None:
+            await asyncio.sleep(0)
+            cleanup_state.append("closed")
+
+    async def consume() -> None:
+        async for _event in stream_response_with_retry(
+            get_stream=CooperativeCancelStream,
+            rewind=lambda: asyncio.sleep(0),
+            retry_settings=None,
+            get_retry_advice=lambda _request: None,
+            previous_response_id=None,
+            conversation_id=None,
+            timeout=1,
+        ):
+            pass
+
+    task = asyncio.create_task(consume())
+    await read_started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert cleanup_state == ["closed"]
+
+
+@pytest.mark.asyncio
+async def test_timed_stream_closes_provider_iterator_once() -> None:
+    class CloseCountingStream:
+        def __init__(self) -> None:
+            self.emitted = False
+            self.close_calls = 0
+
+        def __aiter__(self) -> CloseCountingStream:
+            return self
+
+        async def __anext__(self) -> TResponseStreamEvent:
+            if self.emitted:
+                raise StopAsyncIteration
+            self.emitted = True
+            return cast(TResponseStreamEvent, {"type": "response.created"})
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+
+    provider_stream = CloseCountingStream()
+    events = [
+        event
+        async for event in stream_response_with_retry(
+            get_stream=lambda: provider_stream,
+            rewind=lambda: asyncio.sleep(0),
+            retry_settings=None,
+            get_retry_advice=lambda _request: None,
+            previous_response_id=None,
+            conversation_id=None,
+            timeout=1,
+        )
+    ]
+
+    assert events == [cast(TResponseStreamEvent, {"type": "response.created"})]
+    assert provider_stream.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_response_with_retry_does_not_retry_timeout_after_output() -> None:
+    attempts = 0
+
+    def get_stream() -> AsyncIterator[TResponseStreamEvent]:
+        nonlocal attempts
+        attempts += 1
+
+        async def iterator() -> AsyncIterator[TResponseStreamEvent]:
+            yield cast(TResponseStreamEvent, {"type": "response.output_item.added"})
+            await asyncio.Event().wait()
+
+        return iterator()
+
+    with pytest.raises(ModelTimeoutError):
+        async for _event in stream_response_with_retry(
+            get_stream=get_stream,
+            rewind=lambda: asyncio.sleep(0),
+            retry_settings=ModelRetrySettings(
+                max_retries=1,
+                backoff={"initial_delay": 0},
+                policy=retry_policies.network_error(),
+            ),
+            get_retry_advice=lambda _request: None,
+            previous_response_id=None,
+            conversation_id=None,
+            timeout=0.01,
+        ):
+            pass
+
+    assert attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_timeout_reports_configured_attempt_timeout() -> None:
+    def get_stream() -> AsyncIterator[TResponseStreamEvent]:
+        async def iterator() -> AsyncIterator[TResponseStreamEvent]:
+            yield cast(TResponseStreamEvent, {"type": "response.created"})
+            await asyncio.Event().wait()
+
+        return iterator()
+
+    stream = stream_response_with_retry(
+        get_stream=get_stream,
+        rewind=lambda: asyncio.sleep(0),
+        retry_settings=None,
+        get_retry_advice=lambda _request: None,
+        previous_response_id=None,
+        conversation_id=None,
+        timeout=0.05,
+    )
+    assert await stream.__anext__() == cast(TResponseStreamEvent, {"type": "response.created"})
+    await asyncio.sleep(0.03)
+
+    with pytest.raises(ModelTimeoutError) as exc_info:
+        await stream.__anext__()
+
+    assert exc_info.value.timeout_seconds == 0.05
+    assert str(exc_info.value) == "Model call timed out after 0.05 seconds."
+
+
+@pytest.mark.asyncio
+async def test_stream_timeout_bounds_owner_cleanup_after_exhaustion() -> None:
+    class SlowCloseStream:
+        def __aiter__(self) -> SlowCloseStream:
+            return self
+
+        async def __anext__(self) -> TResponseStreamEvent:
+            raise StopAsyncIteration
+
+        async def aclose(self) -> None:
+            await asyncio.Event().wait()
+
+    with pytest.raises(ModelTimeoutError) as exc_info:
+        async for _event in stream_response_with_retry(
+            get_stream=SlowCloseStream,
+            rewind=lambda: asyncio.sleep(0),
+            retry_settings=None,
+            get_retry_advice=lambda _request: None,
+            previous_response_id=None,
+            conversation_id=None,
+            timeout=0.01,
+        ):
+            pass
+
+    assert exc_info.value.timeout_seconds == 0.01
+
+
+@pytest.mark.asyncio
+async def test_stream_timeout_cancels_blocked_cleanup_after_blocked_read() -> None:
+    read_started = asyncio.Event()
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+
+    class BlockingReadAndCloseStream:
+        def __aiter__(self) -> BlockingReadAndCloseStream:
+            return self
+
+        async def __anext__(self) -> TResponseStreamEvent:
+            read_started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        async def aclose(self) -> None:
+            close_started.set()
+            await release_close.wait()
+
+    async def consume() -> None:
+        async for _event in stream_response_with_retry(
+            get_stream=BlockingReadAndCloseStream,
+            rewind=lambda: asyncio.sleep(0),
+            retry_settings=None,
+            get_retry_advice=lambda _request: None,
+            previous_response_id=None,
+            conversation_id=None,
+            timeout=0.01,
+        ):
+            pass
+
+    task = asyncio.create_task(consume())
+    await read_started.wait()
+    done, _ = await asyncio.wait({task}, timeout=0.2)
+    if task not in done:
+        release_close.set()
+        await task
+        pytest.fail("Timed stream cleanup did not receive a second cancellation.")
+
+    with pytest.raises(ModelTimeoutError) as exc_info:
+        await task
+
+    assert close_started.is_set()
+    assert exc_info.value.timeout_seconds == 0.01
+
+
+@pytest.mark.asyncio
+async def test_stream_response_with_retry_preserves_parent_cancellation_over_cleanup_error() -> (
+    None
+):
+    started = asyncio.Event()
+
+    def get_stream() -> AsyncIterator[TResponseStreamEvent]:
+        async def iterator() -> AsyncIterator[TResponseStreamEvent]:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError as exc:
+                raise RuntimeError("stream cleanup failed") from exc
+            yield cast(TResponseStreamEvent, {"type": "response.created"})
+
+        return iterator()
+
+    async def consume() -> None:
+        async for _event in stream_response_with_retry(
+            get_stream=get_stream,
+            rewind=lambda: asyncio.sleep(0),
+            retry_settings=ModelRetrySettings(
+                max_retries=1,
+                backoff={"initial_delay": 0},
+                policy=retry_policies.network_error(),
+            ),
+            get_retry_advice=lambda _request: None,
+            previous_response_id=None,
+            conversation_id=None,
+            timeout=10,
+        ):
+            pass
+
+    task = asyncio.create_task(consume())
+    await started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 @pytest.mark.asyncio
@@ -2383,3 +3174,541 @@ async def test_stream_response_with_retry_closes_current_stream_when_consumer_st
     await outer_stream.aclose()
 
     assert stream.close_calls == 1
+
+
+def _ws_response_started_advice(request: ModelRetryAdviceRequest) -> ModelRetryAdvice:
+    """Advice matching the Responses WebSocket adapter after a response-started disconnect."""
+    return ModelRetryAdvice(
+        suggested=False,
+        replay_safety="unsafe",
+        reason=str(request.error),
+        response_started=True,
+    )
+
+
+def test_retry_policy_context_normalizes_unknown_provider_replay_safety() -> None:
+    context = RetryPolicyContext(
+        error=_connection_error(),
+        attempt=1,
+        max_retries=1,
+        stream=False,
+        normalized=ModelRetryNormalizedError(),
+        provider_advice=ModelRetryAdvice(replay_safety="conditional"),
+    )
+
+    assert context.replay_safety == "unknown"
+
+
+def test_provider_suggested_preserves_public_veto_for_unsafe_advice() -> None:
+    decision = retry_policies.provider_suggested()(
+        RetryPolicyContext(
+            error=_connection_error(),
+            attempt=1,
+            max_retries=1,
+            stream=False,
+            normalized=ModelRetryNormalizedError(is_network_error=True),
+            provider_advice=ModelRetryAdvice(
+                suggested=False,
+                replay_safety="unsafe",
+                reason="provider veto",
+            ),
+        )
+    )
+
+    assert isinstance(decision, RetryDecision)
+    assert decision.retry is False
+    assert decision.reason == "provider veto"
+
+
+@pytest.mark.asyncio
+async def test_provider_unsafe_replay_retries_when_policy_approves_explicitly() -> None:
+    calls = 0
+    seen: list[RetryPolicyContext] = []
+
+    async def get_response() -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise _connection_error("no close frame received or sent")
+        return ModelResponse(output=[get_text_message("ok")], usage=Usage(), response_id="resp")
+
+    def policy(context: RetryPolicyContext) -> RetryDecision:
+        seen.append(context)
+        return RetryDecision(
+            retry=True,
+            approve_unsafe_replay=True,
+            reason="Approved one replay of a read-only model turn",
+        )
+
+    result = await get_response_with_retry(
+        get_response=get_response,
+        rewind=lambda: asyncio.sleep(0),
+        retry_settings=ModelRetrySettings(
+            max_retries=1, backoff={"initial_delay": 0}, policy=policy
+        ),
+        get_retry_advice=_ws_response_started_advice,
+        previous_response_id=None,
+        conversation_id=None,
+    )
+
+    assert result.response_id == "resp"
+    assert calls == 2
+    # The policy must be able to scope its approval, so it needs the structured context.
+    assert len(seen) == 1
+    assert seen[0].stream is False
+    assert seen[0].response_started is True
+    assert seen[0].replay_safety == "unsafe"
+    assert seen[0].stateful_request is False
+
+
+@pytest.mark.asyncio
+async def test_provider_unsafe_replay_still_blocks_an_ordinary_retry_decision() -> None:
+    calls = 0
+
+    async def get_response() -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        raise _connection_error("no close frame received or sent")
+
+    def policy(_context: RetryPolicyContext) -> RetryDecision:
+        # No `approve_unsafe_replay`, so this must not bypass replay protection.
+        return RetryDecision(retry=True)
+
+    with pytest.raises(APIConnectionError):
+        await get_response_with_retry(
+            get_response=get_response,
+            rewind=lambda: asyncio.sleep(0),
+            retry_settings=ModelRetrySettings(
+                max_retries=1, backoff={"initial_delay": 0}, policy=policy
+            ),
+            get_retry_advice=_ws_response_started_advice,
+            previous_response_id=None,
+            conversation_id=None,
+        )
+
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_provider_unsafe_replay_approval_is_ignored_for_streamed_requests() -> None:
+    calls = 0
+
+    async def get_stream() -> AsyncIterator[TResponseStreamEvent]:
+        nonlocal calls
+        calls += 1
+        raise _connection_error("no close frame received or sent")
+        yield  # pragma: no cover - generator marker
+
+    def policy(_context: RetryPolicyContext) -> RetryDecision:
+        return RetryDecision(retry=True, approve_unsafe_replay=True)
+
+    with pytest.raises(APIConnectionError):
+        async for _event in stream_response_with_retry(
+            get_stream=get_stream,
+            rewind=lambda: asyncio.sleep(0),
+            retry_settings=ModelRetrySettings(
+                max_retries=1, backoff={"initial_delay": 0}, policy=policy
+            ),
+            get_retry_advice=_ws_response_started_advice,
+            previous_response_id=None,
+            conversation_id=None,
+        ):
+            pass
+
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_unsafe_replay_approval_does_not_replay_programmatic_tool_calling() -> None:
+    calls = 0
+    policy_calls = 0
+
+    async def get_response() -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        raise _connection_error()
+
+    def policy(_context: RetryPolicyContext) -> RetryDecision:
+        nonlocal policy_calls
+        policy_calls += 1
+        return RetryDecision(retry=True, approve_unsafe_replay=True)
+
+    # `replay_unsafe_request` is the request-level veto the runner sets for
+    # Programmatic Tool Calling. Application approval must not lift it.
+    with pytest.raises(APIConnectionError):
+        await get_response_with_retry(
+            get_response=get_response,
+            rewind=lambda: asyncio.sleep(0),
+            retry_settings=ModelRetrySettings(
+                max_retries=1, backoff={"initial_delay": 0}, policy=policy
+            ),
+            get_retry_advice=_ws_response_started_advice,
+            previous_response_id=None,
+            conversation_id=None,
+            replay_unsafe_request=True,
+        )
+
+    assert calls == 1
+    assert policy_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("combinator", ["all", "any"])
+@pytest.mark.parametrize("provider_first", [False, True])
+async def test_unsafe_replay_approval_resolves_provider_veto_in_policy_combinators(
+    combinator: str,
+    provider_first: bool,
+) -> None:
+    calls = 0
+
+    async def get_response() -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise _connection_error("no close frame received or sent")
+        return ModelResponse(output=[get_text_message("ok")], usage=Usage(), response_id="resp")
+
+    def approving(_context: RetryPolicyContext) -> RetryDecision:
+        return RetryDecision(retry=True, approve_unsafe_replay=True)
+
+    provider_policy = retry_policies.provider_suggested()
+    policies = (provider_policy, approving) if provider_first else (approving, provider_policy)
+    combined = getattr(retry_policies, combinator)(*policies)
+
+    result = await get_response_with_retry(
+        get_response=get_response,
+        rewind=lambda: asyncio.sleep(0),
+        retry_settings=ModelRetrySettings(
+            max_retries=1, backoff={"initial_delay": 0}, policy=combined
+        ),
+        get_retry_advice=_ws_response_started_advice,
+        previous_response_id=None,
+        conversation_id=None,
+    )
+
+    assert result.response_id == "resp"
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_provider_normalization_cannot_clear_raw_abort_veto() -> None:
+    class AbortError(Exception):
+        pass
+
+    calls = 0
+    policy_calls = 0
+
+    async def get_response() -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        raise AbortError("cancelled")
+
+    async def rewind() -> None:
+        raise AssertionError("An abort must not rewind state")
+
+    def policy(_context: RetryPolicyContext) -> RetryDecision:
+        nonlocal policy_calls
+        policy_calls += 1
+        return RetryDecision(retry=True, approve_unsafe_replay=True)
+
+    def get_retry_advice(_request: ModelRetryAdviceRequest) -> ModelRetryAdvice:
+        return ModelRetryAdvice(
+            suggested=False,
+            replay_safety="unsafe",
+            normalized=ModelRetryNormalizedError(is_abort=False),
+        )
+
+    with pytest.raises(AbortError, match="cancelled"):
+        await get_response_with_retry(
+            get_response=get_response,
+            rewind=rewind,
+            retry_settings=ModelRetrySettings(
+                max_retries=1,
+                backoff={"initial_delay": 0},
+                policy=policy,
+            ),
+            get_retry_advice=get_retry_advice,
+            previous_response_id=None,
+            conversation_id=None,
+        )
+
+    assert calls == 1
+    assert policy_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_policy_cannot_promote_unknown_provider_replay_safety() -> None:
+    calls = 0
+    policy_calls = 0
+
+    async def get_response() -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        raise _connection_error()
+
+    async def rewind() -> None:
+        raise AssertionError("Unknown replay safety must not rewind state")
+
+    def policy(context: RetryPolicyContext) -> RetryDecision:
+        nonlocal policy_calls
+        policy_calls += 1
+        assert context.provider_advice is not None
+        assert context.replay_safety == "unknown"
+        context.provider_advice.replay_safety = "safe"
+        return RetryDecision(retry=True)
+
+    with pytest.raises(APIConnectionError):
+        await get_response_with_retry(
+            get_response=get_response,
+            rewind=rewind,
+            retry_settings=ModelRetrySettings(
+                max_retries=1,
+                backoff={"initial_delay": 0},
+                policy=policy,
+            ),
+            get_retry_advice=lambda _request: ModelRetryAdvice(
+                suggested=True,
+                replay_safety="conditional",
+            ),
+            previous_response_id="resp_1",
+            conversation_id=None,
+        )
+
+    assert calls == 1
+    assert policy_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_policy_cannot_revoke_provider_safe_replay_evidence() -> None:
+    calls = 0
+    rewinds = 0
+
+    async def get_response() -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise _connection_error()
+        return ModelResponse(output=[get_text_message("ok")], usage=Usage(), response_id="resp")
+
+    async def rewind() -> None:
+        nonlocal rewinds
+        rewinds += 1
+
+    def policy(context: RetryPolicyContext) -> RetryDecision:
+        assert context.provider_advice is not None
+        assert context.replay_safety == "safe"
+        context.provider_advice.replay_safety = "conditional"
+        return RetryDecision(retry=True)
+
+    result = await get_response_with_retry(
+        get_response=get_response,
+        rewind=rewind,
+        retry_settings=ModelRetrySettings(
+            max_retries=1,
+            backoff={"initial_delay": 0},
+            policy=policy,
+        ),
+        get_retry_advice=lambda _request: ModelRetryAdvice(
+            suggested=True,
+            replay_safety="safe",
+        ),
+        previous_response_id="resp_1",
+        conversation_id=None,
+    )
+
+    assert result.response_id == "resp"
+    assert calls == 2
+    assert rewinds == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("combinator", ["all", "any"])
+@pytest.mark.parametrize(
+    ("suggested", "initial_safety", "expected_context_safety"),
+    [
+        (False, "unsafe", "unsafe"),
+        (None, "conditional", "unknown"),
+    ],
+)
+async def test_composed_policy_cannot_mutate_provider_authority(
+    combinator: str,
+    suggested: bool | None,
+    initial_safety: str,
+    expected_context_safety: str,
+) -> None:
+    calls = 0
+
+    async def get_response() -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        raise _connection_error()
+
+    async def rewind() -> None:
+        raise AssertionError("Mutated provider authority must not rewind state")
+
+    def mutate_advice(context: RetryPolicyContext) -> RetryDecision:
+        assert context.provider_advice is not None
+        assert context.replay_safety == expected_context_safety
+        assert context.response_started is False
+        context.provider_advice.suggested = True
+        context.provider_advice.replay_safety = "safe"
+        context.provider_advice.response_started = True
+        assert context.replay_safety == expected_context_safety
+        assert context.response_started is False
+        return RetryDecision(retry=True)
+
+    policy = getattr(retry_policies, combinator)(
+        mutate_advice,
+        retry_policies.provider_suggested(),
+    )
+
+    with pytest.raises(APIConnectionError):
+        await get_response_with_retry(
+            get_response=get_response,
+            rewind=rewind,
+            retry_settings=ModelRetrySettings(
+                max_retries=1,
+                backoff={"initial_delay": 0},
+                policy=policy,
+            ),
+            get_retry_advice=lambda _request: ModelRetryAdvice(
+                suggested=suggested,
+                replay_safety=initial_safety,
+                response_started=False,
+            ),
+            previous_response_id="resp_1",
+            conversation_id=None,
+        )
+
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_composed_policy_cannot_mutate_provider_authority_for_ptc() -> None:
+    calls = 0
+
+    async def get_response() -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        raise _connection_error()
+
+    async def rewind() -> None:
+        raise AssertionError("Mutated provider authority must not rewind PTC state")
+
+    def mutate_advice(context: RetryPolicyContext) -> RetryDecision:
+        assert context.provider_advice is not None
+        context.provider_advice.suggested = True
+        context.provider_advice.replay_safety = "safe"
+        return RetryDecision(retry=True)
+
+    with pytest.raises(APIConnectionError):
+        await get_response_with_retry(
+            get_response=get_response,
+            rewind=rewind,
+            retry_settings=ModelRetrySettings(
+                max_retries=1,
+                backoff={"initial_delay": 0},
+                policy=retry_policies.all(
+                    mutate_advice,
+                    retry_policies.provider_suggested(),
+                ),
+            ),
+            get_retry_advice=lambda _request: ModelRetryAdvice(
+                suggested=None,
+                replay_safety="conditional",
+            ),
+            previous_response_id=None,
+            conversation_id=None,
+            replay_unsafe_request=True,
+        )
+
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_unsafe_replay_approval_applies_to_a_stateful_request() -> None:
+    calls = 0
+
+    async def get_response() -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise _connection_error("no close frame received or sent")
+        return ModelResponse(output=[get_text_message("ok")], usage=Usage(), response_id="resp")
+
+    def policy(_context: RetryPolicyContext) -> RetryDecision:
+        return RetryDecision(retry=True, approve_unsafe_replay=True)
+
+    # `auto_previous_response_id=True` produces exactly this shape: a stateful request
+    # that fails closed by default but carries no application-local side effects.
+    result = await get_response_with_retry(
+        get_response=get_response,
+        rewind=lambda: asyncio.sleep(0),
+        retry_settings=ModelRetrySettings(
+            max_retries=1, backoff={"initial_delay": 0}, policy=policy
+        ),
+        get_retry_advice=_ws_response_started_advice,
+        previous_response_id="resp_1",
+        conversation_id=None,
+    )
+
+    assert result.response_id == "resp"
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_stateful_request_still_fails_closed_without_explicit_approval() -> None:
+    calls = 0
+
+    async def get_response() -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        raise _connection_error("no close frame received or sent")
+
+    def policy(_context: RetryPolicyContext) -> RetryDecision:
+        return RetryDecision(retry=True)
+
+    with pytest.raises(APIConnectionError):
+        await get_response_with_retry(
+            get_response=get_response,
+            rewind=lambda: asyncio.sleep(0),
+            retry_settings=ModelRetrySettings(
+                max_retries=1, backoff={"initial_delay": 0}, policy=policy
+            ),
+            get_retry_advice=_ws_response_started_advice,
+            previous_response_id=None,
+            conversation_id="conv_1",
+        )
+
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_unsafe_replay_approval_does_not_lift_a_stateful_request_with_unknown_safety() -> (
+    None
+):
+    calls = 0
+
+    async def get_response() -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        raise _connection_error()
+
+    def policy(_context: RetryPolicyContext) -> RetryDecision:
+        return RetryDecision(retry=True, approve_unsafe_replay=True)
+
+    # No provider advice, so replay safety is unknown rather than unsafe. The approval is
+    # scoped to provider-marked unsafe failures, so the stateful gate must stay closed.
+    with pytest.raises(APIConnectionError):
+        await get_response_with_retry(
+            get_response=get_response,
+            rewind=lambda: asyncio.sleep(0),
+            retry_settings=ModelRetrySettings(
+                max_retries=1, backoff={"initial_delay": 0}, policy=policy
+            ),
+            get_retry_advice=lambda _request: None,
+            previous_response_id="resp_1",
+            conversation_id=None,
+        )
+
+    assert calls == 1

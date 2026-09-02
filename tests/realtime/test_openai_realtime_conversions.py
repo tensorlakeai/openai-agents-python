@@ -4,6 +4,7 @@ import pytest
 from openai.types.realtime.realtime_conversation_item_user_message import (
     RealtimeConversationItemUserMessage,
 )
+from openai.types.realtime.realtime_response_usage import RealtimeResponseUsage
 from openai.types.realtime.realtime_tracing_config import (
     TracingConfiguration,
 )
@@ -42,6 +43,68 @@ async def test_get_api_key_from_callable_async():
 def test_try_convert_raw_message_invalid_returns_none():
     msg = RealtimeModelSendRawMessage(message={"type": "invalid.event", "other_data": {}})
     assert _ConversionHelper.try_convert_raw_message(msg) is None
+
+
+def test_convert_response_usage_preserves_modality_details():
+    event = _ConversionHelper.convert_response_usage(
+        RealtimeResponseUsage.model_validate(
+            {
+                "total_tokens": 253,
+                "input_tokens": 132,
+                "output_tokens": 121,
+                "input_token_details": {
+                    "text_tokens": 119,
+                    "audio_tokens": 13,
+                    "image_tokens": 0,
+                    "cached_tokens": 64,
+                    "cached_tokens_details": {
+                        "text_tokens": 60,
+                        "audio_tokens": 4,
+                        "image_tokens": 0,
+                    },
+                },
+                "output_token_details": {"text_tokens": 30, "audio_tokens": 91},
+            }
+        )
+    )
+
+    assert event.usage.requests == 1
+    assert event.usage.input_tokens == 132
+    assert event.usage.output_tokens == 121
+    assert event.usage.total_tokens == 253
+    assert event.usage.input_tokens_details.cached_tokens == 64
+    assert event.input_tokens_details is not None
+    assert event.input_tokens_details.text_tokens == 119
+    assert event.input_tokens_details.audio_tokens == 13
+    assert event.input_tokens_details.image_tokens == 0
+    assert event.input_tokens_details.cached_tokens == 64
+    assert event.input_tokens_details.cached_tokens_details is not None
+    assert event.input_tokens_details.cached_tokens_details.text_tokens == 60
+    assert event.input_tokens_details.cached_tokens_details.audio_tokens == 4
+    assert event.input_tokens_details.cached_tokens_details.image_tokens == 0
+    assert event.output_tokens_details is not None
+    assert event.output_tokens_details.text_tokens == 30
+    assert event.output_tokens_details.audio_tokens == 91
+
+
+def test_convert_response_usage_preserves_missing_details_and_derives_total():
+    event = _ConversionHelper.convert_response_usage(
+        RealtimeResponseUsage.model_validate(
+            {
+                "input_tokens": 12,
+                "output_tokens": 3,
+                "input_token_details": {"audio_tokens": 0},
+            }
+        )
+    )
+
+    assert event.usage.total_tokens == 15
+    assert event.input_tokens_details is not None
+    assert event.input_tokens_details.audio_tokens == 0
+    assert event.input_tokens_details.text_tokens is None
+    assert event.input_tokens_details.cached_tokens is None
+    assert event.input_tokens_details.cached_tokens_details is None
+    assert event.output_tokens_details is None
 
 
 def test_convert_user_input_to_conversation_item_dict_and_str():
@@ -126,6 +189,86 @@ def test_tools_to_session_tools_includes_handoffs():
     m = OpenAIRealtimeWebSocketModel()
     out = m._tools_to_session_tools([], [h])
     assert out[0].name is not None and out[0].name.startswith("transfer_to_")
+
+
+def test_tools_to_session_tools_rejects_duplicate_function_tool_names():
+    tool_one = function_tool(lambda: "one", name_override="lookup_account")
+    tool_two = function_tool(lambda: "two", name_override="lookup_account")
+    m = OpenAIRealtimeWebSocketModel()
+
+    with pytest.raises(
+        UserError,
+        match=("Duplicate Realtime tool name found: 'lookup_account' \\(2 function tools\\)"),
+    ):
+        m._tools_to_session_tools([tool_one, tool_two], [])
+
+
+def test_tools_to_session_tools_rejects_function_handoff_name_conflict():
+    tool = function_tool(lambda: "ok", name_override="transfer_to_billing")
+    h = handoff(Agent(name="billing"), tool_name_override="transfer_to_billing")
+    m = OpenAIRealtimeWebSocketModel()
+
+    with pytest.raises(
+        UserError,
+        match=(
+            "Duplicate Realtime tool name found: "
+            "'transfer_to_billing' \\(function tool and handoff\\)"
+        ),
+    ):
+        m._tools_to_session_tools([tool], [h])
+
+
+def test_tools_to_session_tools_ignores_disabled_function_tool_name_conflict():
+    tool = function_tool(
+        lambda: "ok",
+        name_override="transfer_to_billing",
+        is_enabled=False,
+    )
+    h = handoff(Agent(name="billing"), tool_name_override="transfer_to_billing")
+    m = OpenAIRealtimeWebSocketModel()
+
+    out = m._tools_to_session_tools([tool], [h])
+
+    assert [tool.name for tool in out] == ["transfer_to_billing"]
+
+
+def test_tools_to_session_tools_omits_disabled_function_tool():
+    tool = function_tool(
+        lambda: "ok",
+        name_override="hidden_tool",
+        is_enabled=False,
+    )
+    m = OpenAIRealtimeWebSocketModel()
+
+    out = m._tools_to_session_tools([tool], [])
+
+    assert out == []
+
+
+def test_tools_to_session_tools_ignores_disabled_handoff_name_conflict():
+    tool = function_tool(lambda: "ok", name_override="transfer_to_billing")
+    h = handoff(
+        Agent(name="billing"),
+        tool_name_override="transfer_to_billing",
+        is_enabled=False,
+    )
+    m = OpenAIRealtimeWebSocketModel()
+
+    out = m._tools_to_session_tools([tool], [h])
+
+    assert [tool.name for tool in out] == ["transfer_to_billing"]
+
+
+def test_tools_to_session_tools_rejects_duplicate_handoff_names():
+    handoff_one = handoff(Agent(name="billing"), tool_name_override="transfer_to_support")
+    handoff_two = handoff(Agent(name="technical"), tool_name_override="transfer_to_support")
+    m = OpenAIRealtimeWebSocketModel()
+
+    with pytest.raises(
+        UserError,
+        match=("Duplicate Realtime tool name found: 'transfer_to_support' \\(2 handoffs\\)"),
+    ):
+        m._tools_to_session_tools([], [handoff_one, handoff_two])
 
 
 def test_tools_to_session_tools_rejects_namespaced_function_tools():

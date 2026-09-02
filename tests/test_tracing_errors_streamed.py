@@ -10,19 +10,21 @@ from typing_extensions import TypedDict
 
 from agents import (
     Agent,
+    AgentsException,
     GuardrailFunctionOutput,
     InputGuardrail,
     InputGuardrailTripwireTriggered,
     MaxTurnsExceeded,
     OutputGuardrail,
     OutputGuardrailTripwireTriggered,
+    RunConfig,
     RunContextWrapper,
     Runner,
     TResponseInputItem,
     _debug,
 )
+from agents.testing import ScriptedModel
 
-from .fake_model import FakeModel
 from .test_responses import (
     get_final_output_message,
     get_function_tool,
@@ -30,7 +32,9 @@ from .test_responses import (
     get_handoff_tool_call,
     get_text_message,
 )
-from .testing_processor import fetch_normalized_spans
+from .testing_processor import fetch_normalized_spans, fetch_span_errors
+
+SENSITIVE_ERROR_MESSAGE = "sensitive-error-detail"
 
 
 async def wait_for_normalized_spans(timeout: float = 0.2):
@@ -53,8 +57,8 @@ async def wait_for_normalized_spans(timeout: float = 0.2):
 
 @pytest.mark.asyncio
 async def test_single_turn_model_error():
-    model = FakeModel(tracing_enabled=True)
-    model.set_next_output(ValueError("test error"))
+    model = ScriptedModel(emit_traces=True)
+    model.enqueue(ValueError("test error"))
 
     agent = Agent(
         name="test_agent",
@@ -96,8 +100,37 @@ async def test_single_turn_model_error():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(AgentsException(SENSITIVE_ERROR_MESSAGE), id="inner-handler"),
+        pytest.param(ValueError(SENSITIVE_ERROR_MESSAGE), id="outer-handler"),
+    ],
+)
+async def test_streamed_agent_error_redacts_sensitive_data(error: Exception) -> None:
+    model = ScriptedModel(emit_traces=False)
+    model.enqueue(error)
+
+    with pytest.raises(type(error)):
+        result = Runner.run_streamed(
+            Agent(name="test_agent", model=model),
+            input="first_test",
+            run_config=RunConfig(trace_include_sensitive_data=False),
+        )
+        async for _ in result.stream_events():
+            pass
+
+    assert fetch_span_errors("agent") == [
+        {
+            "message": "Error in agent run",
+            "data": {"error": "Error details are redacted."},
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_multi_turn_no_handoffs():
-    model = FakeModel(tracing_enabled=True)
+    model = ScriptedModel(emit_traces=True)
 
     agent = Agent(
         name="test_agent",
@@ -105,7 +138,7 @@ async def test_multi_turn_no_handoffs():
         tools=[get_function_tool("foo", "tool_result")],
     )
 
-    model.add_multiple_turn_outputs(
+    model.extend(
         [
             # First turn: a message and tool call
             [get_text_message("a_message"), get_function_tool_call("foo", json.dumps({"a": "b"}))],
@@ -166,7 +199,7 @@ async def test_tool_call_error(monkeypatch: pytest.MonkeyPatch):
     # which depends on inspecting the chained JSONDecodeError, is preserved.
     monkeypatch.setattr(_debug, "DONT_LOG_TOOL_DATA", False)
 
-    model = FakeModel(tracing_enabled=True)
+    model = ScriptedModel(emit_traces=True)
 
     agent = Agent(
         name="test_agent",
@@ -174,7 +207,7 @@ async def test_tool_call_error(monkeypatch: pytest.MonkeyPatch):
         tools=[get_function_tool("foo", "tool_result")],
     )
 
-    model.add_multiple_turn_outputs(
+    model.extend(
         [
             [get_text_message("a_message"), get_function_tool_call("foo", "bad_json")],
             [get_text_message("done")],
@@ -235,7 +268,7 @@ async def test_tool_call_error(monkeypatch: pytest.MonkeyPatch):
 
 @pytest.mark.asyncio
 async def test_multiple_handoff_doesnt_error():
-    model = FakeModel(tracing_enabled=True)
+    model = ScriptedModel(emit_traces=True)
 
     agent_1 = Agent(
         name="test",
@@ -252,15 +285,15 @@ async def test_multiple_handoff_doesnt_error():
         tools=[get_function_tool("some_function", "result")],
     )
 
-    model.add_multiple_turn_outputs(
+    model.extend(
         [
             # First turn: a tool call
             [get_function_tool_call("some_function", json.dumps({"a": "b"}))],
             # Second turn: a message and 2 handoff
             [
                 get_text_message("a_message"),
-                get_handoff_tool_call(agent_1),
-                get_handoff_tool_call(agent_2),
+                get_handoff_tool_call(agent_1, call_id="handoff_1"),
+                get_handoff_tool_call(agent_2, call_id="handoff_2"),
             ],
             # Third turn: text message
             [get_text_message("done")],
@@ -281,7 +314,7 @@ async def test_multiple_handoff_doesnt_error():
                         "type": "agent",
                         "data": {
                             "name": "test",
-                            "handoffs": ["test", "test"],
+                            "handoffs": ["test"],
                             "tools": ["some_function"],
                             "output_type": "str",
                         },
@@ -323,7 +356,7 @@ class Foo(TypedDict):
 
 @pytest.mark.asyncio
 async def test_multiple_final_output_no_error():
-    model = FakeModel(tracing_enabled=True)
+    model = ScriptedModel(emit_traces=True)
 
     agent_1 = Agent(
         name="test",
@@ -331,7 +364,7 @@ async def test_multiple_final_output_no_error():
         output_type=Foo,
     )
 
-    model.set_next_output(
+    model.enqueue(
         [
             get_final_output_message(json.dumps(Foo(bar="baz"))),
             get_final_output_message(json.dumps(Foo(bar="abc"))),
@@ -363,7 +396,7 @@ async def test_multiple_final_output_no_error():
 
 @pytest.mark.asyncio
 async def test_handoffs_lead_to_correct_agent_spans():
-    model = FakeModel(tracing_enabled=True)
+    model = ScriptedModel(emit_traces=True)
 
     agent_1 = Agent(
         name="test_agent_1",
@@ -385,10 +418,10 @@ async def test_handoffs_lead_to_correct_agent_spans():
 
     agent_1.handoffs.append(agent_3)
 
-    model.add_multiple_turn_outputs(
+    model.extend(
         [
             # First turn: a tool call
-            [get_function_tool_call("some_function", json.dumps({"a": "b"}))],
+            [get_function_tool_call("some_function", json.dumps({"a": "b"}), call_id="tool_1")],
             # Second turn: a message and 2 handoff
             [
                 get_text_message("a_message"),
@@ -396,7 +429,7 @@ async def test_handoffs_lead_to_correct_agent_spans():
                 get_handoff_tool_call(agent_2),
             ],
             # Third turn: tool call
-            [get_function_tool_call("some_function", json.dumps({"a": "b"}))],
+            [get_function_tool_call("some_function", json.dumps({"a": "b"}), call_id="tool_2")],
             # Fourth turn: handoff
             [get_handoff_tool_call(agent_3)],
             # Fifth turn: text message
@@ -488,7 +521,7 @@ async def test_handoffs_lead_to_correct_agent_spans():
 
 @pytest.mark.asyncio
 async def test_max_turns_exceeded():
-    model = FakeModel(tracing_enabled=True)
+    model = ScriptedModel(emit_traces=True)
 
     agent = Agent(
         name="test",
@@ -497,13 +530,13 @@ async def test_max_turns_exceeded():
         tools=[get_function_tool("foo", "result")],
     )
 
-    model.add_multiple_turn_outputs(
+    model.extend(
         [
-            [get_function_tool_call("foo")],
-            [get_function_tool_call("foo")],
-            [get_function_tool_call("foo")],
-            [get_function_tool_call("foo")],
-            [get_function_tool_call("foo")],
+            [get_function_tool_call("foo", call_id="tool_1")],
+            [get_function_tool_call("foo", call_id="tool_2")],
+            [get_function_tool_call("foo", call_id="tool_3")],
+            [get_function_tool_call("foo", call_id="tool_4")],
+            [get_function_tool_call("foo", call_id="tool_5")],
         ]
     )
 
@@ -556,14 +589,14 @@ def input_guardrail_function(
 
 @pytest.mark.asyncio
 async def test_input_guardrail_error():
-    model = FakeModel()
+    model = ScriptedModel()
 
     agent = Agent(
         name="test",
         model=model,
         input_guardrails=[InputGuardrail(guardrail_function=input_guardrail_function)],
     )
-    model.set_next_output([get_text_message("some_message")])
+    model.enqueue([get_text_message("some_message")])
 
     with pytest.raises(InputGuardrailTripwireTriggered):
         result = Runner.run_streamed(agent, input="user_message")
@@ -609,14 +642,14 @@ def output_guardrail_function(
 
 @pytest.mark.asyncio
 async def test_output_guardrail_error():
-    model = FakeModel()
+    model = ScriptedModel()
 
     agent = Agent(
         name="test",
         model=model,
         output_guardrails=[OutputGuardrail(guardrail_function=output_guardrail_function)],
     )
-    model.set_next_output([get_text_message("some_message")])
+    model.enqueue([get_text_message("some_message")])
 
     with pytest.raises(OutputGuardrailTripwireTriggered):
         result = Runner.run_streamed(agent, input="user_message")

@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any, cast
 
-from openai.types.responses.response_usage import InputTokensDetails, OutputTokensDetails
+from openai.types.responses.response_usage import OutputTokensDetails
 
 from ..agent import Agent
 from ..agent_tool_state import set_agent_tool_state_scope
@@ -14,8 +14,9 @@ from ..guardrail import InputGuardrailResult
 from ..items import ModelResponse, RunItem, ToolApprovalItem, TResponseInputItem
 from ..memory import Session
 from ..models.openai_agent_registration import add_openai_harness_id_to_metadata
+from ..models.openai_chatcompletions import OpenAIChatCompletionsModel
 from ..result import RunResult
-from ..run_config import RunConfig
+from ..run_config import ReasoningItemIdPolicy, RunConfig
 from ..run_context import RunContextWrapper, TContext
 from ..run_state import RunState
 from ..tool_guardrails import ToolInputGuardrailResult, ToolOutputGuardrailResult
@@ -24,6 +25,9 @@ from ..tracing.config import TracingConfig
 from ..tracing.traces import TraceState
 from ..usage import (
     Usage,
+    _cache_write_tokens,
+    _cached_tokens,
+    _make_input_tokens_details,
     task_usage_to_span_data,
     total_usage_to_span_metadata,
     turn_usage_to_span_data,
@@ -37,8 +41,9 @@ from .run_steps import (
     NextStepRunAgain,
     ProcessedResponse,
 )
-from .session_persistence import save_result_to_session
+from .session_persistence import save_result_to_session, save_resumed_turn_items
 from .tool_use_tracker import AgentToolUseTracker, serialize_tool_use_tracker
+from .turn_preparation import get_model
 
 __all__ = [
     "apply_resumed_conversation_settings",
@@ -52,10 +57,12 @@ __all__ = [
     "finalize_conversation_tracking",
     "get_unsent_tool_call_ids_for_interrupted_state",
     "input_guardrails_triggered",
+    "validate_output_guardrails_with_server_managed_conversation",
     "validate_session_conversation_settings",
     "resolve_trace_settings",
     "resolve_processed_response",
     "resolve_resumed_context",
+    "save_final_turn_items_after_guardrails",
     "save_turn_items_if_needed",
     "should_cancel_parallel_model_task_on_input_guardrail_trip",
     "update_run_state_for_interruption",
@@ -73,12 +80,9 @@ def snapshot_usage(usage: Usage) -> Usage:
         input_tokens=usage.input_tokens,
         output_tokens=usage.output_tokens,
         total_tokens=usage.total_tokens,
-        input_tokens_details=InputTokensDetails(
-            cached_tokens=(
-                usage.input_tokens_details.cached_tokens
-                if usage.input_tokens_details and usage.input_tokens_details.cached_tokens
-                else 0
-            )
+        input_tokens_details=_make_input_tokens_details(
+            cached_tokens=_cached_tokens(usage.input_tokens_details),
+            cache_write_tokens=_cache_write_tokens(usage.input_tokens_details),
         ),
         output_tokens_details=OutputTokensDetails(
             reasoning_tokens=(
@@ -97,11 +101,15 @@ def usage_delta(start: Usage, end: Usage) -> Usage:
         input_tokens=end.input_tokens - start.input_tokens,
         output_tokens=end.output_tokens - start.output_tokens,
         total_tokens=end.total_tokens - start.total_tokens,
-        input_tokens_details=InputTokensDetails(
+        input_tokens_details=_make_input_tokens_details(
             cached_tokens=(
                 (end.input_tokens_details.cached_tokens or 0)
                 - (start.input_tokens_details.cached_tokens or 0)
-            )
+            ),
+            cache_write_tokens=(
+                _cache_write_tokens(end.input_tokens_details)
+                - _cache_write_tokens(start.input_tokens_details)
+            ),
         ),
         output_tokens_details=OutputTokensDetails(
             reasoning_tokens=(
@@ -122,6 +130,7 @@ def attach_usage_to_span(
         if usage.input_tokens_details and usage.input_tokens_details.cached_tokens
         else 0
     )
+    cache_write_tokens = _cache_write_tokens(usage.input_tokens_details)
     reasoning_tokens = (
         usage.output_tokens_details.reasoning_tokens
         if usage.output_tokens_details and usage.output_tokens_details.reasoning_tokens
@@ -133,6 +142,7 @@ def attach_usage_to_span(
         and usage.output_tokens == 0
         and usage.total_tokens == 0
         and cached_tokens == 0
+        and cache_write_tokens == 0
         and reasoning_tokens == 0
     ):
         return
@@ -195,8 +205,20 @@ def _extract_tool_call_id(raw: Any) -> str | None:
 
 
 def get_unsent_tool_call_ids_for_interrupted_state(run_state: RunState[Any] | None) -> set[str]:
-    """Return tool call IDs whose local outputs belong to the current interruption."""
-    if run_state is None or not isinstance(run_state._current_step, NextStepInterruption):
+    """Return tool call IDs whose local outputs have not reached a server conversation."""
+    if run_state is None:
+        return set()
+
+    if isinstance(run_state._current_step, NextStepRunAgain):
+        if not run_state._model_responses:
+            return set()
+        return {
+            call_id
+            for item in run_state._model_responses[-1].output
+            if (call_id := _extract_tool_call_id(item)) is not None
+        }
+
+    if not isinstance(run_state._current_step, NextStepInterruption):
         return set()
 
     processed_response = run_state._last_processed_response
@@ -238,6 +260,29 @@ def validate_session_conversation_settings(
     )
 
 
+def validate_output_guardrails_with_server_managed_conversation(
+    agent: Agent[Any],
+    run_config: RunConfig,
+    *,
+    conversation_id: str | None,
+    previous_response_id: str | None,
+    auto_previous_response_id: bool,
+) -> None:
+    """Reject an output-guardrail run whose rejected history cannot be locally replaced."""
+    if conversation_id is None and previous_response_id is None and not auto_previous_response_id:
+        return
+    if not agent.output_guardrails and not run_config.output_guardrails:
+        return
+    if isinstance(get_model(agent, run_config), OpenAIChatCompletionsModel):
+        # Chat Completions owns its released warn-and-ignore or strict rejection behavior.
+        return
+    raise UserError(
+        "Output guardrails cannot be combined with conversation_id, previous_response_id, "
+        "or auto_previous_response_id because rejected output cannot be removed from "
+        "server-managed conversation history."
+    )
+
+
 def resolve_trace_settings(
     *,
     run_state: RunState[TContext] | None,
@@ -253,7 +298,7 @@ def resolve_trace_settings(
     metadata: dict[str, Any] | None = run_config.trace_metadata
     tracing: TracingConfig | None = run_config.tracing
 
-    if trace_state:
+    if trace_state is not None:
         if workflow_name == default_workflow_name and trace_state.workflow_name:
             workflow_name = trace_state.workflow_name
         if trace_id is None:
@@ -276,8 +321,28 @@ def resolve_resumed_context(
     run_state: RunState[TContext],
     context: RunContextWrapper[TContext] | TContext | None,
 ) -> RunContextWrapper[TContext]:
-    """Return the context wrapper for a resumed run, overriding when provided."""
+    """Return the context wrapper for a resumed run, overriding when provided.
+
+    When an override is supplied, the restored ``RunContextWrapper`` stays
+    authoritative. Only its application ``context`` value is replaced so
+    run-owned wrapper state (approvals, usage, turn input, tool input, ...)
+    survives the override instead of being dropped by a fresh wrapper.
+    Nested ``Agent.as_tool()`` resumes should pass the parent application
+    context into ``Runner.run`` / ``Runner.run_streamed`` so this same path
+    applies there.
+    """
     if context is not None:
+        existing_context = run_state._context
+        if existing_context is not None:
+            application_context = (
+                context.context if isinstance(context, RunContextWrapper) else context
+            )
+            if existing_context is not context:
+                existing_context.context = application_context
+            set_agent_tool_state_scope(existing_context, run_state._agent_tool_state_scope_id)
+            run_state._context = existing_context
+            return existing_context
+
         context_wrapper = ensure_context_wrapper(context)
         set_agent_tool_state_scope(context_wrapper, run_state._agent_tool_state_scope_id)
         run_state._context = context_wrapper
@@ -340,7 +405,9 @@ def build_resumed_stream_debug_extra(
     """Build the logger extra payload when resuming a streamed run."""
     return {
         "current_turn": run_state._current_turn,
-        "current_agent": run_state._current_agent.name if run_state._current_agent else None,
+        "current_agent": (
+            run_state._current_agent.name if run_state._current_agent is not None else None
+        ),
         "generated_items_count": len(run_state._generated_items),
         "generated_items_types": [item.type for item in run_state._generated_items],
         "generated_items_details": build_generated_items_details(
@@ -467,6 +534,7 @@ async def save_turn_items_if_needed(
     items: list[RunItem],
     response_id: str | None,
     store: bool | None = None,
+    wrapper: RunContextWrapper[Any] | None = None,
 ) -> None:
     """Persist turn items when persistence is enabled and guardrails allow it."""
     if not session_persistence_enabled:
@@ -482,6 +550,47 @@ async def save_turn_items_if_needed(
         run_state,
         response_id=response_id,
         store=store,
+        wrapper=wrapper,
+    )
+
+
+async def save_final_turn_items_after_guardrails(
+    *,
+    session: Session | None,
+    run_state: RunState | None,
+    session_persistence_enabled: bool,
+    input_guardrail_results: list[InputGuardrailResult],
+    items: list[RunItem],
+    response_id: str | None,
+    reasoning_item_id_policy: ReasoningItemIdPolicy | None = None,
+    store: bool | None = None,
+    wrapper: RunContextWrapper[Any] | None = None,
+) -> int:
+    """Persist deferred final-turn items without skipping a partially persisted resumed turn."""
+    if not session_persistence_enabled or not items:
+        return 0
+    if input_guardrails_triggered(input_guardrail_results):
+        return 0
+    if run_state is not None and run_state._current_turn_persisted_item_count > 0:
+        run_state._current_turn_persisted_item_count = await save_resumed_turn_items(
+            session=session,
+            items=items,
+            persisted_count=run_state._current_turn_persisted_item_count,
+            response_id=response_id,
+            reasoning_item_id_policy=run_state._reasoning_item_id_policy,
+            store=store,
+            wrapper=wrapper,
+        )
+        return run_state._current_turn_persisted_item_count
+    return await save_result_to_session(
+        session,
+        [],
+        list(items),
+        run_state,
+        response_id=response_id,
+        reasoning_item_id_policy=reasoning_item_id_policy,
+        store=store,
+        wrapper=wrapper,
     )
 
 

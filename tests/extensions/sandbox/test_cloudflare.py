@@ -19,7 +19,11 @@ from agents.extensions.sandbox.cloudflare import (
     CloudflareSandboxSession,
     CloudflareSandboxSessionState,
 )
-from agents.extensions.sandbox.cloudflare.sandbox import _CloudflarePtyProcessEntry
+from agents.extensions.sandbox.cloudflare.sandbox import (
+    _CloudflarePtyProcessEntry,
+    _SSEDecoder,
+    _SSELineDecoder,
+)
 from agents.sandbox.entries import Dir, GCSMount, R2Mount, S3Mount
 from agents.sandbox.errors import (
     ConfigurationError,
@@ -29,10 +33,12 @@ from agents.sandbox.errors import (
     InvalidManifestPathError,
     MountConfigError,
     PtySessionNotFoundError,
+    SandboxRuntimeError,
     WorkspaceArchiveReadError,
     WorkspaceArchiveWriteError,
     WorkspaceReadNotFoundError,
     WorkspaceStartError,
+    WorkspaceStopError,
     WorkspaceWriteTypeError,
 )
 from agents.sandbox.manifest import Environment, Manifest
@@ -50,6 +56,7 @@ class _FakeResponse:
         self.status = status
         self._json_body = json_body
         self._raw_body = raw_body
+        self.read_calls = 0
 
     async def json(self, *, content_type: str | None = None) -> Any:
         _ = content_type
@@ -58,6 +65,7 @@ class _FakeResponse:
         return json.loads(self._raw_body)
 
     async def read(self) -> bytes:
+        self.read_calls += 1
         if self._json_body is not None:
             return json.dumps(self._json_body).encode()
         return self._raw_body
@@ -70,17 +78,18 @@ class _FakeResponse:
 
 
 class _FakeStreamContent:
-    def __init__(self, data: bytes) -> None:
-        self._data = data
+    def __init__(self, data: bytes | list[bytes]) -> None:
+        self._chunks = [data] if isinstance(data, bytes) else data
 
     async def iter_any(self) -> Any:
-        yield self._data
+        for chunk in self._chunks:
+            yield chunk
 
 
 class _FakeSSEResponse:
-    def __init__(self, status: int, sse_body: bytes) -> None:
+    def __init__(self, status: int, sse_body: bytes, sse_chunks: list[bytes] | None = None) -> None:
         self.status = status
-        self.content = _FakeStreamContent(sse_body)
+        self.content = _FakeStreamContent(sse_body if sse_chunks is None else sse_chunks)
 
     async def json(self, *, content_type: str | None = None) -> Any:
         _ = content_type
@@ -546,12 +555,73 @@ async def test_cloudflare_resume_uses_client_timeouts(monkeypatch: pytest.Monkey
 
     client = CloudflareSandboxClient(exec_timeout_s=11.0, request_timeout_s=77.0)
     state = _make_state()
+    state = cast(
+        CloudflareSandboxSessionState,
+        client.deserialize_session_state(client.serialize_session_state(state)),
+    )
     session = await client.resume(state)
     inner = cast(CloudflareSandboxSession, session._inner)
     assert session.state is state
     # Timeouts come from the client, not from state.
     assert inner._exec_timeout_s == 11.0
     assert inner._request_timeout_s == 77.0
+
+
+@pytest.mark.asyncio
+async def test_cloudflare_protected_mount_state_drops_identity_before_resume() -> None:
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                access_key_id="access-key",
+                secret_access_key="secret-key",
+                mount_strategy=CloudflareBucketMountStrategy(),
+            )
+        }
+    )
+    client = CloudflareSandboxClient()
+    payload = client.serialize_session_state(_make_state(manifest=manifest))
+
+    assert payload["sandbox_id"] == ""
+    assert payload["workspace_root_ready"] is False
+    restored = client.deserialize_session_state(payload)
+    rebound = restored.rebind_persisted_mount_authority(
+        manifest,
+        provider_backend_id="cloudflare",
+    )
+
+    with pytest.raises(MountConfigError, match="sandbox mount configuration is invalid"):
+        await client.resume(rebound)
+
+
+@pytest.mark.asyncio
+async def test_cloudflare_resume_rejects_direct_state_with_configured_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                access_key_id="access-key",
+                secret_access_key="secret-key",
+                mount_strategy=CloudflareBucketMountStrategy(),
+            )
+        }
+    )
+    provider_calls = 0
+
+    async def running(self: CloudflareSandboxSession) -> bool:
+        nonlocal provider_calls
+        _ = self
+        provider_calls += 1
+        return True
+
+    monkeypatch.setattr(CloudflareSandboxSession, "running", running)
+
+    with pytest.raises(MountConfigError, match="sandbox mount configuration is invalid"):
+        await CloudflareSandboxClient().resume(_make_state(manifest=manifest))
+
+    assert provider_calls == 0
 
 
 @pytest.mark.asyncio
@@ -602,6 +672,28 @@ async def test_cloudflare_exec_decodes_sse_output() -> None:
     assert result.stdout == b"hello\n"
     assert result.stderr == b"warn"
     assert result.exit_code == 0
+
+
+@pytest.mark.asyncio
+async def test_cloudflare_exec_handles_utf8_split_across_sse_chunks() -> None:
+    body = 'event: error\ndata: {"error":"失败"}\n\n'.encode()
+    split = body.index("失败".encode()) + 1
+    sess = _make_session(
+        fake_http=_FakeHttp(
+            {
+                "POST /exec": _FakeSSEResponse(
+                    status=200,
+                    sse_body=b"",
+                    sse_chunks=[body[:split], body[split:]],
+                )
+            }
+        )
+    )
+
+    with pytest.raises(ExecTransportError) as exc_info:
+        await sess._exec_internal("echo", "hello", timeout=5.0)
+
+    assert str(exc_info.value.__cause__) == "失败"
 
 
 @pytest.mark.asyncio
@@ -664,6 +756,58 @@ async def test_cloudflare_exec_non_200_includes_provider_error_details() -> None
         str(exc_info.value)
         == "POST /exec failed: HTTP 502: pool_error: pool error: Failed to start container"
     )
+    assert exc_info.value.retryable is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "expected_retryable"),
+    [
+        (400, False),
+        (500, False),
+        (503, True),
+    ],
+)
+async def test_cloudflare_exec_retryability_follows_documented_status_semantics(
+    status: int,
+    expected_retryable: bool,
+) -> None:
+    sess = _make_session(
+        fake_http=_FakeHttp(
+            {
+                "POST /exec": _FakeResponse(
+                    status=status,
+                    json_body={
+                        "error": "cloudflare sandbox error",
+                        "code": "cloudflare_error",
+                    },
+                )
+            }
+        )
+    )
+
+    with pytest.raises(ExecTransportError) as exc_info:
+        await sess._exec_internal("mkdir", "-p", "--", "/workspace", timeout=5.0)
+
+    assert exc_info.value.context["backend"] == "cloudflare"
+    assert exc_info.value.context["http_status"] == status
+    assert exc_info.value.context["provider_error"] == "cloudflare_error: cloudflare sandbox error"
+    assert exc_info.value.retryable is expected_retryable
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_retryable"),
+    [
+        (400, False),
+        (500, False),
+        (503, True),
+        (418, None),
+    ],
+)
+def test_cloudflare_retryability_status_table(status: int, expected_retryable: bool | None) -> None:
+    from agents.extensions.sandbox.cloudflare import sandbox as mod
+
+    assert mod._cloudflare_retryability_for_status(status) is expected_retryable
 
 
 @pytest.mark.asyncio
@@ -966,6 +1110,48 @@ async def test_cloudflare_persist_and_hydrate_use_http_endpoints() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cloudflare_persist_retries_only_documented_503_status() -> None:
+    fake_http = _FakeHttp(
+        {
+            "POST /persist": _FakeResponse(
+                status=503,
+                json_body={"error": "container starting"},
+            )
+        }
+    )
+    sess = _make_session(fake_http=fake_http)
+
+    with pytest.raises(WorkspaceArchiveReadError) as exc_info:
+        await sess.persist_workspace()
+
+    persist_calls = [c for c in fake_http.calls if c["method"] == "POST" and "/persist" in c["url"]]
+    assert len(persist_calls) == 3
+    assert exc_info.value.context["http_status"] == 503
+    assert exc_info.value.retryable is True
+
+
+@pytest.mark.asyncio
+async def test_cloudflare_persist_does_not_retry_documented_fail_fast_500() -> None:
+    fake_http = _FakeHttp(
+        {
+            "POST /persist": _FakeResponse(
+                status=500,
+                json_body={"error": "configuration error"},
+            )
+        }
+    )
+    sess = _make_session(fake_http=fake_http)
+
+    with pytest.raises(WorkspaceArchiveReadError) as exc_info:
+        await sess.persist_workspace()
+
+    persist_calls = [c for c in fake_http.calls if c["method"] == "POST" and "/persist" in c["url"]]
+    assert len(persist_calls) == 1
+    assert exc_info.value.context["http_status"] == 500
+    assert exc_info.value.retryable is False
+
+
+@pytest.mark.asyncio
 async def test_cloudflare_persist_unmounts_and_remounts_ephemeral_bucket_mounts() -> None:
     fake_http = _FakeHttp(
         {
@@ -1095,6 +1281,62 @@ async def test_cloudflare_resume_start_skips_hydrate_when_shared_resume_gate_mat
 
 
 @pytest.mark.asyncio
+async def test_cloudflare_resume_start_settles_skipped_hydrate_reapply_cancellation() -> None:
+    mount_started = asyncio.Event()
+    release_mount = asyncio.Event()
+
+    class _BlockingMountResponse(_FakeResponse):
+        async def __aenter__(self) -> _FakeResponse:
+            mount_started.set()
+            await release_mount.wait()
+            return self
+
+    fake_http = _FakeHttp(
+        {
+            "GET /running": _FakeResponse(status=200, json_body={"running": True}),
+            "POST /mount": _BlockingMountResponse(status=200, json_body={"ok": True}),
+        }
+    )
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                mount_strategy=CloudflareBucketMountStrategy(),
+            )
+        }
+    )
+    sess = _make_session(state=_make_state(manifest=manifest), fake_http=fake_http)
+    sess.state.snapshot = _RestorableSnapshot(id="snapshot")
+    sess.state.workspace_root_ready = True
+    sess._start_workspace_root_ready = True  # noqa: SLF001
+    sess._set_start_state_preserved(True)  # noqa: SLF001
+
+    async def _exec_internal(*command: str | Path, timeout: float | None = None) -> ExecResult:
+        _ = (command, timeout)
+        return ExecResult(stdout=b"", stderr=b"", exit_code=0)
+
+    async def _gate(*, is_running: bool) -> bool:
+        assert is_running is True
+        return True
+
+    sess._exec_internal = _exec_internal  # type: ignore[method-assign]
+    sess._can_skip_snapshot_restore_on_resume = _gate  # type: ignore[method-assign]
+    task = asyncio.create_task(sess.start())
+    await mount_started.wait()
+    task.cancel()
+    release_mount.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert [call["url"].split("/")[-1] for call in fake_http.calls] == [
+        "running",
+        "mount",
+    ]
+    assert cast(Any, sess._session()) is fake_http
+
+
+@pytest.mark.asyncio
 async def test_cloudflare_resume_start_unmounts_before_hydrate_when_sandbox_is_running() -> None:
     fake_http = _FakeHttp(
         {
@@ -1132,6 +1374,274 @@ async def test_cloudflare_resume_start_unmounts_before_hydrate_when_sandbox_is_r
         "hydrate",
         "mount",
     ]
+
+
+@pytest.mark.asyncio
+async def test_cloudflare_resume_start_restores_mount_after_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_http = _FakeHttp(
+        {
+            "GET /running": _FakeResponse(status=200, json_body={"running": True}),
+            "POST /unmount": _FakeResponse(status=200, json_body={"ok": True}),
+            "POST /mount": _FakeResponse(status=200, json_body={"ok": True}),
+        }
+    )
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                prefix="nested/prefix/",
+                mount_strategy=CloudflareBucketMountStrategy(),
+            )
+        }
+    )
+    sess = _make_session(state=_make_state(manifest=manifest), fake_http=fake_http)
+    sess.state.snapshot = _RestorableSnapshot(id="snapshot")
+    sess.state.workspace_root_ready = True
+    sess._start_workspace_root_ready = True  # noqa: SLF001
+    sess._set_start_state_preserved(True)  # noqa: SLF001
+    restore_started = asyncio.Event()
+    release_restore = asyncio.Event()
+
+    async def blocking_restore(
+        self: _RestorableSnapshot,
+        *,
+        dependencies: Dependencies | None = None,
+    ) -> io.IOBase:
+        _ = (self, dependencies)
+        restore_started.set()
+        await release_restore.wait()
+        return io.BytesIO(self.payload)
+
+    async def _exec_internal(*command: str | Path, timeout: float | None = None) -> ExecResult:
+        _ = (command, timeout)
+        return ExecResult(stdout=b"", stderr=b"", exit_code=0)
+
+    monkeypatch.setattr(_RestorableSnapshot, "restore", blocking_restore)
+    sess._exec_internal = _exec_internal  # type: ignore[method-assign]
+    task = asyncio.create_task(sess.start())
+    await restore_started.wait()
+    task.cancel()
+    release_restore.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert [call["url"].split("/")[-1] for call in fake_http.calls] == [
+        "running",
+        "unmount",
+        "hydrate",
+        "mount",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cloudflare_resume_start_settles_reapply_after_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mount_started = asyncio.Event()
+    release_mount = asyncio.Event()
+
+    class _BlockingMountResponse(_FakeResponse):
+        async def __aenter__(self) -> _FakeResponse:
+            mount_started.set()
+            await release_mount.wait()
+            return self
+
+    fake_http = _FakeHttp(
+        {
+            "GET /running": _FakeResponse(status=200, json_body={"running": True}),
+            "POST /unmount": _FakeResponse(status=200, json_body={"ok": True}),
+            "POST /hydrate": _FakeResponse(status=200, json_body={"ok": True}),
+        }
+    )
+    original_post = fake_http.post
+    mount_responses = [_BlockingMountResponse(status=200, json_body={"ok": True})]
+
+    def sequenced_post(url: str, **kwargs: Any) -> _FakeResponse | _FakeSSEResponse:
+        if "/mount" not in url:
+            return original_post(url, **kwargs)
+        fake_http.calls.append({"method": "POST", "url": url, **kwargs})
+        return mount_responses.pop(0)
+
+    monkeypatch.setattr(fake_http, "post", sequenced_post)
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                mount_strategy=CloudflareBucketMountStrategy(),
+            )
+        }
+    )
+    sess = _make_session(state=_make_state(manifest=manifest), fake_http=fake_http)
+    sess.state.snapshot = _RestorableSnapshot(id="snapshot")
+    sess.state.workspace_root_ready = True
+    sess._start_workspace_root_ready = True  # noqa: SLF001
+    sess._set_start_state_preserved(True)  # noqa: SLF001
+
+    async def _exec_internal(*command: str | Path, timeout: float | None = None) -> ExecResult:
+        _ = (command, timeout)
+        return ExecResult(stdout=b"", stderr=b"", exit_code=0)
+
+    sess._exec_internal = _exec_internal  # type: ignore[method-assign]
+    task = asyncio.create_task(sess.start())
+    await mount_started.wait()
+    task.cancel()
+    release_mount.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert [(call["method"], call["url"].split("/")[-1]) for call in fake_http.calls] == [
+        ("GET", "running"),
+        ("POST", "unmount"),
+        ("POST", "hydrate"),
+        ("POST", "mount"),
+    ]
+    assert cast(Any, sess._session()) is fake_http
+
+
+@pytest.mark.asyncio
+async def test_cloudflare_resume_start_does_not_restore_after_terminal_reapply_failure() -> None:
+    fake_http = _FakeHttp(
+        {
+            "GET /running": _FakeResponse(status=200, json_body={"running": True}),
+            "POST /unmount": _FakeResponse(status=200, json_body={"ok": True}),
+            "POST /hydrate": _FakeResponse(status=200, json_body={"ok": True}),
+            "POST /mount": _FakeResponse(status=502, json_body={"error": "mount failed"}),
+            "DELETE /v1/sandbox/": _FakeResponse(status=200, json_body={"ok": True}),
+        }
+    )
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                mount_strategy=CloudflareBucketMountStrategy(),
+            )
+        }
+    )
+    sess = _make_session(state=_make_state(manifest=manifest), fake_http=fake_http)
+    sess.state.snapshot = _RestorableSnapshot(id="snapshot")
+    sess.state.workspace_root_ready = True
+    sess._start_workspace_root_ready = True  # noqa: SLF001
+    sess._set_start_state_preserved(True)  # noqa: SLF001
+
+    async def _exec_internal(*command: str | Path, timeout: float | None = None) -> ExecResult:
+        _ = (command, timeout)
+        return ExecResult(stdout=b"", stderr=b"", exit_code=0)
+
+    sess._exec_internal = _exec_internal  # type: ignore[method-assign]
+
+    with pytest.raises(MountConfigError, match="cloudflare bucket mount failed"):
+        await sess.start()
+
+    assert [(call["method"], call["url"].split("/")[-1]) for call in fake_http.calls] == [
+        ("GET", "running"),
+        ("POST", "unmount"),
+        ("POST", "hydrate"),
+        ("POST", "mount"),
+        ("DELETE", "abc123"),
+    ]
+    assert fake_http.closed is True
+    with pytest.raises(SandboxRuntimeError, match="ambiguous mount transition"):
+        sess._session()
+
+
+@pytest.mark.asyncio
+async def test_cloudflare_resume_reapply_surfaces_terminal_delete_failure() -> None:
+    delete_response = _FakeResponse(status=502, raw_body=b"provider response must not be read")
+    fake_http = _FakeHttp(
+        {
+            "POST /mount": _FakeResponse(status=502, json_body={"error": "mount failed"}),
+            "DELETE /v1/sandbox/": delete_response,
+        }
+    )
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                mount_strategy=CloudflareBucketMountStrategy(),
+            )
+        }
+    )
+    sess = _make_session(state=_make_state(manifest=manifest), fake_http=fake_http)
+
+    async def _exec_internal(*command: str | Path, timeout: float | None = None) -> ExecResult:
+        _ = (command, timeout)
+        return ExecResult(stdout=b"", stderr=b"", exit_code=0)
+
+    sess._exec_internal = _exec_internal  # type: ignore[method-assign]
+
+    with pytest.raises(WorkspaceStopError) as exc_info:
+        await sess._reapply_ephemeral_manifest_on_resume()
+
+    assert exc_info.value.context["backend"] == "cloudflare"
+    assert exc_info.value.context["reason"] == "terminal_delete_failed"
+    assert exc_info.value.context["http_status"] == 502
+    assert [(call["method"], call["url"].split("/")[-1]) for call in fake_http.calls] == [
+        ("POST", "mount"),
+        ("DELETE", "abc123"),
+    ]
+    assert delete_response.read_calls == 0
+    assert fake_http.closed is True
+    with pytest.raises(SandboxRuntimeError, match="ambiguous mount transition"):
+        sess._session()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "expected_type"),
+    [
+        ("persist", WorkspaceArchiveReadError),
+        ("hydrate", WorkspaceArchiveWriteError),
+    ],
+)
+async def test_cloudflare_direct_persistence_redacts_protected_remount_failure(
+    operation: str,
+    expected_type: type[WorkspaceArchiveReadError | WorkspaceArchiveWriteError],
+) -> None:
+    sentinel = "cloudflare-direct-persistence-secret"
+    fake_http = _FakeHttp(
+        {
+            "POST /unmount": _FakeResponse(status=200, json_body={"ok": True}),
+            "POST /persist": _FakeResponse(status=200, raw_body=b"fake-tar"),
+            "POST /hydrate": _FakeResponse(status=200, json_body={"ok": True}),
+            "POST /mount": _FakeResponse(
+                status=500,
+                json_body={"error": f"provider echoed {sentinel}"},
+            ),
+        }
+    )
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                access_key_id="access-key",
+                secret_access_key=sentinel,
+                mount_strategy=CloudflareBucketMountStrategy(),
+            )
+        }
+    )
+    sess = _make_session(state=_make_state(manifest=manifest), fake_http=fake_http)
+
+    with pytest.raises(expected_type, match="protected mount configuration") as exc_info:
+        if operation == "persist":
+            await sess.persist_workspace()
+        else:
+            await sess.hydrate_workspace(io.BytesIO(_valid_tar_bytes()))
+
+    assert sentinel not in str(exc_info.value)
+    assert sentinel not in repr(exc_info.value)
+    assert exc_info.value.context == {}
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    traceback = exc_info.value.__traceback__
+    while traceback is not None:
+        module_name = traceback.tb_frame.f_globals.get("__name__", "")
+        if isinstance(module_name, str) and module_name.startswith("agents."):
+            assert sentinel not in repr(traceback.tb_frame.f_locals)
+        traceback = traceback.tb_next
 
 
 @pytest.mark.asyncio
@@ -1441,31 +1951,241 @@ async def test_cloudflare_shutdown_logs_on_failure(caplog: pytest.LogCaptureFixt
 
 
 @pytest.mark.asyncio
-async def test_cloudflare_shutdown_logs_delete_response_details(
+@pytest.mark.parametrize("redacted", [True, False])
+async def test_cloudflare_shutdown_logs_respect_tool_data_policy(
+    monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    redacted: bool,
 ) -> None:
-    """Verify that DELETE response bodies are kept when shutdown cleanup fails."""
+    """Verify that DELETE response bodies follow the tool-data logging policy."""
     import logging
 
+    monkeypatch.setattr("agents._debug.DONT_LOG_TOOL_DATA", redacted)
+
+    response = _FakeResponse(
+        status=502,
+        json_body={
+            "error": "pool error: Failed to start container",
+            "code": "pool_error",
+        },
+    )
+    sess = _make_session(fake_http=_FakeHttp({"DELETE /v1/sandbox/": response}))
+
+    with caplog.at_level(logging.DEBUG, logger="agents.extensions.sandbox.cloudflare.sandbox"):
+        await sess._shutdown_backend()
+
+    has_detail = any(
+        "DELETE /sandbox failed: HTTP 502: pool_error: pool error: Failed to start container"
+        in r.message
+        for r in caplog.records
+    )
+    assert has_detail is not redacted
+    assert response.read_calls == (0 if redacted else 1)
+
+
+@pytest.mark.asyncio
+async def test_cloudflare_shutdown_does_not_log_protected_mount_authority(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verify that protected mount authority disables DELETE response detail logging."""
+    import logging
+
+    sentinel = "cloudflare-secret-access-key"
+    monkeypatch.setattr("agents._debug.DONT_LOG_TOOL_DATA", False)
+    response = _FakeResponse(status=502, raw_body=f"provider echoed {sentinel}".encode())
+    manifest = Manifest(
+        entries={
+            "remote": R2Mount(
+                bucket="bucket",
+                account_id="account-id",
+                access_key_id="access-key",
+                secret_access_key=sentinel,
+                mount_strategy=CloudflareBucketMountStrategy(),
+            )
+        }
+    )
     sess = _make_session(
-        fake_http=_FakeHttp(
-            {
-                "DELETE /v1/sandbox/": _FakeResponse(
-                    status=502,
-                    json_body={
-                        "error": "pool error: Failed to start container",
-                        "code": "pool_error",
-                    },
-                )
-            }
-        )
+        state=_make_state(manifest=manifest),
+        fake_http=_FakeHttp({"DELETE /v1/sandbox/": response}),
     )
 
     with caplog.at_level(logging.DEBUG, logger="agents.extensions.sandbox.cloudflare.sandbox"):
         await sess._shutdown_backend()
 
-    assert any(
-        "DELETE /sandbox failed: HTTP 502: pool_error: pool error: Failed to start container"
-        in r.message
-        for r in caplog.records
+    assert sentinel not in caplog.text
+    assert response.read_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_cloudflare_shutdown_does_not_log_protected_mount_exception(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verify that protected mount authority disables DELETE exception detail logging."""
+    import logging
+
+    sentinel = "cloudflare-secret-access-key"
+    monkeypatch.setattr("agents._debug.DONT_LOG_TOOL_DATA", False)
+
+    class _FailingDeleteHttp(_FakeHttp):
+        def delete(self, url: str, **kwargs: Any) -> Any:
+            raise aiohttp.ClientError(f"provider echoed {sentinel}")
+
+    manifest = Manifest(
+        entries={
+            "remote": R2Mount(
+                bucket="bucket",
+                account_id="account-id",
+                access_key_id="access-key",
+                secret_access_key=sentinel,
+                mount_strategy=CloudflareBucketMountStrategy(),
+            )
+        }
     )
+    sess = _make_session(state=_make_state(manifest=manifest), fake_http=_FailingDeleteHttp())
+
+    with caplog.at_level(logging.DEBUG, logger="agents.extensions.sandbox.cloudflare.sandbox"):
+        await sess._shutdown_backend()
+
+    assert sentinel not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_cloudflare_ambiguous_mount_terminal_delete_failure_is_observable() -> None:
+    response = _FakeResponse(status=502, raw_body=b"provider response must not be read")
+    sess = _make_session(fake_http=_FakeHttp({"DELETE /v1/sandbox/": response}))
+
+    with pytest.raises(WorkspaceStopError) as exc_info:
+        await sess._terminate_ambiguous_mount_transition()
+
+    assert exc_info.value.context["backend"] == "cloudflare"
+    assert exc_info.value.context["reason"] == "terminal_delete_failed"
+    assert exc_info.value.context["http_status"] == 502
+    assert response.read_calls == 0
+    with pytest.raises(SandboxRuntimeError, match="ambiguous mount transition"):
+        sess._session()
+
+
+@pytest.mark.asyncio
+async def test_cloudflare_ambiguous_mount_terminalizes_before_cleanup_failure() -> None:
+    fake_http = _FakeHttp(
+        {"DELETE /v1/sandbox/": _FakeResponse(status=200, json_body={"ok": True})}
+    )
+    sess = _make_session(fake_http=fake_http)
+
+    async def fail_before_shutdown() -> None:
+        raise asyncio.CancelledError()
+
+    sess._before_shutdown = fail_before_shutdown  # type: ignore[method-assign]
+
+    with pytest.raises(asyncio.CancelledError):
+        await sess._terminate_ambiguous_mount_transition()
+
+    assert [call["method"] for call in fake_http.calls] == ["DELETE"]
+    assert fake_http.closed is True
+    with pytest.raises(SandboxRuntimeError, match="ambiguous mount transition"):
+        sess._session()
+
+
+def _decode_in_chunks(stream: str, size: int) -> list[str]:
+    decoder = _SSELineDecoder()
+    lines: list[str] = []
+    for index in range(0, len(stream), size):
+        lines.extend(decoder.decode(stream[index : index + size]))
+    lines.extend(decoder.flush())
+    return lines
+
+
+def _events(lines: list[str]) -> list[tuple[str, str]]:
+    decoder = _SSEDecoder()
+    collected: list[tuple[str, str]] = []
+    for line in lines:
+        event = decoder.decode(line)
+        if event is not None:
+            collected.append((event.event, event.data))
+    return collected
+
+
+@pytest.mark.parametrize(
+    "stream",
+    [
+        "data: a\ndata: b\n\n",
+        "data: a\r\ndata: b\r\n\r\n",
+        "data: a\rdata: b\r\r",
+        "data: a\r\ndata: b\n\r\n",
+        "data:\r\n\r\n",
+        "data: a\r",
+        "\r\n",
+    ],
+    ids=["lf", "crlf", "cr", "mixed", "empty_data", "trailing_cr", "bare_crlf"],
+)
+def test_sse_line_decoder_matches_splitlines_for_every_chunk_boundary(stream: str) -> None:
+    """Line splitting must not depend on how the transport chunks the stream.
+
+    A chunk that ends on a CR cannot be classified yet: the next chunk may start with LF,
+    and CRLF is a single terminator. Emitting the line early left that LF to be read as a
+    blank line, and a blank line dispatches an SSE event.
+    """
+    expected = stream.splitlines()
+    for size in range(1, len(stream) + 1):
+        assert _decode_in_chunks(stream, size) == expected, f"chunk size {size}"
+
+
+def test_sse_event_is_not_split_when_crlf_straddles_a_chunk_boundary() -> None:
+    """One multi-line event must stay one event regardless of chunking."""
+    stream = "data: a\r\ndata: b\r\n\r\n"
+
+    whole = _events(_decode_in_chunks(stream, len(stream)))
+    assert whole == [("message", "a\nb")]
+
+    for size in range(1, len(stream) + 1):
+        assert _events(_decode_in_chunks(stream, size)) == whole, f"chunk size {size}"
+
+
+def test_sse_line_decoder_delivers_a_cr_terminated_line_immediately() -> None:
+    """A CR is a complete line ending, so the line must not wait for the next chunk.
+
+    Holding it back to learn whether a LF follows would delay every CR-terminated line
+    until more bytes arrive or the stream ends.
+    """
+    decoder = _SSELineDecoder()
+
+    assert decoder.decode("data: a\r") == ["data: a"]
+    # The LF is the second half of that CRLF, not a blank line, so it yields nothing.
+    assert decoder.decode("\n") == []
+    assert decoder.flush() == []
+
+
+def test_sse_line_decoder_handles_utf8_split_across_byte_chunks() -> None:
+    decoder = _SSELineDecoder()
+    stream = "data: 失败\n\n".encode()
+    split = stream.index("失败".encode()) + 1
+
+    assert decoder.decode(stream[:split]) == []
+    assert decoder.decode(stream[split:]) == ["data: 失败", ""]
+    assert decoder.flush() == []
+
+
+def test_sse_line_decoder_dispatches_a_cr_only_blank_line_without_more_input() -> None:
+    """A CR-only blank line must dispatch its event without another chunk or EOF."""
+    decoder = _SSELineDecoder()
+    sse = _SSEDecoder()
+
+    lines = decoder.decode("data: a\r\r")
+
+    assert lines == ["data: a", ""]
+    events = [event for event in (sse.decode(line) for line in lines) if event is not None]
+    assert [(event.event, event.data) for event in events] == [("message", "a")]
+
+
+def test_sse_line_decoder_flush_emits_only_an_unterminated_line() -> None:
+    """A stream ending on a lone CR already delivered its line, so flush adds nothing."""
+    decoder = _SSELineDecoder()
+
+    assert decoder.decode("data: a\r") == ["data: a"]
+    assert decoder.flush() == []
+
+    partial = _SSELineDecoder()
+    assert partial.decode("data: b") == []
+    assert partial.flush() == ["data: b"]

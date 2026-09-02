@@ -5,13 +5,18 @@ for synthetic run items or IDs used during tool execution. Internal use only.
 
 from __future__ import annotations
 
+import hashlib
 import json
+from collections import deque
 from collections.abc import Sequence
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal, cast
+from uuid import uuid4
 
 from openai.types.responses import ResponseFunctionToolCall
 from pydantic import BaseModel
 
+from .._tool_identity import get_hosted_mcp_approval_request_identity
 from ..agent_tool_state import drop_agent_tool_run_result
 from ..items import ItemHelpers, RunItem, ToolCallOutputItem, TResponseInputItem
 from ..models.fake_id import FAKE_RESPONSES_ID
@@ -20,7 +25,9 @@ from ..tool import DEFAULT_APPROVAL_REJECTION_MESSAGE
 REJECTION_MESSAGE = DEFAULT_APPROVAL_REJECTION_MESSAGE
 TOOL_CALL_SESSION_DESCRIPTION_KEY = "_agents_tool_description"
 TOOL_CALL_SESSION_TITLE_KEY = "_agents_tool_title"
+_NESTED_HISTORY_RUN_ITEM_OCCURRENCE_KEY = "_agents_nested_history_occurrence_key"
 _TOOL_CALL_TO_OUTPUT_TYPE: dict[str, str] = {
+    "program": "program_output",
     "function_call": "function_call_output",
     "custom_tool_call": "custom_tool_call_output",
     "shell_call": "shell_call_output",
@@ -29,12 +36,32 @@ _TOOL_CALL_TO_OUTPUT_TYPE: dict[str, str] = {
     "local_shell_call": "local_shell_call_output",
     "tool_search_call": "tool_search_output",
 }
+# These items must retain their original position relative to required follower items.
+_DEDUPE_EARLIEST_ANCHOR_ITEM_TYPES = frozenset(
+    {*_TOOL_CALL_TO_OUTPUT_TYPE, "mcp_approval_request", "reasoning"}
+)
+_PROGRAM_OWNED_HOSTED_ITEM_TYPES = frozenset(
+    {
+        "hosted_tool_call",
+        "file_search_call",
+        "web_search_call",
+        "code_interpreter_call",
+        "image_generation_call",
+        "mcp_list_tools",
+        "mcp_call",
+        "mcp_approval_request",
+        "mcp_approval_response",
+    }
+)
 
 __all__ = [
+    "NestedHistoryOwnedItemRef",
+    "NestedHistoryOwnedItem",
     "ReasoningItemIdPolicy",
     "REJECTION_MESSAGE",
     "TOOL_CALL_SESSION_DESCRIPTION_KEY",
     "TOOL_CALL_SESSION_TITLE_KEY",
+    "apply_reasoning_item_id_policy",
     "copy_input_items",
     "drop_orphan_function_calls",
     "ensure_input_item_format",
@@ -44,15 +71,61 @@ __all__ = [
     "normalize_input_items_for_api",
     "normalize_resumed_input",
     "fingerprint_input_item",
+    "digest_input_item",
+    "ensure_nested_history_run_item_occurrence_key",
+    "nested_history_run_item_occurrence_key",
+    "reconcile_nested_history_owned_input_after_rewrite",
+    "filter_nested_history_owned_item_refs_for_input",
+    "rebase_nested_history_owned_item_refs",
+    "resolve_nested_history_owned_item_indexes",
     "deduplicate_input_items",
     "deduplicate_input_items_preferring_latest",
     "strip_internal_input_item_metadata",
+    "function_tool_error_output",
     "function_rejection_item",
     "shell_rejection_item",
     "apply_patch_rejection_item",
     "extract_mcp_request_id",
     "extract_mcp_request_id_from_run",
 ]
+
+
+@dataclass(frozen=True)
+class NestedHistoryOwnedItem:
+    """A run item and the exact nested-input occurrence that represents it."""
+
+    run_item: RunItem | None
+    input_index: int
+    digest: str
+    input_item: TResponseInputItem | None = field(default=None, compare=False, repr=False)
+
+
+@dataclass(frozen=True)
+class NestedHistoryOwnedItemRef:
+    """Durable coordinates plus the live object for one owned session occurrence."""
+
+    session_index: int
+    digest: str
+    input_index: int
+    run_item: RunItem | None = field(default=None, compare=False, repr=False)
+    input_item: TResponseInputItem | None = field(default=None, compare=False, repr=False)
+
+
+def nested_history_run_item_occurrence_key(run_item: RunItem | None) -> str | None:
+    """Return the private copy-lineage key for a run item, when one exists."""
+    if run_item is None:
+        return None
+    key = getattr(run_item, _NESTED_HISTORY_RUN_ITEM_OCCURRENCE_KEY, None)
+    return key if isinstance(key, str) and key else None
+
+
+def ensure_nested_history_run_item_occurrence_key(run_item: RunItem) -> str:
+    """Bind an ephemeral key that survives object copies but never enters model payloads."""
+    key = nested_history_run_item_occurrence_key(run_item)
+    if key is None:
+        key = uuid4().hex
+        setattr(run_item, _NESTED_HISTORY_RUN_ITEM_OCCURRENCE_KEY, key)
+    return key
 
 
 ReasoningItemIdPolicy = Literal["preserve", "omit"]
@@ -99,57 +172,109 @@ def drop_orphan_function_calls(
     items: list[TResponseInputItem],
     *,
     pruning_indexes: set[int] | None = None,
+    output_pruning_indexes: set[int] | None = None,
 ) -> list[TResponseInputItem]:
     """
-    Remove tool call items that do not have corresponding outputs so resumptions or retries do not
-    replay stale tool calls. Reasoning items that immediately precede a tool call dropped by this
-    pass are also removed, since the Responses API rejects reasoning items that are not followed
-    by their associated model-emitted item (``Item 'rs_...' of type 'reasoning' was provided
-    without its required following item``).
+    Remove tool and program call items that do not have corresponding outputs so resumptions or
+    retries do not replay stale calls. When ``output_pruning_indexes`` identifies unambiguous
+    stored history, also remove tool outputs whose corresponding calls are no longer present after
+    history pruning. Program-owned items are removed with an orphan program, while programs with
+    retained hosted calls or tool outputs remain available for continuation. Reasoning items that
+    immediately precede a call dropped by this pass are also removed, since the Responses API
+    rejects reasoning items that are not followed by their associated model-emitted item (``Item
+    'rs_...' of type 'reasoning' was provided without its required following item``).
     """
 
     completed_call_ids = _completed_call_ids_by_type(items)
     matched_anonymous_tool_search_calls = _matched_anonymous_tool_search_call_indexes(items)
+    active_program_call_ids: set[str] = set()
+    orphan_program_call_ids: set[str] = set()
+
+    for index, entry in enumerate(items):
+        if pruning_indexes is not None and index not in pruning_indexes:
+            continue
+        if not isinstance(entry, dict) or entry.get("type") != "program":
+            continue
+        call_id = entry.get("call_id")
+        if not isinstance(call_id, str):
+            continue
+        if call_id in completed_call_ids["program_output"]:
+            continue
+        if any(
+            _get_program_caller_id(candidate) == call_id
+            and _is_retained_program_owned_item(candidate, candidate_index, pruning_indexes)
+            for candidate_index, candidate in enumerate(items)
+        ):
+            active_program_call_ids.add(call_id)
+        else:
+            orphan_program_call_ids.add(call_id)
 
     dropped_indexes: set[int] = set()
-    filtered: list[TResponseInputItem] = []
+    reasoning_trigger_indexes: set[int] = set()
     for index, entry in enumerate(items):
         if not isinstance(entry, dict):
-            filtered.append(entry)
             continue
         entry_type = entry.get("type")
         if not isinstance(entry_type, str):
-            filtered.append(entry)
-            continue
-        output_type = _TOOL_CALL_TO_OUTPUT_TYPE.get(entry_type)
-        if output_type is None:
-            filtered.append(entry)
             continue
         if pruning_indexes is not None and index not in pruning_indexes:
-            filtered.append(entry)
+            continue
+        program_caller_id = _get_program_caller_id(entry)
+        if program_caller_id is not None and program_caller_id in orphan_program_call_ids:
+            dropped_indexes.add(index)
+            reasoning_trigger_indexes.add(index)
             continue
         call_id = entry.get("call_id")
+        output_type = _TOOL_CALL_TO_OUTPUT_TYPE.get(entry_type)
+        if output_type is None:
+            continue
+        if program_caller_id is not None and _is_pending_hosted_shell_call(entry):
+            continue
+        if entry_type == "program" and call_id in active_program_call_ids:
+            continue
         if isinstance(call_id, str) and call_id in completed_call_ids.get(output_type, set()):
-            filtered.append(entry)
             continue
         if (
             entry_type == "tool_search_call"
             and not isinstance(call_id, str)
             and index in matched_anonymous_tool_search_calls
         ):
-            filtered.append(entry)
             continue
         # Tool call entry will be dropped; record so we can also drop preceding reasoning items.
         dropped_indexes.add(index)
+        reasoning_trigger_indexes.add(index)
+
+    available_call_ids = _available_call_ids_by_output_type(
+        items,
+        excluded_indexes=dropped_indexes,
+    )
+    if output_pruning_indexes is not None:
+        for index in output_pruning_indexes:
+            if index in dropped_indexes or index < 0 or index >= len(items):
+                continue
+            entry = items[index]
+            if not isinstance(entry, dict):
+                continue
+            entry_type = entry.get("type")
+            if not isinstance(entry_type, str) or entry_type not in available_call_ids:
+                continue
+            call_id = entry.get("call_id")
+            if isinstance(call_id, str) and call_id not in available_call_ids[entry_type]:
+                dropped_indexes.add(index)
 
     if not dropped_indexes:
-        return filtered
-    return _drop_reasoning_items_preceding_dropped_calls(items, dropped_indexes)
+        return list(items)
+    return _drop_reasoning_items_preceding_dropped_calls(
+        items,
+        dropped_indexes,
+        reasoning_trigger_indexes,
+    )
 
 
 def _drop_reasoning_items_preceding_dropped_calls(
     items: list[TResponseInputItem],
     dropped_indexes: set[int],
+    reasoning_trigger_indexes: set[int],
 ) -> list[TResponseInputItem]:
     """Drop reasoning items whose tied tool call was just dropped as orphan.
 
@@ -172,7 +297,7 @@ def _drop_reasoning_items_preceding_dropped_calls(
             next_entry = items[next_index]
             if isinstance(next_entry, dict) and next_entry.get("type") == "reasoning":
                 continue
-            if next_index in dropped_indexes:
+            if next_index in reasoning_trigger_indexes:
                 drop_reasoning.add(index)
             break
     excluded = dropped_indexes | drop_reasoning
@@ -265,6 +390,294 @@ def fingerprint_input_item(item: Any, *, ignore_ids_for_matching: bool = False) 
         return None
 
 
+def digest_input_item(item: Any) -> str | None:
+    """Return a fixed-size digest of an input item for durable occurrence tracking."""
+    coerced = _coerce_to_dict(item)
+    if coerced is not None:
+        coerced = cast(
+            dict[str, Any],
+            strip_internal_input_item_metadata(cast(TResponseInputItem, coerced)),
+        )
+        if coerced.get("role") == "assistant":
+            content = coerced.get("content")
+            if isinstance(content, str):
+                coerced["content"] = [{"type": "output_text", "text": content}]
+            if coerced.get("status") in {None, "completed"}:
+                coerced.pop("status", None)
+        item = coerced
+
+    fingerprint = fingerprint_input_item(item)
+    if fingerprint is None:
+        return None
+    return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
+
+
+def filter_nested_history_owned_item_refs_for_input(
+    input: str | Sequence[TResponseInputItem],
+    owned_item_refs: Sequence[NestedHistoryOwnedItemRef],
+) -> list[NestedHistoryOwnedItemRef]:
+    """Keep ownership whose exact clean input occurrence is still present."""
+    if isinstance(input, str) or not owned_item_refs:
+        return []
+
+    input_digests = [digest_input_item(item) for item in input]
+    input_indexes_by_identity: dict[tuple[int, str], deque[int]] = {}
+    for index, (item, digest) in enumerate(zip(input, input_digests, strict=True)):
+        if digest is not None:
+            input_indexes_by_identity.setdefault((id(item), digest), deque()).append(index)
+
+    retained: list[NestedHistoryOwnedItemRef] = []
+    used_input_indexes: set[int] = set()
+
+    def _take_unused(candidates: deque[int] | None) -> int | None:
+        while candidates:
+            candidate = candidates.popleft()
+            if candidate not in used_input_indexes:
+                return candidate
+        return None
+
+    for item_ref in owned_item_refs:
+        input_index = (
+            _take_unused(input_indexes_by_identity.get((id(item_ref.input_item), item_ref.digest)))
+            if item_ref.input_item is not None
+            else None
+        )
+        if input_index is None and item_ref.input_item is None:
+            candidate_index = item_ref.input_index
+            if (
+                0 <= candidate_index < len(input)
+                and candidate_index not in used_input_indexes
+                and input_digests[candidate_index] == item_ref.digest
+            ):
+                input_index = candidate_index
+        if input_index is None:
+            continue
+        used_input_indexes.add(input_index)
+        retained.append(replace(item_ref, input_index=input_index, input_item=input[input_index]))
+    return retained
+
+
+def reconcile_nested_history_owned_input_after_rewrite(
+    previous_input: str | Sequence[TResponseInputItem],
+    rewritten_input: str | Sequence[TResponseInputItem],
+    owned_item_refs: Sequence[NestedHistoryOwnedItemRef],
+) -> tuple[str | list[TResponseInputItem], list[NestedHistoryOwnedItemRef]]:
+    """Rebind ownership after an unambiguous input rewrite."""
+    if isinstance(rewritten_input, str) or not owned_item_refs:
+        return (
+            rewritten_input if isinstance(rewritten_input, str) else list(rewritten_input),
+            [],
+        )
+    if isinstance(previous_input, str):
+        return list(rewritten_input), []
+
+    rewritten = list(rewritten_input)
+    previous = list(previous_input)
+    previous_digests = [digest_input_item(item) for item in previous]
+    rewritten_digests = [digest_input_item(item) for item in rewritten]
+    previous_digest_counts: dict[str, int] = {}
+    rewritten_digest_counts: dict[str, int] = {}
+    previous_identity_digests: set[tuple[int, str]] = set()
+    rewritten_indexes_by_identity: dict[tuple[int, str], deque[int]] = {}
+    rewritten_indexes_by_digest: dict[str, deque[int]] = {}
+    for item, digest in zip(previous, previous_digests, strict=True):
+        if digest is None:
+            continue
+        previous_digest_counts[digest] = previous_digest_counts.get(digest, 0) + 1
+        previous_identity_digests.add((id(item), digest))
+    for index, (item, digest) in enumerate(zip(rewritten, rewritten_digests, strict=True)):
+        if digest is None:
+            continue
+        rewritten_digest_counts[digest] = rewritten_digest_counts.get(digest, 0) + 1
+        rewritten_indexes_by_identity.setdefault((id(item), digest), deque()).append(index)
+        rewritten_indexes_by_digest.setdefault(digest, deque()).append(index)
+
+    recoverable_ref_counts: dict[str, int] = {}
+    for item_ref in owned_item_refs:
+        if (
+            item_ref.input_item is not None
+            and (id(item_ref.input_item), item_ref.digest) in previous_identity_digests
+        ):
+            recoverable_ref_counts[item_ref.digest] = (
+                recoverable_ref_counts.get(item_ref.digest, 0) + 1
+            )
+    used_indexes: set[int] = set()
+    used_digest_counts: dict[str, int] = {}
+    retained: list[NestedHistoryOwnedItemRef] = []
+
+    def _take_unused(candidates: deque[int] | None) -> int | None:
+        while candidates:
+            candidate = candidates.popleft()
+            if candidate not in used_indexes:
+                return candidate
+        return None
+
+    for item_ref in owned_item_refs:
+        identity_match = (
+            _take_unused(
+                rewritten_indexes_by_identity.get((id(item_ref.input_item), item_ref.digest))
+            )
+            if item_ref.input_item is not None
+            else None
+        )
+        if identity_match is not None:
+            used_indexes.add(identity_match)
+            used_digest_counts[item_ref.digest] = used_digest_counts.get(item_ref.digest, 0) + 1
+            retained.append(
+                replace(
+                    item_ref,
+                    input_index=identity_match,
+                    input_item=rewritten[identity_match],
+                )
+            )
+            continue
+
+        previous_match = (
+            item_ref.input_item is not None
+            and (id(item_ref.input_item), item_ref.digest) in previous_identity_digests
+        )
+        previous_count = previous_digest_counts.get(item_ref.digest, 0)
+        rewritten_count = rewritten_digest_counts.get(item_ref.digest, 0)
+        all_equal_occurrences_owned = (
+            previous_count == rewritten_count == recoverable_ref_counts.get(item_ref.digest, 0)
+        )
+        if (
+            not previous_match
+            or rewritten_count <= used_digest_counts.get(item_ref.digest, 0)
+            or not ((previous_count == 1 and rewritten_count == 1) or all_equal_occurrences_owned)
+        ):
+            continue
+
+        candidate_index = _take_unused(rewritten_indexes_by_digest.get(item_ref.digest))
+        if candidate_index is None:
+            continue
+        used_indexes.add(candidate_index)
+        used_digest_counts[item_ref.digest] = used_digest_counts.get(item_ref.digest, 0) + 1
+        retained.append(
+            replace(
+                item_ref,
+                input_index=candidate_index,
+                input_item=rewritten[candidate_index],
+            )
+        )
+
+    return rewritten, retained
+
+
+def resolve_nested_history_owned_item_indexes(
+    run_items: Sequence[RunItem],
+    owned_item_refs: Sequence[NestedHistoryOwnedItemRef],
+) -> set[int]:
+    """Resolve ownership references without dropping a different item after list mutation."""
+    if not owned_item_refs:
+        return set()
+
+    indexes_by_identity_digest: dict[tuple[int, str], deque[int]] = {}
+    indexes_by_occurrence_digest: dict[tuple[str, str], deque[int]] = {}
+    run_item_digests: list[str | None] = []
+    for index, run_item in enumerate(run_items):
+        input_item = run_item_to_input_item(run_item)
+        digest = digest_input_item(input_item) if input_item is not None else None
+        run_item_digests.append(digest)
+        if digest is None:
+            continue
+        indexes_by_identity_digest.setdefault((id(run_item), digest), deque()).append(index)
+        occurrence_key = nested_history_run_item_occurrence_key(run_item)
+        if occurrence_key is not None:
+            indexes_by_occurrence_digest.setdefault((occurrence_key, digest), deque()).append(index)
+
+    resolved: set[int] = set()
+
+    def _peek_unused(candidates: deque[int] | None) -> int | None:
+        while candidates and candidates[0] in resolved:
+            candidates.popleft()
+        return candidates[0] if candidates else None
+
+    for item_ref in owned_item_refs:
+        occurrence_key = nested_history_run_item_occurrence_key(item_ref.run_item)
+        stored_index = item_ref.session_index
+        if (
+            0 <= stored_index < len(run_items)
+            and stored_index not in resolved
+            and run_item_digests[stored_index] == item_ref.digest
+            and item_ref.run_item is not None
+            and (
+                run_items[stored_index] is item_ref.run_item
+                or (
+                    occurrence_key is not None
+                    and nested_history_run_item_occurrence_key(run_items[stored_index])
+                    == occurrence_key
+                )
+            )
+        ):
+            resolved.add(stored_index)
+            continue
+
+        identity_index = (
+            _peek_unused(indexes_by_identity_digest.get((id(item_ref.run_item), item_ref.digest)))
+            if item_ref.run_item is not None
+            else None
+        )
+        occurrence_index = (
+            _peek_unused(indexes_by_occurrence_digest.get((occurrence_key, item_ref.digest)))
+            if occurrence_key is not None
+            else None
+        )
+        candidates = [index for index in (identity_index, occurrence_index) if index is not None]
+        if candidates:
+            resolved.add(min(candidates))
+
+    return resolved
+
+
+def rebase_nested_history_owned_item_refs(
+    input: str | Sequence[TResponseInputItem],
+    run_items: Sequence[RunItem],
+    owned_item_refs: Sequence[NestedHistoryOwnedItemRef],
+) -> list[NestedHistoryOwnedItemRef]:
+    """Rebase surviving ownership onto exact live input and session occurrences."""
+    retained_refs = filter_nested_history_owned_item_refs_for_input(input, owned_item_refs)
+    indexes_by_identity_digest: dict[tuple[int, str], deque[int]] = {}
+    indexes_by_occurrence_digest: dict[tuple[str, str], deque[int]] = {}
+    for index, run_item in enumerate(run_items):
+        input_item = run_item_to_input_item(run_item)
+        digest = digest_input_item(input_item) if input_item is not None else None
+        if digest is None:
+            continue
+        indexes_by_identity_digest.setdefault((id(run_item), digest), deque()).append(index)
+        occurrence_key = nested_history_run_item_occurrence_key(run_item)
+        if occurrence_key is not None:
+            indexes_by_occurrence_digest.setdefault((occurrence_key, digest), deque()).append(index)
+
+    rebased: list[NestedHistoryOwnedItemRef] = []
+    used_indexes: set[int] = set()
+
+    def _peek_unused(candidates: deque[int] | None) -> int | None:
+        while candidates and candidates[0] in used_indexes:
+            candidates.popleft()
+        return candidates[0] if candidates else None
+
+    for item_ref in retained_refs:
+        occurrence_key = nested_history_run_item_occurrence_key(item_ref.run_item)
+        identity_index = (
+            _peek_unused(indexes_by_identity_digest.get((id(item_ref.run_item), item_ref.digest)))
+            if item_ref.run_item is not None
+            else None
+        )
+        occurrence_index = (
+            _peek_unused(indexes_by_occurrence_digest.get((occurrence_key, item_ref.digest)))
+            if occurrence_key is not None
+            else None
+        )
+        candidates = [index for index in (identity_index, occurrence_index) if index is not None]
+        if not candidates:
+            continue
+        index = min(candidates)
+        used_indexes.add(index)
+        rebased.append(replace(item_ref, session_index=index, run_item=run_items[index]))
+    return rebased
+
+
 def _dedupe_key(item: TResponseInputItem) -> str | None:
     """Return a stable identity key when items carry explicit identifiers."""
     payload = _coerce_to_dict(item)
@@ -275,6 +688,12 @@ def _dedupe_key(item: TResponseInputItem) -> str | None:
     item_type = payload.get("type") or role
     if role is not None or item_type == "message":
         return None
+    call_id = payload.get("call_id")
+    if isinstance(call_id, str) and item_type in {
+        *_TOOL_CALL_TO_OUTPUT_TYPE,
+        *_TOOL_CALL_TO_OUTPUT_TYPE.values(),
+    }:
+        return f"call_id:{item_type}:{call_id}"
     item_id = payload.get("id")
     if item_id == FAKE_RESPONSES_ID:
         # Ignore placeholder IDs so call_id-based dedupe remains possible.
@@ -282,7 +701,6 @@ def _dedupe_key(item: TResponseInputItem) -> str | None:
     if isinstance(item_id, str):
         return f"id:{item_type}:{item_id}"
 
-    call_id = payload.get("call_id")
     if isinstance(call_id, str):
         return f"call_id:{item_type}:{call_id}"
 
@@ -303,6 +721,16 @@ def strip_internal_input_item_metadata(item: TResponseInputItem) -> TResponseInp
     cleaned.pop(TOOL_CALL_SESSION_DESCRIPTION_KEY, None)
     cleaned.pop(TOOL_CALL_SESSION_TITLE_KEY, None)
     return cast(TResponseInputItem, cleaned)
+
+
+def apply_reasoning_item_id_policy(
+    items: list[TResponseInputItem],
+    reasoning_item_id_policy: ReasoningItemIdPolicy | None,
+) -> list[TResponseInputItem]:
+    """Apply the reasoning item ID policy to already-converted input items."""
+    if not _should_omit_reasoning_item_ids(reasoning_item_id_policy):
+        return items
+    return [_without_reasoning_item_id(item) for item in items]
 
 
 def _should_omit_reasoning_item_ids(reasoning_item_id_policy: ReasoningItemIdPolicy | None) -> bool:
@@ -340,10 +768,57 @@ def deduplicate_input_items(items: Sequence[TResponseInputItem]) -> list[TRespon
 def deduplicate_input_items_preferring_latest(
     items: Sequence[TResponseInputItem],
 ) -> list[TResponseInputItem]:
-    """Deduplicate by stable identifiers while keeping the latest occurrence."""
-    # deduplicate_input_items keeps the first item per dedupe key. Reverse twice so that
-    # the latest item in the original order wins for duplicate IDs/call_ids.
-    return list(reversed(deduplicate_input_items(list(reversed(items)))))
+    """Deduplicate by stable identifiers while keeping the latest value.
+
+    Causal precursor items stay at their earliest position so they cannot move behind required
+    followers. Other identified items stay at their latest position so replacing a stale value
+    does not move the replacement earlier in the conversation.
+    """
+    latest_by_key: dict[str, TResponseInputItem] = {}
+    anchor_index_by_key: dict[str, int] = {}
+    for index, item in enumerate(items):
+        dedupe_key = _dedupe_key(item)
+        if dedupe_key is None:
+            continue
+
+        latest_by_key[dedupe_key] = item
+        payload = _coerce_to_dict(item)
+        item_type = payload.get("type") if payload is not None else None
+        if (
+            dedupe_key not in anchor_index_by_key
+            or item_type not in _DEDUPE_EARLIEST_ANCHOR_ITEM_TYPES
+        ):
+            anchor_index_by_key[dedupe_key] = index
+
+    deduplicated: list[TResponseInputItem] = []
+    for index, item in enumerate(items):
+        dedupe_key = _dedupe_key(item)
+        if dedupe_key is None:
+            deduplicated.append(item)
+        elif anchor_index_by_key[dedupe_key] == index:
+            deduplicated.append(latest_by_key[dedupe_key])
+    return deduplicated
+
+
+def function_tool_error_output(
+    tool_call: Any,
+    output: Any,
+    *,
+    output_json_schema: dict[str, Any] | None,
+) -> Any:
+    """Encode SDK-generated programmatic tool errors as provider-compatible JSON objects."""
+    if output_json_schema is None or not isinstance(output, str):
+        return output
+
+    if isinstance(tool_call, dict):
+        caller = tool_call.get("caller")
+    else:
+        caller = getattr(tool_call, "caller", None)
+    caller_type = caller.get("type") if isinstance(caller, dict) else getattr(caller, "type", None)
+    if caller_type != "program":
+        return output
+
+    return json.dumps({"error": output}, ensure_ascii=False, separators=(",", ":"))
 
 
 def function_rejection_item(
@@ -351,15 +826,24 @@ def function_rejection_item(
     tool_call: Any,
     *,
     rejection_message: str = REJECTION_MESSAGE,
+    output_json_schema: dict[str, Any] | None = None,
     scope_id: str | None = None,
     tool_origin: Any = None,
 ) -> ToolCallOutputItem:
     """Build a ToolCallOutputItem representing a rejected function tool call."""
     if isinstance(tool_call, ResponseFunctionToolCall):
         drop_agent_tool_run_result(tool_call, scope_id=scope_id)
+    provider_output = function_tool_error_output(
+        tool_call,
+        rejection_message,
+        output_json_schema=output_json_schema,
+    )
     return ToolCallOutputItem(
         output=rejection_message,
-        raw_item=ItemHelpers.tool_call_output_item(tool_call, rejection_message),
+        raw_item=ItemHelpers.tool_call_output_item(
+            tool_call,
+            provider_output,
+        ),
         agent=agent,
         tool_origin=tool_origin,
     )
@@ -369,6 +853,7 @@ def shell_rejection_item(
     agent: Any,
     call_id: str,
     *,
+    tool_call: Any | None = None,
     rejection_message: str = REJECTION_MESSAGE,
 ) -> ToolCallOutputItem:
     """Build a ToolCallOutputItem representing a rejected shell call."""
@@ -382,6 +867,8 @@ def shell_rejection_item(
         "call_id": call_id,
         "output": [rejection_output],
     }
+    if tool_call is not None:
+        ItemHelpers.copy_tool_call_caller(tool_call, rejection_raw_item)
     return ToolCallOutputItem(agent=agent, output=rejection_message, raw_item=rejection_raw_item)
 
 
@@ -389,6 +876,7 @@ def apply_patch_rejection_item(
     agent: Any,
     call_id: str,
     *,
+    tool_call: Any | None = None,
     output_type: Literal["apply_patch_call_output", "custom_tool_call_output"] = (
         "apply_patch_call_output"
     ),
@@ -402,6 +890,8 @@ def apply_patch_rejection_item(
     }
     if output_type == "apply_patch_call_output":
         rejection_raw_item["status"] = "failed"
+    if tool_call is not None:
+        ItemHelpers.copy_tool_call_caller(tool_call, rejection_raw_item)
     return ToolCallOutputItem(
         agent=agent,
         output=rejection_message,
@@ -411,6 +901,12 @@ def apply_patch_rejection_item(
 
 def extract_mcp_request_id(raw_item: Any) -> str | None:
     """Pull the request id from hosted MCP approval payloads."""
+    try:
+        hosted_request = get_hosted_mcp_approval_request_identity(raw_item)
+    except Exception:
+        hosted_request = None
+    if hosted_request is not None:
+        return hosted_request.request_id
     if isinstance(raw_item, dict):
         provider_data = raw_item.get("provider_data")
         if isinstance(provider_data, dict):
@@ -437,6 +933,12 @@ def extract_mcp_request_id(raw_item: Any) -> str | None:
 def extract_mcp_request_id_from_run(mcp_run: Any) -> str | None:
     """Extract the hosted MCP request id from a streaming run item."""
     request_item = getattr(mcp_run, "request_item", None) or getattr(mcp_run, "requestItem", None)
+    try:
+        hosted_request = get_hosted_mcp_approval_request_identity(request_item)
+    except Exception:
+        hosted_request = None
+    if hosted_request is not None:
+        return hosted_request.request_id
     if isinstance(request_item, dict):
         provider_data = request_item.get("provider_data")
         if isinstance(provider_data, dict):
@@ -474,6 +976,70 @@ def _completed_call_ids_by_type(payload: list[TResponseInputItem]) -> dict[str, 
         if isinstance(call_id, str):
             completed[item_type].add(call_id)
     return completed
+
+
+def _available_call_ids_by_output_type(
+    payload: list[TResponseInputItem],
+    *,
+    excluded_indexes: set[int],
+) -> dict[str, set[str]]:
+    """Return retained call ids grouped by their required output type."""
+    available: dict[str, set[str]] = {
+        output_type: set() for output_type in _TOOL_CALL_TO_OUTPUT_TYPE.values()
+    }
+    for index, entry in enumerate(payload):
+        if index in excluded_indexes:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        item_type = entry.get("type")
+        if not isinstance(item_type, str):
+            continue
+        output_type = _TOOL_CALL_TO_OUTPUT_TYPE.get(item_type)
+        if output_type is None:
+            continue
+        call_id = entry.get("call_id")
+        if isinstance(call_id, str):
+            available[output_type].add(call_id)
+    return available
+
+
+def _get_program_caller_id(entry: TResponseInputItem) -> str | None:
+    """Return the owning program call id for a program-issued item."""
+    if not isinstance(entry, dict):
+        return None
+    caller = entry.get("caller")
+    if not isinstance(caller, dict) or caller.get("type") != "program":
+        return None
+    caller_id = caller.get("caller_id")
+    return caller_id if isinstance(caller_id, str) else None
+
+
+def _is_pending_hosted_shell_call(entry: TResponseInputItem) -> bool:
+    """Return whether a hosted shell call can remain pending without an output item."""
+    if not isinstance(entry, dict) or entry.get("type") != "shell_call":
+        return False
+    status = entry.get("status")
+    return status is None or status == "in_progress"
+
+
+def _is_retained_program_owned_item(
+    entry: TResponseInputItem,
+    index: int,
+    pruning_indexes: set[int] | None,
+) -> bool:
+    """Return whether a program-owned item keeps its parent program active."""
+    if pruning_indexes is not None:
+        return index not in pruning_indexes
+    if _is_pending_hosted_shell_call(entry):
+        return True
+    if not isinstance(entry, dict):
+        return False
+    entry_type = cast(dict[str, Any], entry).get("type")
+    return (
+        entry_type in _PROGRAM_OWNED_HOSTED_ITEM_TYPES
+        or entry_type in _TOOL_CALL_TO_OUTPUT_TYPE.values()
+    )
 
 
 def _matched_anonymous_tool_search_call_indexes(payload: list[TResponseInputItem]) -> set[int]:

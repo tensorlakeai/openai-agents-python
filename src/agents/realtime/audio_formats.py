@@ -10,6 +10,7 @@ from openai.types.realtime.realtime_audio_formats import (
     RealtimeAudioFormats,
 )
 
+from .. import _debug
 from ..logger import logger
 
 
@@ -25,29 +26,37 @@ def to_realtime_audio_format(
                 format = AudioPCMU(type="audio/pcmu")
             elif input_audio_format in ["g711_alaw", "audio/pcma", "pcma"]:
                 format = AudioPCMA(type="audio/pcma")
+            elif _debug.DONT_LOG_MODEL_DATA:
+                logger.debug("Unknown input audio format")
             else:
-                logger.debug(f"Unknown input_audio_format: {input_audio_format}")
+                logger.debug("Unknown input_audio_format: %s", input_audio_format)
         elif isinstance(input_audio_format, Mapping):
             fmt_type = input_audio_format.get("type")
             rate = input_audio_format.get("rate")
             if fmt_type == "audio/pcm":
                 pcm_rate: Literal[24000] | None
-                if isinstance(rate, int | float) and int(rate) == 24000:
+                if isinstance(rate, int | float) and rate == 24000:
                     pcm_rate = 24000
                 elif rate is None:
                     pcm_rate = 24000
                 else:
-                    logger.debug(
-                        f"Unknown pcm rate in input_audio_format mapping: {input_audio_format}"
-                    )
+                    if _debug.DONT_LOG_MODEL_DATA:
+                        logger.debug("Unknown PCM rate in input audio format mapping")
+                    else:
+                        logger.debug(
+                            "Unknown pcm rate in input_audio_format mapping: %s",
+                            input_audio_format,
+                        )
                     pcm_rate = 24000
                 format = AudioPCM(type="audio/pcm", rate=pcm_rate)
             elif fmt_type == "audio/pcmu":
                 format = AudioPCMU(type="audio/pcmu")
             elif fmt_type == "audio/pcma":
                 format = AudioPCMA(type="audio/pcma")
+            elif _debug.DONT_LOG_MODEL_DATA:
+                logger.debug("Unknown input audio format mapping")
             else:
-                logger.debug(f"Unknown input_audio_format mapping: {input_audio_format}")
+                logger.debug("Unknown input_audio_format mapping: %s", input_audio_format)
         else:
             format = input_audio_format
     return format

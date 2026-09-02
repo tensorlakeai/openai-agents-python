@@ -1,3 +1,4 @@
+import asyncio
 from typing import Any, cast
 
 import pytest
@@ -12,6 +13,7 @@ from agents import (
 )
 from agents.extensions.models.litellm_model import LitellmModel
 from agents.models.multi_provider import MultiProviderMap
+from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
 from agents.run_internal.run_loop import get_model
 
 
@@ -91,6 +93,19 @@ def test_multi_provider_passes_websocket_base_url_to_openai_provider(monkeypatch
     assert captured_kwargs["websocket_base_url"] == "wss://proxy.example.test/v1"
 
 
+def test_multi_provider_forwards_openai_buffer_streamed_tool_calls_to_chat_model():
+    provider = MultiProvider(
+        openai_client=cast(Any, object()),
+        openai_use_responses=False,
+        openai_buffer_streamed_tool_calls=True,
+    )
+
+    model = provider.get_model("gpt-4o")
+
+    assert isinstance(model, OpenAIChatCompletionsModel)
+    assert model._buffer_streamed_tool_calls is True
+
+
 def test_openai_prefix_defaults_to_alias_mode(monkeypatch):
     captured_model: dict[str, Any] = {}
 
@@ -144,9 +159,9 @@ def test_unknown_prefix_can_be_preserved_for_openai_compatible_model_ids(monkeyp
 
         def get_model(self, model_name):
             captured_model["value"] = model_name
-            fake_model = object()
-            captured_result["value"] = fake_model
-            return fake_model
+            mapped_model = object()
+            captured_result["value"] = mapped_model
+            return mapped_model
 
     monkeypatch.setattr("agents.models.multi_provider.OpenAIProvider", FakeOpenAIProvider)
 
@@ -184,6 +199,27 @@ def test_provider_map_entries_override_openai_prefix_mode(monkeypatch):
     assert captured_model["value"] == "gpt-4o"
 
 
+def test_provider_map_routes_to_falsey_provider():
+    captured_model: dict[str, Any] = {}
+    expected_model = object()
+
+    class FalseyProvider:
+        def __bool__(self) -> bool:
+            return False
+
+        def get_model(self, model_name: str | None):
+            captured_model["value"] = model_name
+            return expected_model
+
+    provider_map = MultiProviderMap()
+    provider_map.add_provider("custom", cast(Any, FalseyProvider()))
+
+    result = MultiProvider(provider_map=provider_map).get_model("custom/test-model")
+
+    assert result is expected_model
+    assert captured_model["value"] == "test-model"
+
+
 def test_multi_provider_rejects_invalid_prefix_modes():
     bad_openai_prefix_mode: Any = "invalid"
     bad_unknown_prefix_mode: Any = "invalid"
@@ -193,3 +229,75 @@ def test_multi_provider_rejects_invalid_prefix_modes():
 
     with pytest.raises(UserError, match="unknown_prefix_mode"):
         MultiProvider(unknown_prefix_mode=bad_unknown_prefix_mode)
+
+
+@pytest.mark.asyncio
+async def test_multi_provider_aclose_continues_and_preserves_first_failure():
+    close_error = RuntimeError("close failed")
+    later_error = ValueError("later close failed")
+
+    class CloseTrackingProvider:
+        def __init__(self, error: Exception | None = None):
+            self.error = error
+            self.closed = False
+
+        def get_model(self, model_name: str | None):
+            return object()
+
+        async def aclose(self) -> None:
+            self.closed = True
+            if self.error is not None:
+                raise self.error
+
+    failing_provider = CloseTrackingProvider(close_error)
+    later_provider = CloseTrackingProvider(later_error)
+    provider_map = MultiProviderMap()
+    provider_map.add_provider("failing", cast(Any, failing_provider))
+    provider_map.add_provider("later", cast(Any, later_provider))
+    provider = MultiProvider(provider_map=provider_map, openai_api_key="test")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await provider.aclose()
+
+    assert exc_info.value is close_error
+    assert failing_provider.closed
+    assert later_provider.closed
+
+
+@pytest.mark.asyncio
+async def test_multi_provider_aclose_propagates_hybrid_cancellation():
+    closed: list[str] = []
+
+    class HybridCancellation(asyncio.CancelledError, Exception):
+        pass
+
+    class CloseTrackingProvider:
+        def __init__(self, name: str, error: BaseException | None = None):
+            self.name = name
+            self.error = error
+
+        def get_model(self, model_name: str | None):
+            return object()
+
+        async def aclose(self) -> None:
+            closed.append(self.name)
+            if self.error is not None:
+                raise self.error
+
+    cancellation = HybridCancellation("cancelled")
+    provider_map = MultiProviderMap()
+    provider_map.add_provider(
+        "failing",
+        cast(Any, CloseTrackingProvider("failing", RuntimeError("close failed"))),
+    )
+    provider_map.add_provider(
+        "cancelling", cast(Any, CloseTrackingProvider("cancelling", cancellation))
+    )
+    provider_map.add_provider("later", cast(Any, CloseTrackingProvider("later")))
+    provider = MultiProvider(provider_map=provider_map, openai_api_key="test")
+
+    with pytest.raises(HybridCancellation) as exc_info:
+        await provider.aclose()
+
+    assert exc_info.value is cancellation
+    assert closed == ["failing", "cancelling"]

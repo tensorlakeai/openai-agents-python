@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import weakref
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+
+from ._tool_invocation import tool_invocation_identity_and_scope
 
 if TYPE_CHECKING:
     from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
@@ -10,18 +13,36 @@ if TYPE_CHECKING:
 
 ToolCallSignature = tuple[str, str, str, str, str | None, str | None]
 ScopedToolCallSignature = tuple[str | None, ToolCallSignature]
+ScopedToolCallObject = tuple[str | None, int]
+
+
+@dataclass
+class _AgentToolResumeCheckpoint:
+    state: Any
+    approval_identities: frozenset[tuple[str, str, str, str]]
+
+    @property
+    def interruptions(self) -> list[Any]:
+        interruptions = self.state.get_interruptions()
+        return interruptions if isinstance(interruptions, list) else []
+
+    def to_state(self) -> Any:
+        return self.state
+
 
 _AGENT_TOOL_STATE_SCOPE_ATTR = "_agent_tool_state_scope_id"
 
 # Ephemeral maps linking tool call objects to nested agent results within the same run.
 # Store by object identity, and index by a stable signature to avoid call ID collisions.
-_agent_tool_run_results_by_obj: dict[int, RunResult | RunResultStreaming] = {}
+_agent_tool_run_results_by_obj: dict[
+    ScopedToolCallObject, RunResult | RunResultStreaming | _AgentToolResumeCheckpoint
+] = {}
 _agent_tool_run_results_by_signature: dict[
     ScopedToolCallSignature,
-    set[int],
+    set[ScopedToolCallObject],
 ] = {}
 _agent_tool_run_result_signature_by_obj: dict[
-    int,
+    ScopedToolCallObject,
     ScopedToolCallSignature,
 ] = {}
 _agent_tool_call_refs_by_obj: dict[int, weakref.ReferenceType[ResponseFunctionToolCall]] = {}
@@ -72,25 +93,26 @@ def _scoped_tool_call_signature(
 
 def _index_agent_tool_run_result(
     tool_call: ResponseFunctionToolCall,
-    tool_call_obj_id: int,
+    scoped_object: ScopedToolCallObject,
     *,
     scope_id: str | None,
 ) -> None:
     """Track tool call objects by signature for fallback lookup."""
     signature = _scoped_tool_call_signature(tool_call, scope_id=scope_id)
-    _agent_tool_run_result_signature_by_obj[tool_call_obj_id] = signature
-    _agent_tool_run_results_by_signature.setdefault(signature, set()).add(tool_call_obj_id)
+    _agent_tool_run_result_signature_by_obj[scoped_object] = signature
+    _agent_tool_run_results_by_signature.setdefault(signature, set()).add(scoped_object)
 
 
-def _drop_agent_tool_run_result(tool_call_obj_id: int) -> None:
+def _drop_agent_tool_run_result(scoped_object: ScopedToolCallObject | int) -> None:
     """Remove a tool call object from the fallback index."""
-    tool_call_refs = _agent_tool_call_refs_by_obj
-    if isinstance(tool_call_refs, dict):
-        tool_call_refs.pop(tool_call_obj_id, None)
     signature_by_obj = _agent_tool_run_result_signature_by_obj
     if not isinstance(signature_by_obj, dict):
         return
-    signature = signature_by_obj.pop(tool_call_obj_id, None)
+    if isinstance(scoped_object, int):
+        for candidate in [key for key in signature_by_obj if key[1] == scoped_object]:
+            _drop_agent_tool_run_result(candidate)
+        return
+    signature = signature_by_obj.pop(scoped_object, None)
     if signature is None:
         return
     results_by_signature = _agent_tool_run_results_by_signature
@@ -99,9 +121,11 @@ def _drop_agent_tool_run_result(tool_call_obj_id: int) -> None:
     candidate_ids = results_by_signature.get(signature)
     if not candidate_ids:
         return
-    candidate_ids.discard(tool_call_obj_id)
+    candidate_ids.discard(scoped_object)
     if not candidate_ids:
         results_by_signature.pop(signature, None)
+    if not any(key[1] == scoped_object[1] for key in _agent_tool_run_results_by_obj):
+        _agent_tool_call_refs_by_obj.pop(scoped_object[1], None)
 
 
 def _register_tool_call_ref(tool_call: ResponseFunctionToolCall, tool_call_obj_id: int) -> None:
@@ -110,45 +134,88 @@ def _register_tool_call_ref(tool_call: ResponseFunctionToolCall, tool_call_obj_i
     def _on_tool_call_gc(_ref: weakref.ReferenceType[ResponseFunctionToolCall]) -> None:
         run_results = _agent_tool_run_results_by_obj
         if isinstance(run_results, dict):
-            run_results.pop(tool_call_obj_id, None)
-        _drop_agent_tool_run_result(tool_call_obj_id)
+            scoped_objects = [key for key in run_results if key[1] == tool_call_obj_id]
+            for scoped_object in scoped_objects:
+                run_results.pop(scoped_object, None)
+                _drop_agent_tool_run_result(scoped_object)
 
     _agent_tool_call_refs_by_obj[tool_call_obj_id] = weakref.ref(tool_call, _on_tool_call_gc)
 
 
 def record_agent_tool_run_result(
     tool_call: ResponseFunctionToolCall,
-    run_result: RunResult | RunResultStreaming,
+    run_result: RunResult | RunResultStreaming | _AgentToolResumeCheckpoint,
     *,
     scope_id: str | None = None,
 ) -> None:
     """Store the nested agent run result by tool call identity."""
     tool_call_obj_id = id(tool_call)
-    _agent_tool_run_results_by_obj[tool_call_obj_id] = run_result
-    _index_agent_tool_run_result(tool_call, tool_call_obj_id, scope_id=scope_id)
+    scoped_object = (scope_id, tool_call_obj_id)
+    _agent_tool_run_results_by_obj[scoped_object] = run_result
+    _index_agent_tool_run_result(tool_call, scoped_object, scope_id=scope_id)
     _register_tool_call_ref(tool_call, tool_call_obj_id)
 
 
-def _tool_call_obj_matches_scope(tool_call_obj_id: int, *, scope_id: str | None) -> bool:
-    scoped_signature = _agent_tool_run_result_signature_by_obj.get(tool_call_obj_id)
-    if scoped_signature is None:
-        # Fallback for unindexed entries.
-        return scope_id is None
-    return scoped_signature[0] == scope_id
+def record_agent_tool_resume_state(
+    tool_call: ResponseFunctionToolCall,
+    state: Any,
+    *,
+    scope_id: str | None = None,
+    approval_items: list[Any] | None = None,
+) -> None:
+    """Keep a live nested RunState checkpoint while an approved resume is in flight."""
+    resolved_approval_items = approval_items
+    if resolved_approval_items is None:
+        get_interruptions = getattr(state, "get_interruptions", None)
+        interruptions = get_interruptions() if callable(get_interruptions) else []
+        resolved_approval_items = interruptions if isinstance(interruptions, list) else []
+    approval_identities = frozenset(
+        identity
+        for item in resolved_approval_items
+        if (
+            identity := tool_invocation_identity_and_scope(
+                item.raw_item,
+                tool_lookup_key=getattr(item, "tool_lookup_key", None),
+                tool_name=getattr(item, "tool_name", None),
+            )
+        )
+        is not None
+    )
+    record_agent_tool_run_result(
+        tool_call,
+        _AgentToolResumeCheckpoint(state, approval_identities),
+        scope_id=scope_id,
+    )
+
+
+def get_agent_tool_resume_state(run_result: Any) -> Any | None:
+    """Return the live nested RunState stored in an in-flight resume checkpoint."""
+    return run_result.state if isinstance(run_result, _AgentToolResumeCheckpoint) else None
+
+
+def agent_tool_resume_checkpoint_owns_approval(run_result: Any, approval_item: Any) -> bool:
+    """Return whether an in-flight nested resume accepted the approval item."""
+    if not isinstance(run_result, _AgentToolResumeCheckpoint):
+        return False
+    identity = tool_invocation_identity_and_scope(
+        approval_item.raw_item,
+        tool_lookup_key=getattr(approval_item, "tool_lookup_key", None),
+        tool_name=getattr(approval_item, "tool_name", None),
+    )
+    return identity is not None and identity in run_result.approval_identities
 
 
 def consume_agent_tool_run_result(
     tool_call: ResponseFunctionToolCall,
     *,
     scope_id: str | None = None,
-) -> RunResult | RunResultStreaming | None:
+) -> RunResult | RunResultStreaming | _AgentToolResumeCheckpoint | None:
     """Return and drop the stored nested agent run result for the given tool call."""
-    obj_id = id(tool_call)
-    if _tool_call_obj_matches_scope(obj_id, scope_id=scope_id):
-        run_result = _agent_tool_run_results_by_obj.pop(obj_id, None)
-        if run_result is not None:
-            _drop_agent_tool_run_result(obj_id)
-            return run_result
+    scoped_object = (scope_id, id(tool_call))
+    run_result = _agent_tool_run_results_by_obj.pop(scoped_object, None)
+    if run_result is not None:
+        _drop_agent_tool_run_result(scoped_object)
+        return run_result
 
     signature = _scoped_tool_call_signature(tool_call, scope_id=scope_id)
     candidate_ids = _agent_tool_run_results_by_signature.get(signature)
@@ -158,23 +225,21 @@ def consume_agent_tool_run_result(
         return None
 
     candidate_id = next(iter(candidate_ids))
-    _agent_tool_run_results_by_signature.pop(signature, None)
-    _agent_tool_run_result_signature_by_obj.pop(candidate_id, None)
-    _agent_tool_call_refs_by_obj.pop(candidate_id, None)
-    return _agent_tool_run_results_by_obj.pop(candidate_id, None)
+    run_result = _agent_tool_run_results_by_obj.pop(candidate_id, None)
+    _drop_agent_tool_run_result(candidate_id)
+    return run_result
 
 
 def peek_agent_tool_run_result(
     tool_call: ResponseFunctionToolCall,
     *,
     scope_id: str | None = None,
-) -> RunResult | RunResultStreaming | None:
+) -> RunResult | RunResultStreaming | _AgentToolResumeCheckpoint | None:
     """Return the stored nested agent run result without removing it."""
-    obj_id = id(tool_call)
-    if _tool_call_obj_matches_scope(obj_id, scope_id=scope_id):
-        run_result = _agent_tool_run_results_by_obj.get(obj_id)
-        if run_result is not None:
-            return run_result
+    scoped_object = (scope_id, id(tool_call))
+    run_result = _agent_tool_run_results_by_obj.get(scoped_object)
+    if run_result is not None:
+        return run_result
 
     signature = _scoped_tool_call_signature(tool_call, scope_id=scope_id)
     candidate_ids = _agent_tool_run_results_by_signature.get(signature)
@@ -193,12 +258,11 @@ def drop_agent_tool_run_result(
     scope_id: str | None = None,
 ) -> None:
     """Drop the stored nested agent run result, if present."""
-    obj_id = id(tool_call)
-    if _tool_call_obj_matches_scope(obj_id, scope_id=scope_id):
-        run_result = _agent_tool_run_results_by_obj.pop(obj_id, None)
-        if run_result is not None:
-            _drop_agent_tool_run_result(obj_id)
-            return
+    scoped_object = (scope_id, id(tool_call))
+    run_result = _agent_tool_run_results_by_obj.pop(scoped_object, None)
+    if run_result is not None:
+        _drop_agent_tool_run_result(scoped_object)
+        return
 
     signature = _scoped_tool_call_signature(tool_call, scope_id=scope_id)
     candidate_ids = _agent_tool_run_results_by_signature.get(signature)
@@ -208,7 +272,5 @@ def drop_agent_tool_run_result(
         return
 
     candidate_id = next(iter(candidate_ids))
-    _agent_tool_run_results_by_signature.pop(signature, None)
-    _agent_tool_run_result_signature_by_obj.pop(candidate_id, None)
-    _agent_tool_call_refs_by_obj.pop(candidate_id, None)
     _agent_tool_run_results_by_obj.pop(candidate_id, None)
+    _drop_agent_tool_run_result(candidate_id)

@@ -1,21 +1,29 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
+import logging
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, cast, get_type_hints
 
 import pytest
-from openai.types.responses import ResponseCustomToolCall
+from openai.types.responses import ResponseCustomToolCall, ResponseFunctionToolCall
+from openai.types.responses.response_function_tool_call import CallerProgram
+from openai.types.responses.response_input_item_param import FunctionCallOutput
+from openai.types.responses.response_output_item import Program, ProgramOutput
 from openai.types.responses.response_output_message import ResponseOutputMessage
 from openai.types.responses.response_reasoning_item import ResponseReasoningItem
 
+import agents._debug as _debug
 import agents.sandbox.capabilities.memory as memory_module
 import agents.sandbox.memory.manager as memory_manager_module
 import agents.sandbox.memory.phase_one as phase_one_module
 from agents import (
     Agent,
+    ModelSettings,
     ReasoningItem,
     RunConfig,
     Runner,
@@ -24,8 +32,15 @@ from agents import (
     TResponseInputItem,
 )
 from agents.exceptions import UserError
-from agents.items import CompactionItem, MessageOutputItem, TResponseOutputItem
-from agents.result import RunResultStreaming
+from agents.items import (
+    CompactionItem,
+    MessageOutputItem,
+    ToolApprovalItem,
+    ToolCallItem,
+    ToolCallOutputItem,
+    TResponseOutputItem,
+)
+from agents.result import RunResult, RunResultStreaming
 from agents.run import _sandbox_memory_input
 from agents.run_context import RunContextWrapper
 from agents.sandbox import (
@@ -59,13 +74,25 @@ from agents.sandbox.memory.storage import (
     _updated_at_sort_key,
 )
 from agents.sandbox.runtime import _stream_memory_input_override
-from agents.sandbox.sandboxes.unix_local import UnixLocalSandboxClient
-from tests.fake_model import FakeModel
+from agents.sandbox.workspace_paths import SandboxWorkspaceScope
+from agents.testing import ScriptedModel
+from tests.sandbox._filesystem_test_session import FilesystemTestSandboxClient
 from tests.test_responses import get_final_output_message, get_text_message
 from tests.utils.hitl import make_shell_call
 
 
-class _DeleteTrackingUnixLocalSandboxClient(UnixLocalSandboxClient):
+@dataclass
+class _DeclaredProviderModelSettings(ModelSettings):
+    provider_field: str | None = None
+
+
+@dataclass
+class _DeclaredProviderMemoryGenerateConfig(MemoryGenerateConfig):
+    phase_one_model_settings: _DeclaredProviderModelSettings | None = None
+    phase_two_model_settings: _DeclaredProviderModelSettings | None = None
+
+
+class _DeleteTrackingFilesystemTestSandboxClient(FilesystemTestSandboxClient):
     def __init__(self) -> None:
         super().__init__()
         self.deleted_roots: list[Path] = []
@@ -122,8 +149,8 @@ def _memory_config(
     extra_prompt: str | None = None,
     layout: MemoryLayoutConfig | None = None,
     read: MemoryReadConfig | None = None,
-    phase_one_model: FakeModel | None = None,
-    phase_two_model: FakeModel | None = None,
+    phase_one_model: ScriptedModel | None = None,
+    phase_two_model: ScriptedModel | None = None,
 ) -> Memory:
     return Memory(
         layout=layout or MemoryLayoutConfig(),
@@ -131,14 +158,16 @@ def _memory_config(
         generate=MemoryGenerateConfig(
             max_raw_memories_for_consolidation=max_raw_memories_for_consolidation,
             extra_prompt=extra_prompt,
-            phase_one_model=phase_one_model or FakeModel(initial_output=[_phase_one_message()]),
+            phase_one_model=phase_one_model or ScriptedModel(steps=[[_phase_one_message()]]),
             phase_two_model=phase_two_model
-            or FakeModel(
-                initial_output=[
-                    _patch_update_call("memory-md", "memories/MEMORY.md", "memory entry"),
-                    _patch_update_call(
-                        "memory-summary", "memories/memory_summary.md", "summary entry"
-                    ),
+            or ScriptedModel(
+                steps=[
+                    [
+                        _patch_update_call("memory-md", "memories/MEMORY.md", "memory entry"),
+                        _patch_update_call(
+                            "memory-summary", "memories/memory_summary.md", "summary entry"
+                        ),
+                    ]
                 ]
             ),
         ),
@@ -149,13 +178,12 @@ def _run_config_for_session(session: Any) -> RunConfig:
     return RunConfig(sandbox=SandboxRunConfig(session=session))
 
 
-def _extract_user_text(fake_model: FakeModel) -> str:
-    assert fake_model.first_turn_args is not None
-    return _extract_user_text_from_turn_args(fake_model.first_turn_args)
+def _extract_user_text(scripted_model: ScriptedModel) -> str:
+    assert bool(scripted_model.calls)
+    return _extract_user_text_from_model_input(scripted_model.calls[0].input)
 
 
-def _extract_user_text_from_turn_args(turn_args: dict[str, Any]) -> str:
-    input_items = turn_args["input"]
+def _extract_user_text_from_model_input(input_items: str | list[Any]) -> str:
     assert isinstance(input_items, list)
     first_item = cast(dict[str, Any], input_items[0])
     content = first_item["content"]
@@ -187,7 +215,7 @@ def _raw_memory_record(
 
 
 async def _cleanup_session(
-    client: UnixLocalSandboxClient,
+    client: FilesystemTestSandboxClient,
     session: Any,
     *,
     close: bool = True,
@@ -256,6 +284,148 @@ def test_build_rollout_payload_filters_developer_and_noisy_items() -> None:
         assistant_message.model_dump(exclude_unset=True),
     ]
     assert payload["final_output"] == "done"
+
+
+def test_build_rollout_payload_keeps_programmatic_tool_calling_items() -> None:
+    agent = Agent(name="test")
+    program = Program(
+        id="program_item",
+        call_id="call_prog_1",
+        code='lookup_inventory(sku="A-1")',
+        fingerprint="fingerprint",
+        type="program",
+    )
+    function_call = ResponseFunctionToolCall(
+        id="function_item",
+        call_id="call_fn_1",
+        name="lookup_inventory",
+        arguments='{"sku":"A-1"}',
+        caller=CallerProgram(type="program", caller_id="call_prog_1"),
+        type="function_call",
+    )
+    function_call_output = cast(
+        FunctionCallOutput,
+        {
+            "type": "function_call_output",
+            "call_id": "call_fn_1",
+            "output": '{"available_units":42}',
+        },
+    )
+    program_output = ProgramOutput(
+        id="program_output_item",
+        call_id="call_prog_1",
+        result='{"sku":"A-1","available_units":42}',
+        status="completed",
+        type="program_output",
+    )
+
+    payload = build_rollout_payload(
+        input="what is in stock?",
+        new_items=[
+            ToolCallItem(agent=agent, raw_item=program),
+            ToolCallItem(agent=agent, raw_item=function_call),
+            ToolCallOutputItem(agent=agent, raw_item=function_call_output, output="42"),
+            ToolCallOutputItem(agent=agent, raw_item=program_output, output="42"),
+        ],
+        final_output="done",
+        interruptions=[],
+        terminal_metadata=RolloutTerminalMetadata(
+            terminal_state="completed",
+            has_final_output=True,
+        ),
+    )
+
+    generated_items = payload["generated_items"]
+    assert [item["type"] for item in generated_items] == [
+        "program",
+        "function_call",
+        "function_call_output",
+        "program_output",
+    ]
+    # The retained function call points back at the program that issued it, so the program
+    # it names has to survive alongside it.
+    assert generated_items[1]["caller"] == {"type": "program", "caller_id": "call_prog_1"}
+    assert generated_items[0]["call_id"] == "call_prog_1"
+    assert generated_items[0]["code"] == 'lookup_inventory(sku="A-1")'
+    assert generated_items[3]["call_id"] == "call_prog_1"
+    assert generated_items[3]["result"] == '{"sku":"A-1","available_units":42}'
+
+
+def test_build_rollout_payload_keeps_program_items_from_input() -> None:
+    payload = build_rollout_payload(
+        input=[
+            cast(
+                TResponseInputItem,
+                {
+                    "type": "program",
+                    "call_id": "call_prog_1",
+                    "code": 'lookup_inventory(sku="A-1")',
+                    "fingerprint": "fingerprint",
+                },
+            ),
+            cast(
+                TResponseInputItem,
+                {
+                    "type": "program_output",
+                    "call_id": "call_prog_1",
+                    "result": '{"available_units":42}',
+                    "status": "completed",
+                },
+            ),
+        ],
+        new_items=[],
+        final_output=None,
+        interruptions=[],
+        terminal_metadata=RolloutTerminalMetadata(terminal_state="completed"),
+    )
+
+    assert [item["type"] for item in payload["input"]] == ["program", "program_output"]
+
+
+def test_build_rollout_payload_still_drops_hosted_items_outside_the_included_set() -> None:
+    """Program items are included because every other call/output pair is; hosted tool calls
+    with no output half stay out."""
+    payload = build_rollout_payload(
+        input=[
+            cast(TResponseInputItem, {"type": "file_search_call", "id": "fs_1", "queries": []}),
+            cast(TResponseInputItem, {"type": "image_generation_call", "id": "ig_1"}),
+            cast(TResponseInputItem, {"type": "program", "call_id": "call_prog_1", "code": "x()"}),
+        ],
+        new_items=[],
+        final_output=None,
+        interruptions=[],
+        terminal_metadata=RolloutTerminalMetadata(terminal_state="completed"),
+    )
+
+    assert [item["type"] for item in payload["input"]] == ["program"]
+
+
+def test_build_rollout_payload_serializes_model_interruptions_as_dicts() -> None:
+    agent = Agent(name="test")
+    raw = ResponseFunctionToolCall(
+        id="fc_1",
+        call_id="call_1",
+        name="get_weather",
+        arguments='{"city":"Paris"}',
+        type="function_call",
+    )
+    approval = ToolApprovalItem(agent=agent, raw_item=raw)
+
+    payload = build_rollout_payload(
+        input="hello",
+        new_items=[],
+        final_output=None,
+        interruptions=[approval],
+        terminal_metadata=RolloutTerminalMetadata(terminal_state="interrupted"),
+    )
+
+    interruption = payload["interruptions"][0]
+    assert isinstance(interruption, dict)
+    assert interruption == raw.model_dump(exclude_unset=True)
+    assert interruption["type"] == "function_call"
+    assert interruption["call_id"] == "call_1"
+    assert interruption["name"] == "get_weather"
+    assert interruption["arguments"] == '{"city":"Paris"}'
 
 
 def test_render_phase_one_prompt_truncates_large_rollout_contents() -> None:
@@ -398,6 +568,28 @@ def test_render_memory_prompts_include_extra_prompt_section() -> None:
     assert "Focus on user preferences." in consolidation_prompt
 
 
+def test_render_memory_consolidation_prompt_lists_removed_rollouts() -> None:
+    selection = PhaseTwoInputSelection(
+        selected=[],
+        retained_rollout_ids=set(),
+        removed=[
+            PhaseTwoSelectionItem(
+                rollout_id="old-rollout",
+                updated_at="",
+                rollout_path="sessions/old-rollout.jsonl",
+                rollout_summary_file="memories/rollout_summaries/old.md",
+                terminal_state="completed",
+            )
+        ],
+    )
+
+    prompt = render_memory_consolidation_prompt(memory_root="memory", selection=selection)
+
+    assert "- removed from the last successful Phase 2 run: 1" in prompt
+    assert "rollout_id=old-rollout" in prompt
+    assert "updated_at=unknown" in prompt
+
+
 def test_updated_at_sort_key_places_unknown_timestamps_last() -> None:
     assert _updated_at_sort_key("updated_at: 2025-03-01T00:00:00Z\n") > _updated_at_sort_key(
         "updated_at: unknown\n"
@@ -408,7 +600,7 @@ def test_updated_at_sort_key_places_unknown_timestamps_last() -> None:
 
 @pytest.mark.asyncio
 async def test_phase_two_selection_tracks_added_retained_and_removed_rollouts() -> None:
-    client = UnixLocalSandboxClient()
+    client = FilesystemTestSandboxClient()
     session = await client.create(manifest=Manifest())
 
     try:
@@ -457,25 +649,27 @@ async def test_runner_memory_generation_sanitizes_and_truncates_phase_one_prompt
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(phase_one_module, "_PHASE_ONE_ROLLOUT_TOKEN_LIMIT", 1000)
-    client = UnixLocalSandboxClient()
+    client = FilesystemTestSandboxClient()
     session = await client.create(manifest=Manifest())
-    phase_one_model = FakeModel(initial_output=[_phase_one_message()])
+    phase_one_model = ScriptedModel(steps=[[_phase_one_message()]])
     memory = _memory_config(phase_one_model=phase_one_model)
     agent = SandboxAgent(
         name="worker",
-        model=FakeModel(
-            initial_output=[
-                ResponseReasoningItem(id="rs_1", summary=[], type="reasoning"),
-                cast(
-                    TResponseOutputItem,
-                    {
-                        "id": "compaction_1",
-                        "type": "compaction",
-                        "summary": "compacted-so-far",
-                        "encrypted_content": "encrypted",
-                    },
-                ),
-                get_text_message("done"),
+        model=ScriptedModel(
+            steps=[
+                [
+                    ResponseReasoningItem(id="rs_1", summary=[], type="reasoning"),
+                    cast(
+                        TResponseOutputItem,
+                        {
+                            "id": "compaction_1",
+                            "type": "compaction",
+                            "summary": "compacted-so-far",
+                            "encrypted_content": "encrypted",
+                        },
+                    ),
+                    get_text_message("done"),
+                ]
             ]
         ),
         instructions="Worker.",
@@ -504,7 +698,7 @@ async def test_runner_memory_generation_sanitizes_and_truncates_phase_one_prompt
         )
 
         assert result.final_output == "done"
-        assert phase_one_model.first_turn_args is None
+        assert not phase_one_model.calls
 
         await session.aclose()
         closed = True
@@ -527,11 +721,11 @@ async def test_runner_memory_generation_sanitizes_and_truncates_phase_one_prompt
 
 @pytest.mark.asyncio
 async def test_sandbox_agent_without_memory_capability_skips_memory_generation() -> None:
-    client = UnixLocalSandboxClient()
+    client = FilesystemTestSandboxClient()
     session = await client.create(manifest=Manifest())
     agent = SandboxAgent(
         name="worker",
-        model=FakeModel(initial_output=[get_final_output_message("done")]),
+        model=ScriptedModel(steps=[[get_final_output_message("done")]]),
         instructions="Worker.",
     )
 
@@ -552,7 +746,7 @@ async def test_sandbox_agent_without_memory_capability_skips_memory_generation()
 
 @pytest.mark.asyncio
 async def test_memory_capability_returns_none_without_memory_summary() -> None:
-    client = UnixLocalSandboxClient()
+    client = FilesystemTestSandboxClient()
     session = await client.create(manifest=Manifest())
     capability = Memory(generate=None)
 
@@ -612,6 +806,14 @@ def test_memory_capability_requires_read_or_generate() -> None:
         Memory(read=None, generate=None)
 
 
+@pytest.mark.asyncio
+async def test_memory_capability_instructions_requires_bound_session() -> None:
+    capability = Memory(generate=None)
+
+    with pytest.raises(ValueError, match="Memory capability is not bound to a SandboxSession"):
+        await capability.instructions(Manifest())
+
+
 def test_memory_generate_config_rejects_non_positive_recent_rollout_limit() -> None:
     with pytest.raises(
         ValueError,
@@ -633,6 +835,93 @@ def test_memory_generate_config_accepts_renamed_limit_field() -> None:
     assert config.max_raw_memories_for_consolidation == 123
 
 
+def test_memory_generate_config_normalizes_dictionary_model_settings() -> None:
+    config = MemoryGenerateConfig(
+        phase_one_model_settings={
+            "reasoning": {"effort": "low"},
+            "retry": {"max_retries": 0},
+        },
+        phase_two_model_settings={"temperature": 0.0, "store": False},
+    )
+
+    assert isinstance(config.phase_one_model_settings, ModelSettings)
+    assert config.phase_one_model_settings.reasoning is not None
+    assert config.phase_one_model_settings.reasoning.effort == "low"
+    assert config.phase_one_model_settings.retry is not None
+    assert config.phase_one_model_settings.retry.max_retries == 0
+    assert isinstance(config.phase_two_model_settings, ModelSettings)
+    assert config.phase_two_model_settings.temperature == 0.0
+    assert config.phase_two_model_settings.store is False
+
+
+def test_memory_generate_config_subclass_uses_declared_model_settings_types() -> None:
+    config = cast(Any, _DeclaredProviderMemoryGenerateConfig)(
+        phase_one_model_settings={"provider_field": "phase-one"},
+        phase_two_model_settings={"provider_field": "phase-two"},
+    )
+
+    assert isinstance(config.phase_one_model_settings, _DeclaredProviderModelSettings)
+    assert config.phase_one_model_settings.provider_field == "phase-one"
+    assert isinstance(config.phase_two_model_settings, _DeclaredProviderModelSettings)
+    assert config.phase_two_model_settings.provider_field == "phase-two"
+
+
+def test_memory_generate_config_model_settings_field_types_describe_normalized_values() -> None:
+    type_hints = get_type_hints(MemoryGenerateConfig)
+
+    assert type_hints["phase_one_model_settings"] == ModelSettings | None
+    assert type_hints["phase_two_model_settings"] == ModelSettings | None
+
+
+def test_memory_generate_config_preserves_typed_model_settings() -> None:
+    phase_one_settings = ModelSettings(reasoning={"effort": "low"})
+    phase_two_settings = ModelSettings(temperature=0.2)
+    config = MemoryGenerateConfig(
+        phase_one_model_settings=phase_one_settings,
+        phase_two_model_settings=phase_two_settings,
+    )
+
+    assert config.phase_one_model_settings is phase_one_settings
+    assert config.phase_two_model_settings is phase_two_settings
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ["phase_one_model_settings", "phase_two_model_settings"],
+)
+def test_memory_generate_config_preserves_forward_compatible_reasoning_settings(
+    field_name: str,
+) -> None:
+    settings: dict[str, Any] = {field_name: {"reasoning": {"future_reasoning_option": "enabled"}}}
+
+    config = MemoryGenerateConfig(**settings)
+    model_settings = getattr(config, field_name)
+
+    assert model_settings is not None
+    assert model_settings.reasoning is not None
+    assert model_settings.reasoning.model_extra == {"future_reasoning_option": "enabled"}
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ["phase_one_model_settings", "phase_two_model_settings"],
+)
+def test_memory_generate_config_rejects_invalid_model_settings(field_name: str) -> None:
+    settings: dict[str, Any] = {field_name: "invalid"}
+    with pytest.raises(
+        TypeError,
+        match=f"MemoryGenerateConfig.{field_name} must be a ModelSettings instance or a dict",
+    ):
+        MemoryGenerateConfig(**settings)
+
+
+def test_memory_generate_config_preserves_disabled_model_settings() -> None:
+    config = MemoryGenerateConfig(phase_one_model_settings=None, phase_two_model_settings=None)
+
+    assert config.phase_one_model_settings is None
+    assert config.phase_two_model_settings is None
+
+
 def test_memory_generate_config_rejects_too_many_raw_memories() -> None:
     with pytest.raises(
         ValueError,
@@ -648,17 +937,17 @@ def test_memory_generate_config_rejects_too_many_raw_memories() -> None:
 async def test_memory_capability_injects_truncated_memory_summary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client = UnixLocalSandboxClient()
+    client = FilesystemTestSandboxClient()
     session = await client.create(manifest=Manifest())
     capability = Memory(generate=None)
 
     try:
         async with session:
-            monkeypatch.setattr(memory_module, "_MEMORY_SUMMARY_MAX_TOKENS", 1)
+            monkeypatch.setattr(memory_module, "_MEMORY_SUMMARY_MAX_TOKENS", 8)
             await session.mkdir("memories", parents=True)
             await session.write(
                 Path("memories/memory_summary.md"),
-                io.BytesIO(b"abcdefg"),
+                io.BytesIO(b"abcdefghijklmnopqrstuvwxyz" * 2),
             )
             capability.bind(session)
 
@@ -677,7 +966,7 @@ async def test_memory_capability_injects_truncated_memory_summary(
 
 @pytest.mark.asyncio
 async def test_memory_capability_live_update_instructions() -> None:
-    client = UnixLocalSandboxClient()
+    client = FilesystemTestSandboxClient()
     session = await client.create(manifest=Manifest())
     capability = Memory(generate=None)
 
@@ -702,17 +991,112 @@ async def test_memory_capability_live_update_instructions() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sandbox_memory_writes_rollouts_and_memory_files() -> None:
-    client = UnixLocalSandboxClient()
+async def test_memory_capability_renders_session_owned_paths_as_absolute_with_run_cwd() -> None:
+    client = FilesystemTestSandboxClient()
     session = await client.create(manifest=Manifest())
-    phase_one_model = FakeModel(initial_output=[_phase_one_message()])
-    phase_two_model = FakeModel(
-        initial_output=[
-            _patch_update_call("memory-md", "memories/MEMORY.md", "memory entry"),
-            _patch_update_call("memory-summary", "memories/memory_summary.md", "summary entry"),
+    capability = Memory(generate=None)
+
+    try:
+        async with session:
+            await session.mkdir("memories", parents=True)
+            await session.write(
+                Path("memories/memory_summary.md"),
+                io.BytesIO(b"summary entry"),
+            )
+            capability.bind(session)
+            capability.bind_workspace_scope(SandboxWorkspaceScope.from_cwd("tasks/task-a"))
+
+            instructions = await capability.instructions(session.state.manifest)
+
+            assert instructions is not None
+            workspace_root = session.state.manifest.root
+            assert (
+                f"{workspace_root}/memories/memory_summary.md "
+                "(already provided below; do NOT open again)" in instructions
+            )
+            assert f"{workspace_root}/memories/MEMORY.md" in instructions
+            assert "summary entry" in instructions
+    finally:
+        await client.delete(session)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("memories_dir", [r"team\memory", "team//memory"])
+async def test_memory_capability_preserves_layout_spelling_without_run_cwd(
+    memories_dir: str,
+) -> None:
+    client = FilesystemTestSandboxClient()
+    session = await client.create(manifest=Manifest())
+    capability = Memory(
+        layout=MemoryLayoutConfig(memories_dir=memories_dir),
+        generate=None,
+    )
+
+    try:
+        async with session:
+            await session.mkdir(Path(memories_dir), parents=True)
+            await session.write(
+                Path(memories_dir) / "memory_summary.md",
+                io.BytesIO(b"summary entry"),
+            )
+            capability.bind(session)
+
+            instructions = await capability.instructions(session.state.manifest)
+
+            assert instructions is not None
+            assert f"{memories_dir}/memory_summary.md" in instructions
+            assert f"{memories_dir}/MEMORY.md" in instructions
+    finally:
+        await client.delete(session)
+
+
+@pytest.mark.asyncio
+async def test_memory_capability_uses_typed_layout_path_with_run_cwd() -> None:
+    memories_dir = r"team\memory"
+    client = FilesystemTestSandboxClient()
+    session = await client.create(manifest=Manifest())
+    capability = Memory(
+        layout=MemoryLayoutConfig(memories_dir=memories_dir),
+        generate=None,
+    )
+
+    try:
+        async with session:
+            memory_dir_path = Path(memories_dir)
+            await session.mkdir(memory_dir_path, parents=True)
+            await session.write(
+                memory_dir_path / "memory_summary.md",
+                io.BytesIO(b"summary entry"),
+            )
+            capability.bind(session)
+            capability.bind_workspace_scope(SandboxWorkspaceScope.from_cwd("tasks/task-a"))
+
+            instructions = await capability.instructions(session.state.manifest)
+
+            assert instructions is not None
+            workspace_root = session.state.manifest.root
+            assert (
+                f"{workspace_root}/{memory_dir_path.as_posix()}/memory_summary.md" in instructions
+            )
+            assert f"{workspace_root}/{memory_dir_path.as_posix()}/MEMORY.md" in instructions
+    finally:
+        await client.delete(session)
+
+
+@pytest.mark.asyncio
+async def test_sandbox_memory_writes_rollouts_and_memory_files() -> None:
+    client = FilesystemTestSandboxClient()
+    session = await client.create(manifest=Manifest())
+    phase_one_model = ScriptedModel(steps=[[_phase_one_message()]])
+    phase_two_model = ScriptedModel(
+        steps=[
+            [
+                _patch_update_call("memory-md", "memories/MEMORY.md", "memory entry"),
+                _patch_update_call("memory-summary", "memories/memory_summary.md", "summary entry"),
+            ]
         ]
     )
-    phase_two_model.set_next_output([get_final_output_message("consolidated")])
+    phase_two_model.enqueue([get_final_output_message("consolidated")])
     memory = _memory_config(
         extra_prompt="Track durable user preferences.",
         phase_one_model=phase_one_model,
@@ -720,7 +1104,7 @@ async def test_sandbox_memory_writes_rollouts_and_memory_files() -> None:
     )
     agent = SandboxAgent(
         name="worker",
-        model=FakeModel(initial_output=[get_final_output_message("done")]),
+        model=ScriptedModel(steps=[[get_final_output_message("done")]]),
         instructions="Worker.",
         capabilities=[memory],
     )
@@ -738,7 +1122,7 @@ async def test_sandbox_memory_writes_rollouts_and_memory_files() -> None:
 
         assert result.final_output == "done"
         assert len(rollouts) == 1
-        assert phase_one_model.first_turn_args is None
+        assert not phase_one_model.calls
 
         await session.aclose()
         closed = True
@@ -763,16 +1147,12 @@ async def test_sandbox_memory_writes_rollouts_and_memory_files() -> None:
         assert "rollout_path: sessions/" in rollout_summaries[0].read_text()
         assert "terminal_state: completed" in rollout_summaries[0].read_text()
         assert '"terminal_state":"completed"' in _extract_user_text(phase_one_model)
-        assert phase_one_model.first_turn_args is not None
-        assert (
-            "DEVELOPER-SPECIFIC EXTRA GUIDANCE"
-            in phase_one_model.first_turn_args["system_instructions"]
-        )
-        assert (
-            "Track durable user preferences."
-            in phase_one_model.first_turn_args["system_instructions"]
-        )
-        assert phase_two_model.first_turn_args is not None
+        assert bool(phase_one_model.calls)
+        system_instructions = phase_one_model.calls[0].system_instructions
+        assert system_instructions is not None
+        assert "DEVELOPER-SPECIFIC EXTRA GUIDANCE" in system_instructions
+        assert "Track durable user preferences." in system_instructions
+        assert bool(phase_two_model.calls)
         assert "DEVELOPER-SPECIFIC EXTRA GUIDANCE" in _extract_user_text(phase_two_model)
         assert "Track durable user preferences." in _extract_user_text(phase_two_model)
     finally:
@@ -781,26 +1161,30 @@ async def test_sandbox_memory_writes_rollouts_and_memory_files() -> None:
 
 @pytest.mark.asyncio
 async def test_sandbox_memory_uses_custom_layout() -> None:
-    client = UnixLocalSandboxClient()
+    client = FilesystemTestSandboxClient()
     session = await client.create(manifest=Manifest())
-    phase_two_model = FakeModel(
-        initial_output=[
-            _patch_update_call("memory-md", "agent_memory/MEMORY.md", "memory entry"),
-            _patch_update_call("memory-summary", "agent_memory/memory_summary.md", "summary entry"),
+    phase_two_model = ScriptedModel(
+        steps=[
+            [
+                _patch_update_call("memory-md", "agent_memory/MEMORY.md", "memory entry"),
+                _patch_update_call(
+                    "memory-summary", "agent_memory/memory_summary.md", "summary entry"
+                ),
+            ]
         ]
     )
-    phase_two_model.set_next_output([get_final_output_message("consolidated")])
+    phase_two_model.enqueue([get_final_output_message("consolidated")])
     memory = Memory(
         layout=MemoryLayoutConfig(memories_dir="agent_memory", sessions_dir="agent_sessions"),
         read=None,
         generate=MemoryGenerateConfig(
-            phase_one_model=FakeModel(initial_output=[_phase_one_message()]),
+            phase_one_model=ScriptedModel(steps=[[_phase_one_message()]]),
             phase_two_model=phase_two_model,
         ),
     )
     agent = SandboxAgent(
         name="worker",
-        model=FakeModel(initial_output=[get_final_output_message("done")]),
+        model=ScriptedModel(steps=[[get_final_output_message("done")]]),
         instructions="Worker.",
         capabilities=[memory],
     )
@@ -827,49 +1211,53 @@ async def test_sandbox_memory_uses_custom_layout() -> None:
 
 @pytest.mark.asyncio
 async def test_sandbox_memory_supports_multiple_generating_layouts_in_one_session() -> None:
-    client = UnixLocalSandboxClient()
+    client = FilesystemTestSandboxClient()
     session = await client.create(manifest=Manifest())
-    phase_two_model_a = FakeModel(
-        initial_output=[
-            _patch_update_call("a-memory", "agent_a_memory/MEMORY.md", "agent a entry"),
-            _patch_update_call(
-                "a-summary",
-                "agent_a_memory/memory_summary.md",
-                "agent a summary",
-            ),
+    phase_two_model_a = ScriptedModel(
+        steps=[
+            [
+                _patch_update_call("a-memory", "agent_a_memory/MEMORY.md", "agent a entry"),
+                _patch_update_call(
+                    "a-summary",
+                    "agent_a_memory/memory_summary.md",
+                    "agent a summary",
+                ),
+            ]
         ]
     )
-    phase_two_model_a.set_next_output([get_final_output_message("agent a consolidated")])
-    phase_two_model_b = FakeModel(
-        initial_output=[
-            _patch_update_call("b-memory", "agent_b_memory/MEMORY.md", "agent b entry"),
-            _patch_update_call(
-                "b-summary",
-                "agent_b_memory/memory_summary.md",
-                "agent b summary",
-            ),
+    phase_two_model_a.enqueue([get_final_output_message("agent a consolidated")])
+    phase_two_model_b = ScriptedModel(
+        steps=[
+            [
+                _patch_update_call("b-memory", "agent_b_memory/MEMORY.md", "agent b entry"),
+                _patch_update_call(
+                    "b-summary",
+                    "agent_b_memory/memory_summary.md",
+                    "agent b summary",
+                ),
+            ]
         ]
     )
-    phase_two_model_b.set_next_output([get_final_output_message("agent b consolidated")])
+    phase_two_model_b.enqueue([get_final_output_message("agent b consolidated")])
     memory_a = _memory_config(
         layout=MemoryLayoutConfig(memories_dir="agent_a_memory", sessions_dir="agent_a_sessions"),
-        phase_one_model=FakeModel(initial_output=[_phase_one_message(raw_memory="agent a raw\n")]),
+        phase_one_model=ScriptedModel(steps=[[_phase_one_message(raw_memory="agent a raw\n")]]),
         phase_two_model=phase_two_model_a,
     )
     memory_b = _memory_config(
         layout=MemoryLayoutConfig(memories_dir="agent_b_memory", sessions_dir="agent_b_sessions"),
-        phase_one_model=FakeModel(initial_output=[_phase_one_message(raw_memory="agent b raw\n")]),
+        phase_one_model=ScriptedModel(steps=[[_phase_one_message(raw_memory="agent b raw\n")]]),
         phase_two_model=phase_two_model_b,
     )
     agent_a = SandboxAgent(
         name="agent-a",
-        model=FakeModel(initial_output=[get_final_output_message("a done")]),
+        model=ScriptedModel(steps=[[get_final_output_message("a done")]]),
         instructions="Agent A.",
         capabilities=[memory_a],
     )
     agent_b = SandboxAgent(
         name="agent-b",
-        model=FakeModel(initial_output=[get_final_output_message("b done")]),
+        model=ScriptedModel(steps=[[get_final_output_message("b done")]]),
         instructions="Agent B.",
         capabilities=[memory_b],
     )
@@ -894,11 +1282,11 @@ async def test_sandbox_memory_supports_multiple_generating_layouts_in_one_sessio
 
 @pytest.mark.asyncio
 async def test_sandbox_memory_rejects_different_generate_configs_for_same_layout() -> None:
-    client = UnixLocalSandboxClient()
+    client = FilesystemTestSandboxClient()
     session = await client.create(manifest=Manifest())
     memory = _memory_config()
     different_memory = _memory_config(
-        phase_one_model=FakeModel(initial_output=[_phase_one_message(raw_memory="different\n")])
+        phase_one_model=ScriptedModel(steps=[[_phase_one_message(raw_memory="different\n")]])
     )
 
     try:
@@ -912,7 +1300,7 @@ async def test_sandbox_memory_rejects_different_generate_configs_for_same_layout
 
 @pytest.mark.asyncio
 async def test_sandbox_memory_rollout_payload_uses_validated_rollout_id() -> None:
-    client = UnixLocalSandboxClient()
+    client = FilesystemTestSandboxClient()
     session = await client.create(manifest=Manifest())
     memory = _memory_config()
 
@@ -939,7 +1327,7 @@ async def test_sandbox_memory_rollout_payload_uses_validated_rollout_id() -> Non
 
 @pytest.mark.asyncio
 async def test_sandbox_memory_rejects_different_sessions_dirs_for_same_memories_dir() -> None:
-    client = UnixLocalSandboxClient()
+    client = FilesystemTestSandboxClient()
     session = await client.create(manifest=Manifest())
     first_memory = _memory_config(
         layout=MemoryLayoutConfig(memories_dir="shared_memory", sessions_dir="sessions_a")
@@ -959,7 +1347,7 @@ async def test_sandbox_memory_rejects_different_sessions_dirs_for_same_memories_
 
 @pytest.mark.asyncio
 async def test_sandbox_memory_rejects_shared_sessions_dir_for_different_memories_dirs() -> None:
-    client = UnixLocalSandboxClient()
+    client = FilesystemTestSandboxClient()
     session = await client.create(manifest=Manifest())
     first_memory = _memory_config(
         layout=MemoryLayoutConfig(memories_dir="memory_a", sessions_dir="shared_sessions")
@@ -979,29 +1367,33 @@ async def test_sandbox_memory_rejects_shared_sessions_dir_for_different_memories
 
 @pytest.mark.asyncio
 async def test_sandbox_memory_groups_segments_by_sdk_session_until_close() -> None:
-    client = UnixLocalSandboxClient()
+    client = FilesystemTestSandboxClient()
     session = await client.create(manifest=Manifest())
-    phase_one_model = FakeModel(initial_output=[_phase_one_message(raw_memory="joined raw\n")])
-    phase_two_model = FakeModel(
-        initial_output=[
-            _patch_update_call("memory-md", "memories/MEMORY.md", "joined entry"),
-            _patch_update_call("memory-summary", "memories/memory_summary.md", "joined summary"),
+    phase_one_model = ScriptedModel(steps=[[_phase_one_message(raw_memory="joined raw\n")]])
+    phase_two_model = ScriptedModel(
+        steps=[
+            [
+                _patch_update_call("memory-md", "memories/MEMORY.md", "joined entry"),
+                _patch_update_call(
+                    "memory-summary", "memories/memory_summary.md", "joined summary"
+                ),
+            ]
         ]
     )
-    phase_two_model.set_next_output([get_final_output_message("joined")])
+    phase_two_model.enqueue([get_final_output_message("joined")])
     memory = _memory_config(
         phase_one_model=phase_one_model,
         phase_two_model=phase_two_model,
     )
     first_agent = SandboxAgent(
         name="first-worker",
-        model=FakeModel(initial_output=[get_final_output_message("first done")]),
+        model=ScriptedModel(steps=[[get_final_output_message("first done")]]),
         instructions="Worker.",
         capabilities=[memory],
     )
     second_agent = SandboxAgent(
         name="second-worker",
-        model=FakeModel(initial_output=[get_final_output_message("second done")]),
+        model=ScriptedModel(steps=[[get_final_output_message("second done")]]),
         instructions="Worker.",
         capabilities=[memory],
     )
@@ -1039,7 +1431,7 @@ async def test_sandbox_memory_groups_segments_by_sdk_session_until_close() -> No
         ]
         assert segments[0]["input"] == [{"content": "first", "role": "user"}]
         assert segments[1]["input"] == [{"content": "second", "role": "user"}]
-        assert phase_one_model.first_turn_args is None
+        assert not phase_one_model.calls
 
         await session.aclose()
         closed = True
@@ -1058,10 +1450,10 @@ async def test_sandbox_memory_groups_segments_by_sdk_session_until_close() -> No
 
 @pytest.mark.asyncio
 async def test_sandbox_memory_fallback_does_not_mutate_run_config() -> None:
-    client = UnixLocalSandboxClient()
+    client = FilesystemTestSandboxClient()
     session = await client.create(manifest=Manifest())
-    agent_model = FakeModel()
-    agent_model.add_multiple_turn_outputs(
+    agent_model = ScriptedModel()
+    agent_model.extend(
         [
             [get_final_output_message("first done")],
             [get_final_output_message("second done")],
@@ -1098,11 +1490,11 @@ async def test_sandbox_memory_fallback_does_not_mutate_run_config() -> None:
 
 @pytest.mark.asyncio
 async def test_sandbox_memory_uses_conversation_id_when_sdk_session_is_absent() -> None:
-    client = UnixLocalSandboxClient()
+    client = FilesystemTestSandboxClient()
     session = await client.create(manifest=Manifest())
     agent = SandboxAgent(
         name="worker",
-        model=FakeModel(initial_output=[get_final_output_message("done")]),
+        model=ScriptedModel(steps=[[get_final_output_message("done")]]),
         instructions="Worker.",
         capabilities=[_memory_config()],
     )
@@ -1126,10 +1518,10 @@ async def test_sandbox_memory_uses_conversation_id_when_sdk_session_is_absent() 
 
 @pytest.mark.asyncio
 async def test_sandbox_memory_uses_group_id_when_sdk_session_is_absent() -> None:
-    client = UnixLocalSandboxClient()
+    client = FilesystemTestSandboxClient()
     session = await client.create(manifest=Manifest())
-    agent_model = FakeModel()
-    agent_model.add_multiple_turn_outputs(
+    agent_model = ScriptedModel()
+    agent_model.extend(
         [
             [get_final_output_message("first done")],
             [get_final_output_message("second done")],
@@ -1163,10 +1555,10 @@ async def test_sandbox_memory_uses_group_id_when_sdk_session_is_absent() -> None
 
 @pytest.mark.asyncio
 async def test_sandbox_memory_uses_per_run_conversation_when_no_conversation_id() -> None:
-    client = UnixLocalSandboxClient()
+    client = FilesystemTestSandboxClient()
     session = await client.create(manifest=Manifest())
-    agent_model = FakeModel()
-    agent_model.add_multiple_turn_outputs(
+    agent_model = ScriptedModel()
+    agent_model.extend(
         [
             [get_final_output_message("first done")],
             [get_final_output_message("second done")],
@@ -1196,29 +1588,31 @@ async def test_sandbox_memory_uses_per_run_conversation_when_no_conversation_id(
 
 @pytest.mark.asyncio
 async def test_sandbox_memory_caps_phase_two_selection_and_surfaces_removed_rollouts() -> None:
-    client = UnixLocalSandboxClient()
+    client = FilesystemTestSandboxClient()
     session = await client.create(manifest=Manifest())
-    phase_one_model = FakeModel()
-    phase_one_model.add_multiple_turn_outputs(
+    phase_one_model = ScriptedModel()
+    phase_one_model.extend(
         [
             [_phase_one_message(slug="first", raw_memory="first raw\n")],
             [_phase_one_message(slug="second", raw_memory="second raw\n")],
         ]
     )
-    phase_two_model = FakeModel(
-        initial_output=[
-            _patch_update_call("memory-md", "memories/MEMORY.md", "first entry"),
-            _patch_update_call("memory-summary", "memories/memory_summary.md", "first summary"),
+    phase_two_model = ScriptedModel(
+        steps=[
+            [
+                _patch_update_call("memory-md", "memories/MEMORY.md", "first entry"),
+                _patch_update_call("memory-summary", "memories/memory_summary.md", "first summary"),
+            ]
         ]
     )
-    phase_two_model.set_next_output([get_final_output_message("consolidated")])
+    phase_two_model.enqueue([get_final_output_message("consolidated")])
     memory = _memory_config(
         max_raw_memories_for_consolidation=1,
         phase_one_model=phase_one_model,
         phase_two_model=phase_two_model,
     )
-    agent_model = FakeModel()
-    agent_model.add_multiple_turn_outputs(
+    agent_model = ScriptedModel()
+    agent_model.extend(
         [
             [get_final_output_message("first done")],
             [get_final_output_message("second done")],
@@ -1266,8 +1660,8 @@ async def test_sandbox_memory_caps_phase_two_selection_and_surfaces_removed_roll
         assert "second raw" in merged_raw_memories
         assert "first raw" not in merged_raw_memories
 
-        assert phase_two_model.first_turn_args is not None
-        prompt = _extract_user_text_from_turn_args(phase_two_model.first_turn_args)
+        assert bool(phase_two_model.calls)
+        prompt = _extract_user_text_from_model_input(phase_two_model.calls[0].input)
         assert "newly added since the last successful Phase 2 run: 1" in prompt
         assert f"rollout_id={selected_rollout_ids[0]}" in prompt
     finally:
@@ -1276,23 +1670,27 @@ async def test_sandbox_memory_caps_phase_two_selection_and_surfaces_removed_roll
 
 @pytest.mark.asyncio
 async def test_sandbox_memory_runs_phase_one_and_phase_two_on_session_close() -> None:
-    client = UnixLocalSandboxClient()
+    client = FilesystemTestSandboxClient()
     session = await client.create(manifest=Manifest())
-    phase_one_model = FakeModel(initial_output=[_phase_one_message()])
-    phase_two_model = FakeModel(
-        initial_output=[
-            _patch_update_call("memory-md", "memories/MEMORY.md", "shutdown entry"),
-            _patch_update_call("memory-summary", "memories/memory_summary.md", "shutdown summary"),
+    phase_one_model = ScriptedModel(steps=[[_phase_one_message()]])
+    phase_two_model = ScriptedModel(
+        steps=[
+            [
+                _patch_update_call("memory-md", "memories/MEMORY.md", "shutdown entry"),
+                _patch_update_call(
+                    "memory-summary", "memories/memory_summary.md", "shutdown summary"
+                ),
+            ]
         ]
     )
-    phase_two_model.set_next_output([get_final_output_message("shutdown")])
+    phase_two_model.enqueue([get_final_output_message("shutdown")])
     memory = _memory_config(
         phase_one_model=phase_one_model,
         phase_two_model=phase_two_model,
     )
     agent = SandboxAgent(
         name="worker",
-        model=FakeModel(initial_output=[get_final_output_message("done")]),
+        model=ScriptedModel(steps=[[get_final_output_message("done")]]),
         instructions="Worker.",
         capabilities=[memory],
     )
@@ -1314,7 +1712,7 @@ async def test_sandbox_memory_runs_phase_one_and_phase_two_on_session_close() ->
 
 @pytest.mark.asyncio
 async def test_sandbox_memory_unregisters_manager_on_session_close() -> None:
-    client = UnixLocalSandboxClient()
+    client = FilesystemTestSandboxClient()
     session = await client.create(manifest=Manifest())
     memory = _memory_config()
 
@@ -1332,56 +1730,204 @@ async def test_sandbox_memory_unregisters_manager_on_session_close() -> None:
         await client.delete(session)
 
 
+class _FatalMemoryWorkerError(BaseException):
+    pass
+
+
+@pytest.mark.parametrize(
+    "worker_error",
+    [_FatalMemoryWorkerError("fatal"), asyncio.CancelledError()],
+    ids=["base_exception", "cancelled_error"],
+)
 @pytest.mark.asyncio
-async def test_sandbox_memory_enqueue_failure_still_cleans_up_owned_session(
+async def test_sandbox_memory_flush_propagates_worker_base_exception_without_hanging(
+    monkeypatch: pytest.MonkeyPatch,
+    worker_error: BaseException,
+) -> None:
+    client = FilesystemTestSandboxClient()
+    session = await client.create(manifest=Manifest())
+    memory = _memory_config()
+    manager = get_or_create_memory_generation_manager(session=session, memory=memory)
+
+    async def fail_processing(_rollout_file_name: str) -> None:
+        raise worker_error
+
+    monkeypatch.setattr(manager, "_process_rollout_file", fail_processing)
+
+    try:
+        await manager.enqueue_rollout_payload(
+            {
+                "updated_at": "2026-08-05T00:00:00+00:00",
+                "input": [],
+                "generated_items": [],
+                "terminal_metadata": {
+                    "terminal_state": "completed",
+                    "has_final_output": False,
+                },
+            },
+            rollout_id="fatal-worker",
+        )
+
+        with pytest.raises(type(worker_error)):
+            await asyncio.wait_for(manager.flush(), timeout=1.0)
+
+        assert manager._worker_task is None
+        assert memory_manager_module._MEMORY_GENERATION_MANAGERS.get(session) is None
+    finally:
+        await client.delete(session)
+
+
+@pytest.mark.asyncio
+async def test_sandbox_memory_flush_parent_cancellation_stops_worker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    client = FilesystemTestSandboxClient()
+    session = await client.create(manifest=Manifest())
+    memory = _memory_config()
+    manager = get_or_create_memory_generation_manager(session=session, memory=memory)
+    worker_started = asyncio.Event()
+    worker_cancelled = asyncio.Event()
+    phase_two_called = False
+
+    async def block_processing(_rollout_file_name: str) -> None:
+        worker_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            worker_cancelled.set()
+
+    async def record_phase_two() -> None:
+        nonlocal phase_two_called
+        phase_two_called = True
+
+    monkeypatch.setattr(manager, "_process_rollout_file", block_processing)
+    monkeypatch.setattr(manager, "_run_phase_two", record_phase_two)
+
+    try:
+        await manager.enqueue_rollout_payload(
+            {
+                "updated_at": "2026-08-05T00:00:00+00:00",
+                "input": [],
+                "generated_items": [],
+                "terminal_metadata": {
+                    "terminal_state": "completed",
+                    "has_final_output": False,
+                },
+            },
+            rollout_id="cancelled-flush",
+        )
+        flush_task = asyncio.create_task(manager.flush())
+        await asyncio.wait_for(worker_started.wait(), timeout=1.0)
+        flush_task.cancel()
+
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(flush_task, timeout=1.0)
+        finally:
+            if not flush_task.done():
+                flush_task.cancel()
+            await asyncio.gather(flush_task, return_exceptions=True)
+
+        assert worker_cancelled.is_set()
+        assert manager._worker_task is None
+        assert memory_manager_module._MEMORY_GENERATION_MANAGERS.get(session) is None
+        assert not phase_two_called
+    finally:
+        await client.delete(session)
+
+
+@pytest.mark.parametrize("streamed", [False, True], ids=["non_streamed", "streamed"])
+@pytest.mark.parametrize(
+    ("model_redacted", "tool_redacted"),
+    [(True, False), (False, True), (False, False)],
+    ids=["model_redacted", "tool_redacted", "diagnostic"],
+)
+@pytest.mark.asyncio
+async def test_sandbox_memory_enqueue_failure_follows_both_data_policies(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    streamed: bool,
+    model_redacted: bool,
+    tool_redacted: bool,
+) -> None:
+    secret = "SECRET_SANDBOX_MEMORY_PAYLOAD"
+    error = RuntimeError(secret)
+
     async def _raise_write_rollout(*args: Any, **kwargs: Any) -> Path:
         _ = args, kwargs
-        raise RuntimeError("write_rollout failed")
+        raise error
 
     monkeypatch.setattr(memory_manager_module, "write_rollout", _raise_write_rollout)
+    monkeypatch.setattr(_debug, "DONT_LOG_MODEL_DATA", model_redacted)
+    monkeypatch.setattr(_debug, "DONT_LOG_TOOL_DATA", tool_redacted)
+    caplog.set_level(logging.WARNING)
 
-    client = _DeleteTrackingUnixLocalSandboxClient()
+    client = _DeleteTrackingFilesystemTestSandboxClient()
     agent = SandboxAgent(
         name="worker",
-        model=FakeModel(initial_output=[get_final_output_message("done")]),
+        model=ScriptedModel(steps=[[get_final_output_message("done")]]),
         instructions="Worker.",
         capabilities=[_memory_config()],
     )
 
-    result = await Runner.run(
-        agent,
-        "hello",
-        run_config=RunConfig(sandbox=SandboxRunConfig(client=client)),
-    )
+    run_config = RunConfig(sandbox=SandboxRunConfig(client=client))
+    result: RunResult | RunResultStreaming
+    if streamed:
+        result = Runner.run_streamed(agent, "hello", run_config=run_config)
+        async for _ in result.stream_events():
+            pass
+        expected_message = "Failed to enqueue sandbox memory after streamed run"
+    else:
+        result = await Runner.run(agent, "hello", run_config=run_config)
+        expected_message = "Failed to enqueue sandbox memory after run"
 
     assert result.final_output == "done"
     assert len(client.deleted_roots) == 1
     assert not client.deleted_roots[0].exists()
 
+    record = next(
+        record
+        for record in caplog.records
+        if expected_message in logging.Formatter().format(record)
+    )
+    redacted = model_redacted or tool_redacted
+    if redacted:
+        assert record.msg == "%s"
+        assert record.args == (expected_message,)
+        assert record.exc_info is None
+        assert record.exc_text is None
+        assert error not in record.__dict__.values()
+        assert secret not in logging.Formatter().format(record)
+    else:
+        assert record.args == (expected_message, error)
+        assert record.exc_info is not None
+        assert record.exc_info[1] is error
+        assert secret in logging.Formatter().format(record)
+
 
 @pytest.mark.asyncio
 async def test_sandbox_memory_marks_interrupted_runs_in_phase_one_prompt() -> None:
-    client = UnixLocalSandboxClient()
+    client = FilesystemTestSandboxClient()
     session = await client.create(manifest=Manifest())
-    phase_one_model = FakeModel(initial_output=[_phase_one_message()])
-    phase_two_model = FakeModel(
-        initial_output=[
-            _patch_update_call("memory-md", "memories/MEMORY.md", "interrupted entry"),
-            _patch_update_call(
-                "memory-summary", "memories/memory_summary.md", "interrupted summary"
-            ),
+    phase_one_model = ScriptedModel(steps=[[_phase_one_message()]])
+    phase_two_model = ScriptedModel(
+        steps=[
+            [
+                _patch_update_call("memory-md", "memories/MEMORY.md", "interrupted entry"),
+                _patch_update_call(
+                    "memory-summary", "memories/memory_summary.md", "interrupted summary"
+                ),
+            ]
         ]
     )
-    phase_two_model.set_next_output([get_final_output_message("done")])
+    phase_two_model.enqueue([get_final_output_message("done")])
     memory = _memory_config(
         phase_one_model=phase_one_model,
         phase_two_model=phase_two_model,
     )
     agent = SandboxAgent(
         name="worker",
-        model=FakeModel(initial_output=[make_shell_call("approval-call")]),
+        model=ScriptedModel(steps=[[make_shell_call("approval-call")]]),
         instructions="Worker.",
         tools=[ShellTool(executor=lambda _request: "ok", needs_approval=True)],
         capabilities=[memory],

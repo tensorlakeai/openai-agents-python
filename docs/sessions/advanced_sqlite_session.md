@@ -64,7 +64,7 @@ session = AdvancedSQLiteSession(
 # With persistent storage
 session = AdvancedSQLiteSession(
     session_id="user_123",
-    db_path="path/to/conversations.db",
+    db_path="conversations.db",
     create_tables=True
 )
 
@@ -81,7 +81,7 @@ session = AdvancedSQLiteSession(
 ### Parameters
 
 - `session_id` (str): Unique identifier for the conversation session
-- `db_path` (str | Path): Path to SQLite database file. Defaults to `:memory:` for in-memory storage
+- `db_path` (str | Path): Path to SQLite database file. Defaults to `:memory:`, which uses in-memory storage
 - `create_tables` (bool): Whether to automatically create the advanced tables. Defaults to `False`
 - `logger` (logging.Logger | None): Custom logger for the session. Defaults to module logger
 
@@ -160,6 +160,8 @@ branch_id = await session.create_branch_from_content(
     branch_name="weather_focus"
 )
 ```
+
+Branch IDs are unique for the lifetime of a session ID. Deleting a branch or clearing the session removes its conversation data but does not make previously used branch IDs available again; use a new name when creating another branch.
 
 ### Branch management
 
@@ -243,7 +245,7 @@ for turn in matching_turns:
 
 The session automatically tracks message structure including:
 
-- Message types (user, assistant, tool_call, etc.)
+- Message type values (`user`, `assistant`, `tool_call`, etc.)
 - Tool names for tool calls
 - Turn numbers and sequence numbers
 - Branch associations
@@ -251,7 +253,7 @@ The session automatically tracks message structure including:
 
 ## Database schema
 
-AdvancedSQLiteSession extends the basic SQLite schema with two additional tables:
+AdvancedSQLiteSession extends the basic SQLite schema with three additional tables:
 
 ### message_structure table
 
@@ -271,6 +273,18 @@ CREATE TABLE message_structure (
     FOREIGN KEY (message_id) REFERENCES agent_messages(id) ON DELETE CASCADE
 );
 ```
+
+### branch_reservations table
+
+```sql
+CREATE TABLE branch_reservations (
+    session_id TEXT NOT NULL,
+    branch_id TEXT NOT NULL,
+    PRIMARY KEY (session_id, branch_id)
+);
+```
+
+This table atomically reserves branch IDs, including branches whose copied prefix is empty. Reservation rows are retained both when a branch is deleted and when the session is cleared, so stale session instances cannot merge history into a later branch that reused the same ID.
 
 ### turn_usage table
 

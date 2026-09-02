@@ -64,9 +64,11 @@ async def on_codex_stream(payload: CodexToolStreamEvent) -> None:
     if isinstance(item, CommandExecutionItem):
         command = item.command
         output = item.aggregated_output
-        output_preview = output[-200:] if isinstance(output, str) else ""
+        output_tail = output[-200:] if isinstance(output, str) else ""
         status = item.status
-        log(f"codex command {event.type}: {command} | status={status} | output={output_preview}")
+        log(
+            f"codex command {event.type}: {command} | status={status} | output_tail={output_tail!r}"
+        )
         return
     if isinstance(item, McpToolCallItem):
         server = item.server
@@ -133,7 +135,7 @@ async def main() -> None:
         ],
     )
     trace_id = gen_trace_id()
-    log(f"View trace: https://platform.openai.com/traces/trace?trace_id={trace_id}")
+    log(f"View trace: https://platform.openai.com/logs/trace?trace_id={trace_id}")
 
     with trace("Codex tool example", trace_id=trace_id):
         log("Using the Codex tool to inspect pyproject.toml and summarize Python requirements...")

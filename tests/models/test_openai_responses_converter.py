@@ -27,6 +27,7 @@ from typing import Any, cast
 
 import pytest
 from openai import omit
+from openai.types.responses.web_search_tool import Filters as WebSearchToolFilters
 from pydantic import BaseModel
 
 from agents import (
@@ -451,6 +452,47 @@ def test_convert_tools_basic_types_and_includes():
         Converter.convert_tools(tools=[comp_tool, comp_tool], handoffs=[])
 
 
+@pytest.mark.parametrize("max_num_results", [1, 50])
+def test_convert_file_search_tool_preserves_supported_result_limits(
+    max_num_results: int,
+) -> None:
+    converted = Converter.convert_tools(
+        [FileSearchTool(vector_store_ids=["vs1"], max_num_results=max_num_results)],
+        handoffs=[],
+    )
+
+    file_params = next(tool for tool in converted.tools if tool["type"] == "file_search")
+    assert file_params.get("max_num_results") == max_num_results
+
+
+@pytest.mark.parametrize("max_num_results", [None, 0])
+def test_convert_file_search_tool_omits_provider_default_result_limit(
+    max_num_results: int | None,
+) -> None:
+    converted = Converter.convert_tools(
+        [FileSearchTool(vector_store_ids=["vs1"], max_num_results=max_num_results)],
+        handoffs=[],
+    )
+
+    file_params = next(tool for tool in converted.tools if tool["type"] == "file_search")
+    assert "max_num_results" not in file_params
+
+
+@pytest.mark.parametrize("max_num_results", [-1, 51, True, 0.0, 1.5, "3"])
+def test_convert_file_search_tool_rejects_unsupported_result_limits(
+    max_num_results: object,
+) -> None:
+    tool = FileSearchTool(
+        vector_store_ids=["vs1"],
+        max_num_results=max_num_results,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(
+        UserError, match="max_num_results must be zero, an integer between 1 and 50"
+    ):
+        Converter.convert_tools([tool], handoffs=[])
+
+
 def test_convert_tools_includes_explicit_false_external_web_access() -> None:
     web_tool = WebSearchTool(external_web_access=False)
 
@@ -466,6 +508,32 @@ def test_convert_tools_includes_explicit_false_external_web_access() -> None:
             "external_web_access": False,
         }
     ]
+
+
+@pytest.mark.parametrize("use_dictionary", [False, True], ids=["class", "dictionary"])
+def test_web_search_filters_preserve_existing_provider_payload(use_dictionary: bool) -> None:
+    filters = {"allowed_domains": ["example.com"]}
+    tool = WebSearchTool(
+        filters=filters if use_dictionary else WebSearchToolFilters.model_validate(filters)
+    )
+
+    assert isinstance(tool.filters, WebSearchToolFilters)
+    converted = Converter.convert_tools([tool], handoffs=[], model="gpt-5.4")
+    assert converted.tools == [
+        {
+            "type": "web_search",
+            "filters": filters,
+            "user_location": None,
+            "search_context_size": "medium",
+        }
+    ]
+
+
+def test_web_search_filters_preserve_openai_forward_compatible_fields() -> None:
+    tool = WebSearchTool(filters={"future_filter": ["example.com"]})
+
+    assert tool.filters is not None
+    assert tool.filters.model_extra == {"future_filter": ["example.com"]}
 
 
 def test_convert_tools_uses_preview_computer_payload_for_preview_model() -> None:

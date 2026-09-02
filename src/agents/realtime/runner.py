@@ -38,18 +38,21 @@ class RealtimeRunner:
 
         Args:
             starting_agent: The agent to start the session with.
-            context: The context to use for the session.
             model: The model to use. If not provided, will use a default OpenAI realtime model.
             config: Override parameters to use for the entire run.
         """
         self._starting_agent = starting_agent
         self._config = config
-        self._model = model or OpenAIRealtimeWebSocketModel()
+        self._model = model if model is not None else OpenAIRealtimeWebSocketModel()
 
     async def run(
         self, *, context: TContext | None = None, model_config: RealtimeModelConfig | None = None
     ) -> RealtimeSession:
         """Start and returns a realtime session.
+
+        Args:
+            context: The context to use for the session.
+            model_config: Override parameters to use for this session's model.
 
         Returns:
             RealtimeSession: A session object that allows bidirectional communication with the

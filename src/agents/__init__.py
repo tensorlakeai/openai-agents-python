@@ -1,5 +1,6 @@
 import logging
 import sys
+import threading
 from typing import TYPE_CHECKING, Any, Literal
 
 from openai import AsyncOpenAI
@@ -24,6 +25,7 @@ from .exceptions import (
     MCPToolCancellationError,
     ModelBehaviorError,
     ModelRefusalError,
+    ModelTimeoutError,
     OutputGuardrailTripwireTriggered,
     RunErrorDetails,
     ToolInputGuardrailTripwireTriggered,
@@ -55,6 +57,7 @@ from .items import (
     CompactionItem,
     HandoffCallItem,
     HandoffOutputItem,
+    InputItem,
     ItemHelpers,
     MCPApprovalRequestItem,
     MCPApprovalResponseItem,
@@ -108,12 +111,15 @@ from .retry import (
     retry_policies,
 )
 from .run import (
+    OutputGuardrailBlockedMessageArgs,
+    OutputGuardrailBlockedMessageFormatter,
     ReasoningItemIdPolicy,
     RunConfig,
     Runner,
     ToolErrorFormatter,
     ToolErrorFormatterArgs,
     ToolExecutionConfig,
+    ToolNameCollisionPolicy,
     ToolNotFoundBehavior,
 )
 from .run_context import AgentHookContext, RunContextWrapper, TContext
@@ -133,12 +139,20 @@ from .stream_events import (
 )
 from .tool import (
     ApplyPatchTool,
+    ApplyPatchToolCustomDataContext,
+    ApplyPatchToolCustomDataExtractor,
     CodeInterpreterTool,
     ComputerProvider,
     ComputerTool,
+    ComputerToolCustomDataContext,
+    ComputerToolCustomDataExtractor,
     CustomTool,
+    CustomToolCustomDataContext,
+    CustomToolCustomDataExtractor,
     FileSearchTool,
     FunctionTool,
+    FunctionToolCustomDataContext,
+    FunctionToolCustomDataExtractor,
     FunctionToolResult,
     HostedMCPTool,
     ImageGenerationTool,
@@ -148,6 +162,7 @@ from .tool import (
     MCPToolApprovalFunction,
     MCPToolApprovalFunctionResult,
     MCPToolApprovalRequest,
+    ProgrammaticToolCallingTool,
     ShellActionRequest,
     ShellCallData,
     ShellCallOutcome,
@@ -171,6 +186,7 @@ from .tool import (
     ShellToolLocalSkill,
     ShellToolSkillReference,
     Tool,
+    ToolCaller,
     ToolOrigin,
     ToolOriginType,
     ToolOutputFileContent,
@@ -304,7 +320,7 @@ def set_default_openai_responses_transport(transport: Literal["http", "websocket
 
 
 def set_default_openai_agent_registration(
-    config: OpenAIAgentRegistrationConfig | None,
+    config: OpenAIAgentRegistrationConfig | dict[str, Any] | None,
 ) -> None:
     """Set the default OpenAI agent registration config.
 
@@ -322,11 +338,29 @@ def set_default_openai_harness(harness_id: str | None) -> None:
     _config.set_default_openai_harness(harness_id)
 
 
-def enable_verbose_stdout_logging():
+_verbose_stdout_handler: "logging.StreamHandler[Any] | None" = None
+_verbose_stdout_handler_lock = threading.Lock()
+
+
+def enable_verbose_stdout_logging() -> None:
     """Enables verbose logging to stdout. This is useful for debugging."""
+    global _verbose_stdout_handler
+
     logger = logging.getLogger("openai.agents")
-    logger.setLevel(logging.DEBUG)
-    logger.addHandler(logging.StreamHandler(sys.stdout))
+    with _verbose_stdout_handler_lock:
+        logger.setLevel(logging.DEBUG)
+        stream = sys.stdout if sys.stdout is not None else sys.stderr
+
+        if _verbose_stdout_handler is None:
+            _verbose_stdout_handler = logging.StreamHandler(stream)
+        else:
+            _verbose_stdout_handler.acquire()
+            try:
+                _verbose_stdout_handler.stream = stream
+            finally:
+                _verbose_stdout_handler.release()
+
+        logger.addHandler(_verbose_stdout_handler)
 
 
 __all__ = [
@@ -381,6 +415,7 @@ __all__ = [
     "MCPToolCancellationError",
     "ModelBehaviorError",
     "ModelRefusalError",
+    "ModelTimeoutError",
     "ToolTimeoutError",
     "UserError",
     "InputGuardrail",
@@ -404,6 +439,7 @@ __all__ = [
     "HandoffInputData",
     "HandoffInputFilter",
     "TResponseInputItem",
+    "InputItem",
     "MessageOutputItem",
     "ModelResponse",
     "RunItem",
@@ -447,6 +483,9 @@ __all__ = [
     "RunResultStreaming",
     "ResponsesWebSocketSession",
     "RunConfig",
+    "OutputGuardrailBlockedMessageArgs",
+    "OutputGuardrailBlockedMessageFormatter",
+    "ToolNameCollisionPolicy",
     "ReasoningItemIdPolicy",
     "ToolExecutionConfig",
     "ToolErrorFormatter",
@@ -458,10 +497,16 @@ __all__ = [
     "AgentUpdatedStreamEvent",
     "StreamEvent",
     "FunctionTool",
+    "FunctionToolCustomDataContext",
+    "FunctionToolCustomDataExtractor",
     "FunctionToolResult",
     "ComputerTool",
+    "ComputerToolCustomDataContext",
+    "ComputerToolCustomDataExtractor",
     "ComputerProvider",
     "CustomTool",
+    "CustomToolCustomDataContext",
+    "CustomToolCustomDataExtractor",
     "FileSearchTool",
     "CodeInterpreterTool",
     "ImageGenerationTool",
@@ -494,7 +539,11 @@ __all__ = [
     "ApplyPatchOperation",
     "ApplyPatchResult",
     "ApplyPatchTool",
+    "ApplyPatchToolCustomDataContext",
+    "ApplyPatchToolCustomDataExtractor",
+    "ProgrammaticToolCallingTool",
     "Tool",
+    "ToolCaller",
     "WebSearchTool",
     "HostedMCPTool",
     "MCPToolApprovalFunction",

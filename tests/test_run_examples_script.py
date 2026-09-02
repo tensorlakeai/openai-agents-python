@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
+
+import pytest
 
 import examples.run_examples as run_examples
 
@@ -9,8 +12,9 @@ def test_default_auto_skip_excludes_prerequisite_bound_examples() -> None:
     expected = {
         "examples/sandbox/docker/mounts/azure_mount_read_write.py",
         "examples/sandbox/docker/mounts/gcs_mount_read_write.py",
-        "examples/sandbox/docker/mounts/s3_files_mount_read_write.py",
         "examples/sandbox/docker/mounts/s3_mount_read_write.py",
+        "examples/sandbox/extensions/blaxel_runner.py",
+        "examples/sandbox/extensions/cloudflare_runner.py",
         "examples/sandbox/extensions/daytona/usaspending_text2sql/setup_db.py",
         "examples/sandbox/extensions/temporal/temporal_sandbox_agent.py",
         "examples/sandbox/extensions/vercel_runner.py",
@@ -75,6 +79,24 @@ def test_artifact_dir_for_example_uses_tmp_safe_stem(tmp_path: Path) -> None:
     )
 
     assert artifact_dir == tmp_path / "examples__sandbox__tutorials__vision_website_clone__main"
+
+
+@pytest.mark.parametrize(
+    "removed_arguments",
+    [
+        ["--rerun-file", ".tmp/failed.txt"],
+        ["--write-rerun"],
+        ["--collect", ".tmp/main.log"],
+        ["--output", ".tmp/failed.txt"],
+    ],
+)
+def test_removed_rerun_arguments_are_rejected(
+    monkeypatch: pytest.MonkeyPatch, removed_arguments: list[str]
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["run_examples.py", *removed_arguments])
+
+    with pytest.raises(SystemExit, match="2"):
+        run_examples.parse_args()
 
 
 def test_prepare_redis_for_example_uses_existing_local_redis(monkeypatch) -> None:

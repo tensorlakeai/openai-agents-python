@@ -12,8 +12,14 @@ from typing import Any, TypeVar, cast
 
 from ...run_config import SandboxArchiveLimits, SandboxConcurrencyLimits
 from ...tracing import Span, custom_span, get_current_trace
+from .._mount_security import (
+    redact_mount_error_data,
+    validate_manifest_mount_credential_boundaries,
+)
 from ..errors import OpName, SandboxError
 from ..files import FileEntry
+from ..manifest import Manifest
+from ..materialization import MaterializationResult
 from ..types import ExecResult, ExposedPortEndpoint, User
 from .base_sandbox_session import BaseSandboxSession
 from .dependencies import Dependencies
@@ -228,7 +234,9 @@ class SandboxSession(BaseSandboxSession):
     ) -> None:
         self._inner = inner
         self._inner.set_dependencies(dependencies)
-        self._instrumentation = instrumentation or Instrumentation()
+        self._instrumentation = (
+            instrumentation if instrumentation is not None else Instrumentation()
+        )
         self._seq = 0
 
         self._bind_session_to_sinks()
@@ -252,6 +260,9 @@ class SandboxSession(BaseSandboxSession):
     @state.setter
     def state(self, value: SandboxSessionState) -> None:  # pragma: no cover
         self._inner.state = value
+
+    def _runtime_has_protected_mount_authority(self) -> bool:
+        return self._inner._runtime_has_protected_mount_authority()
 
     @property
     def dependencies(self) -> Dependencies:
@@ -280,9 +291,9 @@ class SandboxSession(BaseSandboxSession):
     def supports_pty(self) -> bool:
         return self._inner.supports_pty()
 
-    async def aclose(self) -> None:
+    async def _aclose_impl(self) -> None:
         try:
-            await super().aclose()
+            await super()._aclose_impl()
         finally:
             await self._instrumentation.flush()
 
@@ -351,6 +362,9 @@ class SandboxSession(BaseSandboxSession):
             if isinstance(exc, SandboxError):
                 trace_data["error_code"] = exc.error_code
                 error_data["error_code"] = exc.error_code
+                if exc.retryable is not None:
+                    trace_data["error_retryable"] = exc.retryable
+                    error_data["error_retryable"] = exc.retryable
             span.set_error({"message": type(exc).__name__, "data": error_data})
             return
         if not ok:
@@ -375,6 +389,7 @@ class SandboxSession(BaseSandboxSession):
         finish_data: Callable[[T], dict[str, object]] | None = None,
         ok: Callable[[T], bool] | None = None,
         outputs: Callable[[T], tuple[bytes | None, bytes | None]] | None = None,
+        expected_span_errors: tuple[type[BaseException], ...] = (),
     ) -> T:
         span_cm = (
             custom_span(
@@ -400,24 +415,35 @@ class SandboxSession(BaseSandboxSession):
                 value = await run()
             except Exception as e:
                 duration_ms = (time.monotonic() - t0) * 1000.0
+                expected_span_error = isinstance(e, expected_span_errors)
+                try:
+                    await self._emit_finish_event(
+                        op=op,
+                        span_id=span_id,
+                        parent_span_id=parent_span_id,
+                        trace_id=trace_id,
+                        duration_ms=duration_ms,
+                        ok=False,
+                        exc=e,
+                        data=start_data,
+                        stdout=None,
+                        stderr=None,
+                    )
+                except BaseException as sink_error:
+                    self._apply_trace_finish_data(
+                        span=trace_span,
+                        op=op,
+                        ok=False,
+                        data=start_data,
+                        exc=sink_error,
+                    )
+                    raise
                 self._apply_trace_finish_data(
                     span=trace_span,
                     op=op,
-                    ok=False,
+                    ok=expected_span_error,
                     data=start_data,
-                    exc=e,
-                )
-                await self._emit_finish_event(
-                    op=op,
-                    span_id=span_id,
-                    parent_span_id=parent_span_id,
-                    trace_id=trace_id,
-                    duration_ms=duration_ms,
-                    ok=False,
-                    exc=e,
-                    data=start_data,
-                    stdout=None,
-                    stderr=None,
+                    exc=None if expected_span_error else e,
                 )
                 raise
 
@@ -425,24 +451,34 @@ class SandboxSession(BaseSandboxSession):
             ok_value = ok(value) if ok is not None else True
             stdout, stderr = outputs(value) if outputs is not None else (None, None)
             duration_ms = (time.monotonic() - t0) * 1000.0
+            try:
+                await self._emit_finish_event(
+                    op=op,
+                    span_id=span_id,
+                    parent_span_id=parent_span_id,
+                    trace_id=trace_id,
+                    duration_ms=duration_ms,
+                    ok=ok_value,
+                    exc=None,
+                    data=data_finish,
+                    stdout=stdout,
+                    stderr=stderr,
+                )
+            except BaseException as sink_error:
+                self._apply_trace_finish_data(
+                    span=trace_span,
+                    op=op,
+                    ok=False,
+                    data=data_finish,
+                    exc=sink_error,
+                )
+                raise
             self._apply_trace_finish_data(
                 span=trace_span,
                 op=op,
                 ok=ok_value,
                 data=data_finish,
                 exc=None,
-            )
-            await self._emit_finish_event(
-                op=op,
-                span_id=span_id,
-                parent_span_id=parent_span_id,
-                trace_id=trace_id,
-                duration_ms=duration_ms,
-                ok=ok_value,
-                exc=None,
-                data=data_finish,
-                stdout=stdout,
-                stderr=stderr,
             )
             return value
 
@@ -477,6 +513,7 @@ class SandboxSession(BaseSandboxSession):
             event.error_message = str(exc)
             if isinstance(exc, SandboxError):
                 event.error_code = exc.error_code
+                event.error_retryable = exc.retryable
 
         # Preserve raw bytes so Instrumentation can apply per-op/per-sink policies later.
         # Decoding here would force one global formatting decision before sink-specific redaction
@@ -491,12 +528,30 @@ class SandboxSession(BaseSandboxSession):
         await self._inner.start()
 
     @instrumented_op("stop")
+    @redact_mount_error_data
     async def stop(self) -> None:
         await self._inner.stop()
 
     @instrumented_op("shutdown")
+    @redact_mount_error_data
     async def shutdown(self) -> None:
         await self._inner.shutdown()
+
+    async def _validate_manifest_application(
+        self,
+        *,
+        only_ephemeral: bool = False,
+        manifest: Manifest | None = None,
+        session_running: bool | None = None,
+    ) -> None:
+        await self._inner._validate_manifest_application(
+            only_ephemeral=only_ephemeral,
+            manifest=manifest,
+            session_running=session_running,
+        )
+
+    async def apply_manifest(self, *, only_ephemeral: bool = False) -> MaterializationResult:
+        return await super().apply_manifest(only_ephemeral=only_ephemeral)
 
     @instrumented_op(
         "exec",
@@ -595,9 +650,22 @@ class SandboxSession(BaseSandboxSession):
     ) -> None:
         await self._inner.mkdir(path, parents=parents, user=user)
 
-    @instrumented_op("read", data=_read_start_data)
+    async def _read(
+        self,
+        path: Path,
+        *,
+        user: str | User | None = None,
+        expected_span_errors: tuple[type[BaseException], ...] = (),
+    ) -> io.IOBase:
+        return await self._annotate(
+            op="read",
+            start_data=_read_start_data(self, path, user=user),
+            run=lambda: self._inner.read(path, user=user),
+            expected_span_errors=expected_span_errors,
+        )
+
     async def read(self, path: Path, *, user: str | User | None = None) -> io.IOBase:
-        return await self._inner.read(path, user=user)
+        return await self._read(path, user=user)
 
     @instrumented_op("write", data=_write_start_data)
     async def write(
@@ -631,12 +699,38 @@ class SandboxSession(BaseSandboxSession):
         data=_persist_start_data,
         finish_data=_persist_finish_data,
     )
+    @redact_mount_error_data
     async def persist_workspace(self) -> io.IOBase:
+        validate_manifest_mount_credential_boundaries(
+            self._inner.state.manifest,
+            provider_backend_id=self._inner.state.type,
+        )
         return await self._inner.persist_workspace()
 
     @instrumented_op(
         "hydrate_workspace",
         data=_hydrate_start_data,
     )
+    @redact_mount_error_data
     async def hydrate_workspace(self, data: io.IOBase) -> None:
+        validate_manifest_mount_credential_boundaries(
+            self._inner.state.manifest,
+            provider_backend_id=self._inner.state.type,
+        )
         await self._inner.hydrate_workspace(data)
+
+
+async def _read_with_expected_span_errors(
+    session: BaseSandboxSession,
+    path: Path,
+    *,
+    user: str | User | None = None,
+    expected_span_errors: tuple[type[BaseException], ...],
+) -> io.IOBase:
+    if isinstance(session, SandboxSession):
+        return await session._read(
+            path,
+            user=user,
+            expected_span_errors=expected_span_errors,
+        )
+    return await session.read(path, user=user)

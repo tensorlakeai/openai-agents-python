@@ -42,6 +42,7 @@ class ShellExecutor:
             )
             timed_out = False
             try:
+                # Zero is intentionally equivalent to no explicit Shell action timeout.
                 timeout = (action.timeout_ms or 0) / 1000 or None
                 stdout_bytes, stderr_bytes = await asyncio.wait_for(
                     proc.communicate(), timeout=timeout
@@ -135,7 +136,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--model",
-        default="gpt-5.5",
+        default="gpt-5.6-sol",
     )
     args = parser.parse_args()
     asyncio.run(main(args.prompt, args.model))

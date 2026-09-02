@@ -1,13 +1,32 @@
 from __future__ import annotations
 
 import inspect
+import json
 from collections.abc import Callable
-from typing import Any
+from typing import Any, NoReturn
 
 from ..exceptions import UserError
 
 # Keep this helper here so both run_internal and realtime can import it without
 # creating cross-package dependencies.
+
+
+def _reject_nonstandard_json_constant(value: str) -> NoReturn:
+    raise ValueError(f"Invalid JSON constant: {value}")
+
+
+def parse_function_tool_arguments(arguments: str | None) -> dict[str, Any] | None:
+    """Return parsed object arguments, or None when an approval policy cannot inspect them."""
+    if arguments is None or not arguments.strip():
+        return None
+    try:
+        parsed = json.loads(
+            arguments,
+            parse_constant=_reject_nonstandard_json_constant,
+        )
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 async def evaluate_needs_approval_setting(

@@ -11,9 +11,9 @@ This is represented via the [`RunContextWrapper`][agents.run_context.RunContextW
 
 1. You create any Python object you want. A common pattern is to use a dataclass or a Pydantic object.
 2. You pass that object to the various run methods (e.g. `Runner.run(..., context=whatever)`).
-3. All your tool calls, lifecycle hooks etc will be passed a wrapper object, `RunContextWrapper[T]`, where `T` represents your context object type which you can access via `wrapper.context`.
+3. All your tool calls, lifecycle hooks etc will be passed a wrapper object, `RunContextWrapper[T]`, where `T` represents the type of your context object; the object itself is available via `wrapper.context`.
 
-For some runtime-specific callbacks, the SDK may pass a more specialized subclass of `RunContextWrapper[T]`. For example, function-tool lifecycle hooks typically receive `ToolContext`, which also exposes tool-call metadata like `tool_call_id`, `tool_name`, and `tool_arguments`.
+For some runtime-specific callbacks, the SDK may pass a more specialized subclass of `RunContextWrapper[T]`. For example, lifecycle hooks for `FunctionTool` instances typically receive `ToolContext`, which also exposes tool-call metadata like `tool_call_id`, `tool_name`, and `tool_arguments`.
 
 The **most important** thing to be aware of: every agent, tool function, lifecycle etc for a given agent run must use the same _type_ of context.
 
@@ -28,6 +28,16 @@ You can use the context for things like:
     The context object is **not** sent to the LLM. It is purely a local object that you can read from, write to and call methods on it.
 
 Within a single run, derived wrappers share the same underlying app context, approval state, and usage tracking. Nested [`Agent.as_tool()`][agents.agent.Agent.as_tool] runs may attach a different `tool_input`, but they do not get an isolated copy of your app state by default.
+
+### Use local context for capability visibility
+
+When function tools, MCP tools, and handoffs depend on the same request policy, keep the policy inputs or helper on your application context. Each SDK surface exposes the current run context through its own callback:
+
+-   [`FunctionTool.is_enabled`][agents.tool.FunctionTool.is_enabled] receives a `RunContextWrapper`.
+-   [`Handoff.is_enabled`][agents.handoffs.Handoff.is_enabled] receives a `RunContextWrapper`.
+-   An MCP [`tool_filter`](mcp.md#dynamic-tool-filtering) receives a [`ToolFilterContext`][agents.mcp.ToolFilterContext], whose `run_context` property contains the current `RunContextWrapper`.
+
+Adapt the shared application policy to these callbacks instead of maintaining separate capability lists. The callbacks control which capabilities the SDK exposes for the current run; they cannot authorize a model-generated argument or resource selection. For function tools, enforce those decisions inside the tool implementation or with [tool input guardrails](guardrails.md#tool-guardrails) and [approvals](human_in_the_loop.md) when appropriate. MCP servers must authorize their own protected operations. For a handoff with `input_type`, check the parsed input at the start of `on_handoff`, before application side effects, and raise instead of returning when authorization fails. Tool input guardrails do not run for handoffs. See [handoff inputs](handoffs.md#handoff-inputs) for the callback lifecycle.
 
 ### What `RunContextWrapper` exposes
 
@@ -48,14 +58,15 @@ Conversation state is a separate concern. Use `result.to_input_list()`, `session
 import asyncio
 from dataclasses import dataclass
 
-from agents import Agent, RunContextWrapper, Runner, function_tool
+from agents import Agent, RunContextWrapper, Runner
+from agents.decorators import tool
 
 @dataclass
 class UserInfo:  # (1)!
     name: str
     uid: int
 
-@function_tool
+@tool
 async def fetch_user_age(wrapper: RunContextWrapper[UserInfo]) -> str:  # (2)!
     """Fetch the age of the user. Call this function to get user's age information."""
     return f"The user {wrapper.context.name} is 47 years old"
@@ -97,7 +108,8 @@ For this, you can use the [`ToolContext`][agents.tool_context.ToolContext] class
 ```python
 from typing import Annotated
 from pydantic import BaseModel, Field
-from agents import Agent, Runner, function_tool
+from agents import Agent
+from agents.decorators import tool
 from agents.tool_context import ToolContext
 
 class WeatherContext(BaseModel):
@@ -108,7 +120,7 @@ class Weather(BaseModel):
     temperature_range: str = Field(description="The temperature range in Celsius")
     conditions: str = Field(description="The weather conditions")
 
-@function_tool
+@tool
 def get_weather(ctx: ToolContext[WeatherContext], city: Annotated[str, "The city to get the weather for"]) -> Weather:
     print(f"[debug] Tool context: (name: {ctx.tool_name}, call_id: {ctx.tool_call_id}, args: {ctx.tool_arguments})")
     return Weather(city=city, temperature_range="14-20C", conditions="Sunny with wind.")
@@ -140,5 +152,5 @@ When an LLM is called, the **only** data it can see is from the conversation his
 
 1. You can add it to the Agent `instructions`. This is also known as a "system prompt" or "developer message". System prompts can be static strings, or they can be dynamic functions that receive the context and output a string. This is a common tactic for information that is always useful (for example, the user's name or the current date).
 2. Add it to the `input` when calling the `Runner.run` functions. This is similar to the `instructions` tactic, but allows you to have messages that are lower in the [chain of command](https://cdn.openai.com/spec/model-spec-2024-05-08.html#follow-the-chain-of-command).
-3. Expose it via function tools. This is useful for _on-demand_ context - the LLM decides when it needs some data, and can call the tool to fetch that data.
+3. Expose it through `FunctionTool` instances. This is useful for _on-demand_ context - the LLM decides when it needs some data, and can call the tool to fetch that data.
 4. Use retrieval or web search. These are special tools that are able to fetch relevant data from files or databases (retrieval), or from the web (web search). This is useful for "grounding" the response in relevant contextual data.

@@ -5,16 +5,17 @@ import io
 import stat
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator
 
 from ...tool import FunctionTool, Tool
 from ..entries import BaseEntry, Dir, File, LocalDir, LocalFile
-from ..errors import LocalDirReadError, SkillsConfigError
+from ..errors import LocalDirReadError, SkillsConfigError, WorkspaceReadNotFoundError
 from ..manifest import Manifest
 from ..session.base_sandbox_session import BaseSandboxSession
+from ..session.sandbox_session import _read_with_expected_span_errors
 from ..types import User
 from ..workspace_paths import (
     SandboxPathGrant,
@@ -28,6 +29,20 @@ _SKILLS_SECTION_INTRO = (
     "A skill is a set of local instructions to follow that is stored in a `SKILL.md` file. "
     "Below is the list of skills that can be used. Each entry includes a name, description, "
     "and file path so you can open the source for full instructions when using a specific skill."
+)
+
+_SKILL_PATH_GUIDANCE = (
+    "- Skill paths: Treat each listed path as the skill root. Resolve relative paths in "
+    "`SKILL.md`, including `scripts/`, `references/`, and `assets/`, against that root rather "
+    "than the shell working directory.",
+    "- Shared resources: Skill files belong to the sandbox session and may be visible to other "
+    "runs. Unless the task explicitly requires editing a skill, invoke scripts through the "
+    "listed skill root and write task inputs, outputs, caches, and temporary files in the run "
+    "working directory.",
+)
+
+_SCOPED_SKILL_PATH_ERROR = (
+    "skill path must be non-empty and workspace-relative when sandbox.cwd is configured"
 )
 
 _HOW_TO_USE_SKILLS_SECTION = "\n".join(
@@ -236,8 +251,13 @@ class LocalDirLazySkillSource(LazySkillSource):
         skill_dest = workspace_root / metadata.path
         skill_md_path = skill_dest / "SKILL.md"
         try:
-            handle = await session.read(skill_md_path, user=user)
-        except Exception:
+            handle = await _read_with_expected_span_errors(
+                session,
+                skill_md_path,
+                user=user,
+                expected_span_errors=(FileNotFoundError, WorkspaceReadNotFoundError),
+            )
+        except (FileNotFoundError, WorkspaceReadNotFoundError):
             handle = None
         if handle is not None:
             handle.close()
@@ -247,7 +267,13 @@ class LocalDirLazySkillSource(LazySkillSource):
                 "path": str(metadata.path).replace("\\", "/"),
             }
 
-        await LocalDir(src=src_root / metadata.path.name).apply(
+        # Materialize through a copy of the configured source so the loaded skill keeps the
+        # entry metadata (permissions, group) that the eager `from_` path already applies.
+        skill_source = self.source.model_copy(
+            update={"src": src_root / metadata.path.name},
+            deep=True,
+        )
+        await skill_source.apply(
             session,
             skill_dest,
             base_dir=Path.cwd(),
@@ -503,7 +529,9 @@ class Skills(Capability):
     skills_path: str = Field(default=".agents")
 
     _skills_metadata: list[SkillMetadata] | None = PrivateAttr(default=None)
-    _skills_metadata_cache_key: tuple[tuple[str, bool], ...] | None = PrivateAttr(default=None)
+    _skills_metadata_cache_key: tuple[tuple[str, bool, str | None], ...] | None = PrivateAttr(
+        default=None
+    )
 
     @field_validator("skills", mode="before")
     @classmethod
@@ -578,7 +606,7 @@ class Skills(Capability):
         skills_root = posix_path_as_path(coerce_posix_path(self.skills_path))
         existing_paths = _manifest_entry_paths(manifest)
 
-        if self.lazy_from:
+        if self.lazy_from is not None:
             # Lazy sources do not claim `skills_root` in the manifest up front, so reserve the
             # whole namespace here and fail fast if any existing manifest entry is equal to,
             # above, or below that path.
@@ -598,7 +626,7 @@ class Skills(Capability):
                 )
             return manifest
 
-        if self.from_:
+        if self.from_ is not None:
             if skills_root in existing_paths:
                 existing_entry = _get_manifest_entry_by_path(manifest, skills_root)
                 if existing_entry is None:
@@ -652,6 +680,32 @@ class Skills(Capability):
             raise ValueError(f"{type(self).__name__} is not bound to a SandboxSession")
         return [_LoadSkillTool(skills=self)]
 
+    def _model_skill_path(
+        self,
+        *,
+        manifest: Manifest,
+        skill_name: str,
+        path: str | PurePath,
+    ) -> str:
+        if self.workspace_scope.cwd is None:
+            return str(path).replace("\\", "/")
+        try:
+            return self.workspace_scope.model_resource_path(
+                workspace_root=manifest.root,
+                workspace_relative_path=path,
+            ).as_posix()
+        except ValueError as exc:
+            raise SkillsConfigError(
+                message=_SCOPED_SKILL_PATH_ERROR,
+                context={
+                    "skill_name": skill_name,
+                    "field": "path",
+                    "path": path.as_posix() if isinstance(path, PurePath) else path,
+                    "reason": "invalid",
+                },
+                cause=exc,
+            ) from exc
+
     async def load_skill(self, skill_name: str) -> dict[str, str]:
         if self.lazy_from is None:
             raise SkillsConfigError(
@@ -660,12 +714,29 @@ class Skills(Capability):
             )
         if self.session is None:
             raise ValueError(f"{type(self).__name__} is not bound to a SandboxSession")
-        return await self.lazy_from.load_skill(
+        result = await self.lazy_from.load_skill(
             skill_name=skill_name,
             session=self.session,
             skills_path=self.skills_path,
             user=self.run_as,
         )
+        if self.workspace_scope.cwd is None:
+            return result
+
+        source_path = result.get("path")
+        if source_path is None:
+            raise SkillsConfigError(
+                message=_SCOPED_SKILL_PATH_ERROR,
+                context={"skill_name": skill_name, "field": "path", "reason": "missing"},
+            )
+        return {
+            **result,
+            "path": self._model_skill_path(
+                manifest=self.session.state.manifest,
+                skill_name=skill_name,
+                path=source_path,
+            ),
+        }
 
     async def _resolve_runtime_metadata(self, manifest: Manifest) -> list[SkillMetadata]:
         if self.session is None:
@@ -756,10 +827,15 @@ class Skills(Capability):
         self._skills_metadata_cache_key = cache_key
         return self._skills_metadata
 
-    def _metadata_cache_key(self, manifest: Manifest) -> tuple[tuple[str, bool], ...]:
+    def _metadata_cache_key(
+        self,
+        manifest: Manifest,
+    ) -> tuple[tuple[str, bool, str | None], ...]:
         if self.lazy_from is None:
             return ()
-        return tuple((grant.path, grant.read_only) for grant in manifest.extra_path_grants)
+        return tuple(
+            (grant.path, grant.read_only, grant.host_path) for grant in manifest.extra_path_grants
+        )
 
     async def instructions(self, manifest: Manifest) -> str | None:
         skills = await self._skill_metadata(manifest)
@@ -768,7 +844,11 @@ class Skills(Capability):
 
         available_skill_lines: list[str] = []
         for skill in skills:
-            path_str = str(skill.path).replace("\\", "/")
+            path_str = self._model_skill_path(
+                manifest=manifest,
+                skill_name=skill.name,
+                path=skill.path,
+            )
             available_skill_lines.append(f"- {skill.name}: {skill.description} (file: {path_str})")
 
         how_to_use_section = (
@@ -782,6 +862,11 @@ class Skills(Capability):
                 _SKILLS_SECTION_INTRO,
                 "### Available skills",
                 *available_skill_lines,
+                *(
+                    ["### Run-scoped skill paths", *_SKILL_PATH_GUIDANCE]
+                    if self.workspace_scope.cwd is not None
+                    else []
+                ),
                 *(
                     [
                         "### Lazy loading",

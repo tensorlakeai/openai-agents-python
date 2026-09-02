@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from openai import AsyncOpenAI
 
 from ..items import TResponseInputItem
+from ..logger import log_model_and_tool_action_warning
 from ..models._openai_shared import get_default_openai_client
 from ..run_internal.items import normalize_input_items_for_api
+from ..usage import _response_usage_to_usage
 from .openai_conversations_session import OpenAIConversationsSession
 from .session import (
     OpenAIResponsesCompactionArgs,
@@ -17,6 +20,7 @@ from .session import (
 )
 
 if TYPE_CHECKING:
+    from ..run_context import RunContextWrapper
     from .session import Session
 
 logger = logging.getLogger("openai-agents.openai.compaction")
@@ -124,7 +128,9 @@ class OpenAIResponsesCompactionSession(SessionABC, OpenAIResponsesCompactionAwar
         self.model = model
         self.compaction_mode = compaction_mode
         self.should_trigger_compaction = (
-            should_trigger_compaction or default_should_trigger_compaction
+            should_trigger_compaction
+            if should_trigger_compaction is not None
+            else default_should_trigger_compaction
         )
 
         # cache for incremental candidate tracking
@@ -133,11 +139,15 @@ class OpenAIResponsesCompactionSession(SessionABC, OpenAIResponsesCompactionAwar
         self._response_id: str | None = None
         self._deferred_response_id: str | None = None
         self._last_unstored_response_id: str | None = None
+        # Serialize wrapper mutations against compaction snapshot/replace/restore so a
+        # cancellation rollback cannot rewrite past a newer concurrent write.
+        self._mutation_lock = asyncio.Lock()
 
     @property
     def client(self) -> AsyncOpenAI:
         if self._client is None:
-            self._client = get_default_openai_client() or AsyncOpenAI()
+            default_client = get_default_openai_client()
+            self._client = default_client if default_client is not None else AsyncOpenAI()
         return self._client
 
     def _resolve_compaction_mode_for_response(
@@ -157,8 +167,17 @@ class OpenAIResponsesCompactionSession(SessionABC, OpenAIResponsesCompactionAwar
             return "input"
         return _resolve_compaction_mode(mode, response_id=response_id, store=store)
 
-    async def run_compaction(self, args: OpenAIResponsesCompactionArgs | None = None) -> None:
-        """Run compaction using responses.compact API."""
+    async def run_compaction(
+        self,
+        args: OpenAIResponsesCompactionArgs | None = None,
+        *,
+        wrapper: RunContextWrapper[Any] | None = None,
+    ) -> None:
+        """Run compaction using responses.compact API.
+
+        When a run context is provided, the billed compaction request contributes to
+        that run's usage totals.
+        """
         if args and args.get("response_id"):
             self._response_id = args["response_id"]
         requested_mode = args.get("compaction_mode") if args else None
@@ -196,14 +215,18 @@ class OpenAIResponsesCompactionSession(SessionABC, OpenAIResponsesCompactionAwar
 
         if not should_compact:
             logger.debug(
-                f"skip: decision hook declined compaction for {self._response_id} "
-                f"(mode={resolved_mode})"
+                "skip: decision hook declined compaction for %s (mode=%s)",
+                self._response_id,
+                resolved_mode,
             )
             return
 
         self._deferred_response_id = None
         logger.debug(
-            f"compact: start for {self._response_id} using {self.model} (mode={resolved_mode})"
+            "compact: start for %s using %s (mode=%s)",
+            self._response_id,
+            self.model,
+            resolved_mode,
         )
 
         compact_kwargs: dict[str, Any] = {"model": self.model}
@@ -214,23 +237,29 @@ class OpenAIResponsesCompactionSession(SessionABC, OpenAIResponsesCompactionAwar
 
         compacted = await self.client.responses.compact(**compact_kwargs)
 
+        compacted_usage = getattr(compacted, "usage", None)
+        if wrapper is not None and compacted_usage is not None:
+            wrapper.usage.add(_response_usage_to_usage(compacted_usage))
+
         output_items = _strip_orphaned_assistant_ids(
             _normalize_compaction_output_items(compacted.output or [])
         )
 
-        previous_items = await self._get_all_underlying_session_items()
-        await self._replace_underlying_session_items(
-            output_items=output_items,
-            previous_items=previous_items,
-        )
-
-        self._compaction_candidate_items = select_compaction_candidate_items(output_items)
-        self._session_items = output_items
+        async with self._mutation_lock:
+            previous_items = await self._get_all_underlying_session_items()
+            await self._replace_underlying_session_items(
+                output_items=output_items,
+                previous_items=previous_items,
+            )
+            self._compaction_candidate_items = select_compaction_candidate_items(output_items)
+            self._session_items = output_items
 
         logger.debug(
-            f"compact: done for {self._response_id} "
-            f"(mode={resolved_mode}, output={len(output_items)}, "
-            f"candidates={len(self._compaction_candidate_items)})"
+            "compact: done for %s (mode=%s, output=%s, candidates=%s)",
+            self._response_id,
+            resolved_mode,
+            len(output_items),
+            len(self._compaction_candidate_items or []),
         )
 
     async def get_items(self, limit: int | None = None) -> list[TResponseInputItem]:
@@ -245,32 +274,79 @@ class OpenAIResponsesCompactionSession(SessionABC, OpenAIResponsesCompactionAwar
         output_items: list[TResponseInputItem],
         previous_items: list[TResponseInputItem],
     ) -> None:
+        # Treat clear → add as one replacement transaction. Exception and CancelledError
+        # both restore previous history, and restore settlement is always drained so a
+        # cancel during restore cannot leave an empty session.
+        cleared = False
         try:
             await self.underlying_session.clear_session()
-        except Exception as clear_error:
-            await self._restore_underlying_session_items_after_failed_clear(
-                previous_items, clear_error
+            cleared = True
+            if output_items:
+                await self.underlying_session.add_items(output_items)
+        except Exception as error:
+            await self._recover_from_failed_replacement(
+                previous_items=previous_items,
+                error=error,
+                cleared=cleared,
+            )
+            raise
+        except asyncio.CancelledError as error:
+            await self._recover_from_failed_replacement(
+                previous_items=previous_items,
+                error=error,
+                cleared=cleared,
             )
             raise
 
+    async def _recover_from_failed_replacement(
+        self,
+        *,
+        previous_items: list[TResponseInputItem],
+        error: BaseException,
+        cleared: bool,
+    ) -> None:
+        if not cleared:
+            restore = self._restore_underlying_session_items_after_failed_clear(
+                previous_items, error
+            )
+        else:
+            restore = self._restore_underlying_session_items(previous_items, error)
+        await self._await_restore_despite_cancellation(restore)
+
+    async def _await_restore_despite_cancellation(self, restore: Awaitable[None]) -> None:
+        """Await restore even when the current task keeps receiving cancellation.
+
+        ``asyncio.shield`` alone is not enough: a second ``task.cancel()`` makes
+        ``await asyncio.shield(restore)`` raise immediately while restore is still
+        running. Keep re-awaiting the shielded task until it settles, then
+        re-raise ``CancelledError`` so callers still observe cancellation.
+        """
+        restore_task = asyncio.ensure_future(restore)
         try:
-            if output_items:
-                await self.underlying_session.add_items(output_items)
-        except Exception as replacement_error:
-            await self._restore_underlying_session_items(previous_items, replacement_error)
+            await asyncio.shield(restore_task)
+        except asyncio.CancelledError:
+            while not restore_task.done():
+                try:
+                    await asyncio.shield(restore_task)
+                except asyncio.CancelledError:
+                    continue
+            # Retrieve the restore outcome so a failed restore does not warn about an
+            # unretrieved task exception after we re-raise cancellation.
+            _ = restore_task.exception() if not restore_task.cancelled() else None
             raise
 
     async def _restore_underlying_session_items_after_failed_clear(
         self,
         previous_items: list[TResponseInputItem],
-        clear_error: Exception,
+        clear_error: BaseException,
     ) -> None:
         try:
             current_items = await self._get_all_underlying_session_items()
-        except Exception:
-            logger.warning(
+        except Exception as inspection_error:
+            log_model_and_tool_action_warning(
+                logger,
                 "Failed to inspect session history after compaction replacement clear failed.",
-                exc_info=True,
+                inspection_error,
             )
             return
 
@@ -284,7 +360,7 @@ class OpenAIResponsesCompactionSession(SessionABC, OpenAIResponsesCompactionAwar
     async def _restore_underlying_session_items(
         self,
         previous_items: list[TResponseInputItem],
-        replacement_error: Exception,
+        replacement_error: BaseException,
         *,
         clear_existing_items: bool = True,
     ) -> None:
@@ -293,15 +369,17 @@ class OpenAIResponsesCompactionSession(SessionABC, OpenAIResponsesCompactionAwar
                 await self.underlying_session.clear_session()
             if previous_items:
                 await self.underlying_session.add_items(list(previous_items))
-        except Exception:
-            logger.warning(
+        except Exception as restore_error:
+            log_model_and_tool_action_warning(
+                logger,
                 "Failed to restore session history after compaction replacement failed.",
-                exc_info=True,
+                restore_error,
             )
             return
 
-        logger.warning(
-            "Restored previous session history after compaction replacement failed: %s",
+        log_model_and_tool_action_warning(
+            logger,
+            "Restored previous session history after compaction replacement failed",
             replacement_error,
         )
 
@@ -332,27 +410,37 @@ class OpenAIResponsesCompactionSession(SessionABC, OpenAIResponsesCompactionAwar
         self._deferred_response_id = None
 
     async def add_items(self, items: list[TResponseInputItem]) -> None:
-        await self.underlying_session.add_items(items)
-        if self._compaction_candidate_items is not None:
-            new_items = _normalize_compaction_session_items(items)
-            new_candidates = select_compaction_candidate_items(new_items)
-            if new_candidates:
-                self._compaction_candidate_items.extend(new_candidates)
-        if self._session_items is not None:
-            self._session_items.extend(_normalize_compaction_session_items(items))
+        async with self._mutation_lock:
+            try:
+                await self.underlying_session.add_items(items)
+            except (Exception, asyncio.CancelledError):
+                # The backend may have committed before acknowledgement failed. Re-read its
+                # authoritative history before compaction instead of retaining a stale cache.
+                self._compaction_candidate_items = None
+                self._session_items = None
+                raise
+            if self._compaction_candidate_items is not None:
+                new_items = _normalize_compaction_session_items(items)
+                new_candidates = select_compaction_candidate_items(new_items)
+                if new_candidates:
+                    self._compaction_candidate_items.extend(new_candidates)
+            if self._session_items is not None:
+                self._session_items.extend(_normalize_compaction_session_items(items))
 
     async def pop_item(self) -> TResponseInputItem | None:
-        popped = await self.underlying_session.pop_item()
-        if popped:
-            self._compaction_candidate_items = None
-            self._session_items = None
-        return popped
+        async with self._mutation_lock:
+            popped = await self.underlying_session.pop_item()
+            if popped:
+                self._compaction_candidate_items = None
+                self._session_items = None
+            return popped
 
     async def clear_session(self) -> None:
-        await self.underlying_session.clear_session()
-        self._compaction_candidate_items = []
-        self._session_items = []
-        self._deferred_response_id = None
+        async with self._mutation_lock:
+            await self.underlying_session.clear_session()
+            self._compaction_candidate_items = []
+            self._session_items = []
+            self._deferred_response_id = None
 
     async def _ensure_compaction_candidates(
         self,
@@ -367,7 +455,9 @@ class OpenAIResponsesCompactionSession(SessionABC, OpenAIResponsesCompactionAwar
         self._session_items = history
 
         logger.debug(
-            f"candidates: initialized (history={len(history)}, candidates={len(candidates)})"
+            "candidates: initialized (history=%s, candidates=%s)",
+            len(history),
+            len(candidates),
         )
         return (candidates[:], history[:])
 
