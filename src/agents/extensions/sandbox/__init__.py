@@ -99,6 +99,20 @@ except Exception:  # pragma: no cover
     _HAS_RUNLOOP = False
 
 try:
+    from .tensorlake import (
+        DEFAULT_TENSORLAKE_WORKSPACE_ROOT as DEFAULT_TENSORLAKE_WORKSPACE_ROOT,
+        TensorlakeSandboxClient as TensorlakeSandboxClient,
+        TensorlakeSandboxClientOptions as TensorlakeSandboxClientOptions,
+        TensorlakeSandboxSession as TensorlakeSandboxSession,
+        TensorlakeSandboxSessionState as TensorlakeSandboxSessionState,
+        TensorlakeSandboxTimeouts as TensorlakeSandboxTimeouts,
+    )
+
+    _HAS_TENSORLAKE = True
+except Exception:  # pragma: no cover
+    _HAS_TENSORLAKE = False
+
+try:
     from .vercel import (
         VercelCloudBucketMountStrategy as VercelCloudBucketMountStrategy,
         VercelSandboxClient as VercelSandboxClient,
@@ -176,6 +190,18 @@ if _HAS_CLOUDFLARE:
             "CloudflareSandboxClientOptions",
             "CloudflareSandboxSession",
             "CloudflareSandboxSessionState",
+        ]
+    )
+
+if _HAS_TENSORLAKE:
+    __all__.extend(
+        [
+            "DEFAULT_TENSORLAKE_WORKSPACE_ROOT",
+            "TensorlakeSandboxClient",
+            "TensorlakeSandboxClientOptions",
+            "TensorlakeSandboxSession",
+            "TensorlakeSandboxSessionState",
+            "TensorlakeSandboxTimeouts",
         ]
     )
 
