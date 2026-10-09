@@ -9,6 +9,13 @@ from agents.mcp.util import MCPUtil, create_static_tool_filter
 from agents.run_context import RunContextWrapper
 from examples.auto_mode import confirm_with_fallback, is_auto_mode
 
+MCP_SERVER_BINARY = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "node_modules",
+    ".bin",
+    "mcp-server-filesystem",
+)
+
 
 async def list_tools(server: MCPServer, *, convert_to_strict: bool) -> list[Any]:
     """Fetch all MCP tools from the server."""
@@ -65,8 +72,8 @@ async def main():
     async with MCPServerStdio(
         name="Filesystem Server",
         params={
-            "command": "npx",
-            "args": ["-y", "@modelcontextprotocol/server-filesystem", samples_dir],
+            "command": MCP_SERVER_BINARY,
+            "args": [samples_dir],
             "cwd": samples_dir,
         },
         require_approval={"always": {"tool_names": ["read_text_file"]}},
@@ -131,7 +138,9 @@ async def main():
 
 
 if __name__ == "__main__":
-    if not shutil.which("npx"):
-        raise RuntimeError("npx is required. Install it with `npm install -g npx`.")
+    if not shutil.which(MCP_SERVER_BINARY):
+        raise RuntimeError(
+            "Install MCP tools first: pnpm --dir examples/mcp install --frozen-lockfile --ignore-scripts"
+        )
 
     asyncio.run(main())

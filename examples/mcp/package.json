@@ -1,0 +1,8 @@
+{
+  "name": "agents-python-mcp-example-tools",
+  "private": true,
+  "packageManager": "pnpm@11.28.5",
+  "dependencies": {
+    "@modelcontextprotocol/server-filesystem": "2026.8.31"
+  }
+}

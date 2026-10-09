@@ -5,6 +5,13 @@ import shutil
 from agents import Agent, Runner, gen_trace_id, trace
 from agents.mcp import MCPServer, MCPServerStdio
 
+MCP_SERVER_BINARY = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "node_modules",
+    ".bin",
+    "mcp-server-filesystem",
+)
+
 
 async def run(mcp_server: MCPServer):
     agent = Agent(
@@ -37,10 +44,10 @@ async def main():
     samples_dir = os.path.join(current_dir, "sample_files")
 
     async with MCPServerStdio(
-        name="Filesystem Server, via npx",
+        name="Filesystem Server",
         params={
-            "command": "npx",
-            "args": ["-y", "@modelcontextprotocol/server-filesystem", samples_dir],
+            "command": MCP_SERVER_BINARY,
+            "args": [samples_dir],
         },
     ) as server:
         trace_id = gen_trace_id()
@@ -50,8 +57,10 @@ async def main():
 
 
 if __name__ == "__main__":
-    # Let's make sure the user has npx installed
-    if not shutil.which("npx"):
-        raise RuntimeError("npx is not installed. Please install it with `npm install -g npx`.")
+    # Check the locked executable before starting an MCP subprocess.
+    if not shutil.which(MCP_SERVER_BINARY):
+        raise RuntimeError(
+            "Install MCP tools first: pnpm --dir examples/mcp install --frozen-lockfile --ignore-scripts"
+        )
 
     asyncio.run(main())
